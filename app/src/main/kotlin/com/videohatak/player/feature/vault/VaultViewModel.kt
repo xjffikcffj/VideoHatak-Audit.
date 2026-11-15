@@ -99,6 +99,12 @@ class VaultViewModel(
         }
     }
 
+    fun onVaultTabExited() {
+        if (repository.isUnlocked.value && autoLockTimeout.value.shouldAutoLockOnBackground()) {
+            lockVault()
+        }
+    }
+
     fun checkTimeoutOnForeground(nowMs: Long = System.currentTimeMillis()): Boolean {
         if (!repository.isUnlocked.value) return false
         val expired = autoLockTimeout.value.isInactivityExpired(repository.lastActivityTimestampMs, nowMs)

@@ -38,7 +38,7 @@ import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.OutputStream
 import java.security.GeneralSecurityException
-import java.util.Base64
+import com.videohatak.player.core.vault.crypto.VaultBase64
 
 /**
  * Targeted engineering verification suite covering database upgrades,
@@ -153,9 +153,9 @@ class EngineeringFixesVerificationTest {
         assertEquals(originalJson, crypto.decryptMetadata(encrypted))
 
         // Flip a byte inside Base64 payload to verify GCM tag rejection
-        val rawPayload = Base64.getDecoder().decode(encrypted.removePrefix("VHTKMETA1:"))
+        val rawPayload = VaultBase64.decode(encrypted.removePrefix("VHTKMETA1:"))
         rawPayload[rawPayload.size - 1] = (rawPayload[rawPayload.size - 1].toInt() xor 0xFF).toByte()
-        val tampered = "VHTKMETA1:" + Base64.getEncoder().encodeToString(rawPayload)
+        val tampered = "VHTKMETA1:" + VaultBase64.encodeNoWrap(rawPayload)
 
         assertThrows(GeneralSecurityException::class.java) {
             crypto.decryptMetadata(tampered)
@@ -374,7 +374,10 @@ class EngineeringFixesVerificationTest {
         assertTrue(BackupManager.parseAndValidateBackupJson(tamperedJson) is BackupParseResult.Error)
 
         // Unsupported future schema version rejected cleanly
-        val unsupportedVersion = json.replace("\"schemaVersion\": 1", "\"schemaVersion\": 99")
+        val unsupportedVersion = json.replace(
+            "\"schemaVersion\": ${BackupManager.SCHEMA_VERSION}",
+            "\"schemaVersion\": 99"
+        )
         assertTrue(BackupManager.parseAndValidateBackupJson(unsupportedVersion) is BackupParseResult.Error)
 
         // Injected Vault secret key rejected cleanly

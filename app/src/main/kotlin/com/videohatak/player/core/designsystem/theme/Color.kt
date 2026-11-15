@@ -95,7 +95,7 @@ fun paletteForTheme(themeId: AppThemeId, forceLight: Boolean = false): VideoHata
         themeId
     }
 
-    if (effectiveId == AppThemeId.ROYAL_IVORY || forceLight) {
+    if (forceLight) {
         val (accent, glow, secondary, border) = when (effectiveId) {
             AppThemeId.SAPPHIRE_PREMIUM -> QuadColor(Color(0xFF1D6FD8), Color(0xFF60A5FA), Color(0xFF0284C7), Color(0xFFBFD7F5))
             AppThemeId.EMERALD_LUXURY -> QuadColor(Color(0xFF059669), Color(0xFF34D399), Color(0xFF0D9488), Color(0xFFB5E3D0))
@@ -279,7 +279,26 @@ fun paletteForTheme(themeId: AppThemeId, forceLight: Boolean = false): VideoHata
             seekBarThumb = Color(0xFFE0F7FA)
         )
 
-        AppThemeId.ROYAL_IVORY -> paletteForTheme(AppThemeId.ROYAL_IVORY, forceLight = true)
+        AppThemeId.ROYAL_IVORY -> VideoHatakPalette(
+            themeId = effectiveId,
+            isDark = true,
+            background = Color(0xFF14110B),
+            surface = Color(0xFF1E1911),
+            surfaceElevated = Color(0xFF2B2418),
+            accent = Color(0xFFF0C96B),
+            accentGlow = Color(0xFFFCE29E),
+            secondaryAccent = Color(0xFFB4820A),
+            border = Color(0xFF574728),
+            onSurface = Color(0xFFFAF5EA),
+            onSurfaceMuted = Color(0xFFD1C3A5),
+            topBarGradientStart = Color(0xFF19150D),
+            topBarGradientEnd = Color(0xFF292115),
+            seekBarPlayedStart = Color(0xFFA67C2E),
+            seekBarPlayedEnd = Color(0xFFF5D889),
+            seekBarGlow = Color(0xFFF0C96B).copy(alpha = 0.55f),
+            seekBarUnplayed = Color(0xFFFAF5EA).copy(alpha = 0.24f),
+            seekBarThumb = Color(0xFFFCE7AF)
+        )
     }
 }
 

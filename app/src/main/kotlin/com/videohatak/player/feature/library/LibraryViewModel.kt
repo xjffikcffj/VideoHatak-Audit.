@@ -4,6 +4,7 @@ import android.content.IntentSender
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import com.videohatak.player.core.data.repository.MediaExistenceResult
 import com.videohatak.player.core.data.repository.PendingVideoFileOp
 import com.videohatak.player.core.data.repository.VideoFileOperationResult
 import com.videohatak.player.core.data.repository.VideoRepository
@@ -13,7 +14,6 @@ import com.videohatak.player.core.model.VideoItem
 import com.videohatak.player.core.permission.PermissionHelper
 import com.videohatak.player.core.permission.VideoPermissionStatus
 import com.videohatak.player.core.trash.model.TrashItem
-import com.videohatak.player.core.trash.model.toVideoItem
 import com.videohatak.player.core.trash.repository.TrashRepository
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -21,6 +21,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -55,6 +56,15 @@ class LibraryViewModel(
 
     val trashItems: StateFlow<List<TrashItem>> =
         trashRepository?.trashItems ?: MutableStateFlow(emptyList())
+
+    val trashError: StateFlow<String?> =
+        trashRepository?.trashError ?: MutableStateFlow(null)
+
+    private val _trashExistenceMap = MutableStateFlow<Map<Long, MediaExistenceResult>>(emptyMap())
+    val trashExistenceMap: StateFlow<Map<Long, MediaExistenceResult>> = _trashExistenceMap.asStateFlow()
+
+    private val _missingTrashItemPendingRemoval = MutableStateFlow<TrashItem?>(null)
+    val missingTrashItemPendingRemoval: StateFlow<TrashItem?> = _missingTrashItemPendingRemoval.asStateFlow()
 
     private val trashedUrisFlow: StateFlow<Set<String>> =
         trashRepository?.trashedUris ?: MutableStateFlow(emptySet())
@@ -160,38 +170,111 @@ class LibraryViewModel(
 
     fun moveToTrash(video: VideoItem) {
         viewModelScope.launch {
+            if (video.contentUri.toString() in trashedUrisFlow.value) {
+                _events.tryEmit(LibraryUiEvent.ShowMessage("\"${video.safeTitle}\" موجود بالفعل في سلة المحذوفات"))
+                return@launch
+            }
             val saved = trashRepository?.moveToTrash(video)
             if (saved != null) {
+                _trashExistenceMap.value = _trashExistenceMap.value + (saved.id to MediaExistenceResult.Exists)
                 _events.tryEmit(LibraryUiEvent.ShowMessage("تم نقل \"${video.safeTitle}\" إلى سلة المحذوفات"))
             } else {
-                _events.tryEmit(LibraryUiEvent.ShowMessage("تعذر نقل الفيديو إلى سلة المحذوفات"))
+                val err = trashRepository?.trashError?.value ?: "تعذر نقل الفيديو إلى سلة المحذوفات"
+                _events.tryEmit(LibraryUiEvent.ShowMessage(err))
             }
         }
     }
 
+    fun refreshTrashStatus() {
+        viewModelScope.launch {
+            trashRepository?.refresh()
+            val items = trashItems.value
+            val statusMap = LinkedHashMap<Long, MediaExistenceResult>(items.size)
+            for (item in items) {
+                statusMap[item.id] = videoRepository.checkMediaExistence(item.toVideoItem())
+            }
+            _trashExistenceMap.value = statusMap
+        }
+    }
+
+    fun dismissTrashError() {
+        trashRepository?.clearError()
+    }
+
     fun restoreFromTrash(trashItem: TrashItem) {
         viewModelScope.launch {
-            val mediaExists = videoRepository.doesMediaExist(trashItem.toVideoItem())
-            val restored = trashRepository?.restoreFromTrash(trashItem.id)
-            if (restored != null) {
-                loadVideos()
-                val label = trashItem.title.ifBlank { trashItem.displayName }
-                if (mediaExists) {
-                    _events.tryEmit(LibraryUiEvent.ShowMessage("تمت استعادة \"$label\""))
-                } else {
-                    _events.tryEmit(LibraryUiEvent.ShowMessage("الملف \"$label\" لم يعد موجودًا على الجهاز؛ تمت إزالة السجل من السلة"))
+            val label = trashItem.title.ifBlank { trashItem.displayName }
+            when (val existence = videoRepository.checkMediaExistence(trashItem.toVideoItem())) {
+                MediaExistenceResult.Exists -> {
+                    _trashExistenceMap.value = _trashExistenceMap.value + (trashItem.id to MediaExistenceResult.Exists)
+                    val restored = trashRepository?.restoreFromTrash(trashItem.id)
+                    if (restored != null) {
+                        loadVideos()
+                        _events.tryEmit(LibraryUiEvent.ShowMessage("تمت استعادة \"$label\""))
+                    } else {
+                        val err = trashRepository?.trashError?.value ?: "تعذر استعادة \"$label\" من سلة المحذوفات"
+                        _events.tryEmit(LibraryUiEvent.ShowMessage(err))
+                    }
+                }
+                MediaExistenceResult.Missing -> {
+                    _trashExistenceMap.value = _trashExistenceMap.value + (trashItem.id to MediaExistenceResult.Missing)
+                    _missingTrashItemPendingRemoval.value = trashItem
+                }
+                is MediaExistenceResult.Unverifiable -> {
+                    _trashExistenceMap.value = _trashExistenceMap.value + (trashItem.id to existence)
+                    _events.tryEmit(
+                        LibraryUiEvent.ShowMessage(
+                            "تعذر التحقق من وجود \"$label\": ${existence.reason} — تم الإبقاء على السجل في السلة"
+                        )
+                    )
                 }
             }
         }
+    }
+
+    fun confirmRemoveMissingTrashRecord(trashItem: TrashItem) {
+        viewModelScope.launch {
+            _missingTrashItemPendingRemoval.value = null
+            val removed = trashRepository?.removeRecord(trashItem.id) == true
+            val label = trashItem.title.ifBlank { trashItem.displayName }
+            if (removed) {
+                _trashExistenceMap.value = _trashExistenceMap.value - trashItem.id
+                _events.tryEmit(LibraryUiEvent.ShowMessage("تمت إزالة سجل \"$label\" من سلة المحذوفات"))
+            } else {
+                val err = trashRepository?.trashError?.value ?: "تعذر إزالة السجل من سلة المحذوفات"
+                _events.tryEmit(LibraryUiEvent.ShowMessage(err))
+            }
+        }
+    }
+
+    fun dismissMissingTrashRemoval() {
+        _missingTrashItemPendingRemoval.value = null
     }
 
     fun deleteTrashItemPermanently(trashItem: TrashItem) {
         viewModelScope.launch {
             pendingBulkTrashItems.clear()
             pendingBulkDeletedCount = 0
+            when (val existence = videoRepository.checkMediaExistence(trashItem.toVideoItem())) {
+                is MediaExistenceResult.Unverifiable -> {
+                    _trashExistenceMap.value = _trashExistenceMap.value + (trashItem.id to existence)
+                    _events.tryEmit(
+                        LibraryUiEvent.ShowMessage("تعذر الحذف النهائي لعدم إمكانية التحقق من الملف: ${existence.reason}")
+                    )
+                    return@launch
+                }
+                MediaExistenceResult.Missing -> {
+                    trashRepository?.removeRecord(trashItem.id)
+                    _trashExistenceMap.value = _trashExistenceMap.value - trashItem.id
+                    _events.tryEmit(LibraryUiEvent.ShowMessage("الملف مفقود بالفعل على الجهاز — تمت إزالة السجل من السلة"))
+                    return@launch
+                }
+                MediaExistenceResult.Exists -> Unit
+            }
             val result = videoRepository.deleteVideoPermanently(trashItem.toVideoItem(), trashItem.id)
             if (result is VideoFileOperationResult.Success) {
                 trashRepository?.removeRecord(trashItem.id)
+                _trashExistenceMap.value = _trashExistenceMap.value - trashItem.id
             }
             handleFileOpResult(
                 result = result,
@@ -212,10 +295,25 @@ class LibraryViewModel(
     private suspend fun processNextBulkDeleteItem() {
         while (pendingBulkTrashItems.isNotEmpty()) {
             val item = pendingBulkTrashItems.removeAt(0)
+            when (val existence = videoRepository.checkMediaExistence(item.toVideoItem())) {
+                is MediaExistenceResult.Unverifiable -> {
+                    _trashExistenceMap.value = _trashExistenceMap.value + (item.id to existence)
+                    _events.tryEmit(LibraryUiEvent.ShowMessage("تم تجاوز \"${item.title.ifBlank { item.displayName }}\": ${existence.reason}"))
+                    continue
+                }
+                MediaExistenceResult.Missing -> {
+                    trashRepository?.removeRecord(item.id)
+                    _trashExistenceMap.value = _trashExistenceMap.value - item.id
+                    pendingBulkDeletedCount++
+                    continue
+                }
+                MediaExistenceResult.Exists -> Unit
+            }
             val res = videoRepository.deleteVideoPermanently(item.toVideoItem(), item.id)
             when (res) {
                 is VideoFileOperationResult.Success -> {
                     trashRepository?.removeRecord(item.id)
+                    _trashExistenceMap.value = _trashExistenceMap.value - item.id
                     pendingBulkDeletedCount++
                 }
                 is VideoFileOperationResult.RequiresPermission -> {

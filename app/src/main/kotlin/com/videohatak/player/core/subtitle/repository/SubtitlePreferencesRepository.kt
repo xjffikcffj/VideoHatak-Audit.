@@ -10,31 +10,38 @@ import kotlinx.coroutines.flow.map
 
 private val Context.subtitleDataStore by preferencesDataStore(name = "videohatak_subtitles")
 
-class SubtitlePreferencesRepository(private val context: Context) {
+interface SubtitlePreferencesStore {
+    val primaryStyle: Flow<SubtitleStyleConfig>
+    val secondaryStyle: Flow<SubtitleStyleConfig>
+    suspend fun updatePrimaryFontSize(sizeSp: Float)
+    suspend fun updateSecondaryFontSize(sizeSp: Float)
+}
+
+class SubtitlePreferencesRepository(private val context: Context) : SubtitlePreferencesStore {
     private val primarySizeKey = floatPreferencesKey("sub_primary_size")
     private val secondarySizeKey = floatPreferencesKey("sub_secondary_size")
 
-    val primaryStyle: Flow<SubtitleStyleConfig> = context.subtitleDataStore.data.map { prefs ->
+    override val primaryStyle: Flow<SubtitleStyleConfig> = context.subtitleDataStore.data.map { prefs ->
         SubtitleStyleConfig(
             fontSizeSp = prefs[primarySizeKey] ?: 18f,
             bottomPaddingDp = 48f
         )
     }
 
-    val secondaryStyle: Flow<SubtitleStyleConfig> = context.subtitleDataStore.data.map { prefs ->
+    override val secondaryStyle: Flow<SubtitleStyleConfig> = context.subtitleDataStore.data.map { prefs ->
         SubtitleStyleConfig(
             fontSizeSp = prefs[secondarySizeKey] ?: 15f,
             bottomPaddingDp = 88f
         )
     }
 
-    suspend fun updatePrimaryFontSize(sizeSp: Float) {
+    override suspend fun updatePrimaryFontSize(sizeSp: Float) {
         context.subtitleDataStore.edit { prefs ->
             prefs[primarySizeKey] = sizeSp
         }
     }
 
-    suspend fun updateSecondaryFontSize(sizeSp: Float) {
+    override suspend fun updateSecondaryFontSize(sizeSp: Float) {
         context.subtitleDataStore.edit { prefs ->
             prefs[secondarySizeKey] = sizeSp
         }

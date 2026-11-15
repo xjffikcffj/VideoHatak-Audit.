@@ -12,11 +12,14 @@ import com.videohatak.player.core.playback.PlaybackPreferencesRepositoryImpl
 import com.videohatak.player.core.playback.ResumeMode
 import com.videohatak.player.core.playback.VideoPlayerManager
 import com.videohatak.player.core.playback.VideoResizeMode
+import com.videohatak.player.core.playlist.db.BackupPlaylistStore
 import com.videohatak.player.core.playlist.db.VideoHatakDatabaseHelper
 import com.videohatak.player.core.playlist.model.Playlist
 import com.videohatak.player.core.playlist.model.PlaylistItem
 import com.videohatak.player.core.subtitle.repository.SubtitlePreferencesRepository
+import com.videohatak.player.core.subtitle.repository.SubtitlePreferencesStore
 import com.videohatak.player.core.vault.security.VaultAutoLockTimeout
+import com.videohatak.player.core.vault.security.VaultSecurityBackupStore
 import com.videohatak.player.core.vault.security.VaultSecurityPreferences
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
@@ -99,21 +102,38 @@ sealed interface BackupParseResult {
  * Security boundary (never backed up): Raw video media files, Vault encrypted videos,
  * Vault PIN hashes/salts, Android Keystore keys, or file DEKs.
  */
-class BackupManager(
-    private val context: Context,
-    private val themeRepository: ThemePreferencesRepository = ThemePreferencesRepositoryImpl(context),
-    private val playbackRepository: PlaybackPreferencesRepository = PlaybackPreferencesRepositoryImpl(context),
-    private val subtitleRepository: SubtitlePreferencesRepository = SubtitlePreferencesRepository(context),
-    private val vaultSecurityPreferences: VaultSecurityPreferences = VaultSecurityPreferences(context),
-    private val databaseHelper: VideoHatakDatabaseHelper = VideoHatakDatabaseHelper(context)
+class BackupManager internal constructor(
+    private val context: Context?,
+    private val themeRepository: ThemePreferencesRepository,
+    private val playbackRepository: PlaybackPreferencesRepository,
+    private val subtitleRepository: SubtitlePreferencesStore,
+    private val vaultSecurityStore: VaultSecurityBackupStore,
+    private val playlistStore: BackupPlaylistStore
 ) {
+
+    constructor(
+        context: Context,
+        themeRepository: ThemePreferencesRepository = ThemePreferencesRepositoryImpl(context),
+        playbackRepository: PlaybackPreferencesRepository = PlaybackPreferencesRepositoryImpl(context),
+        subtitleRepository: SubtitlePreferencesRepository = SubtitlePreferencesRepository(context),
+        vaultSecurityPreferences: VaultSecurityPreferences = VaultSecurityPreferences(context),
+        databaseHelper: VideoHatakDatabaseHelper = VideoHatakDatabaseHelper(context)
+    ) : this(
+        context = context,
+        themeRepository = themeRepository,
+        playbackRepository = playbackRepository,
+        subtitleRepository = subtitleRepository as SubtitlePreferencesStore,
+        vaultSecurityStore = vaultSecurityPreferences as VaultSecurityBackupStore,
+        playlistStore = databaseHelper as BackupPlaylistStore
+    )
 
     suspend fun exportToUri(uri: Uri): Result<BackupExportSummary> = withContext(Dispatchers.IO) {
         runCatching {
+            val nonNullContext = requireNotNull(context) { "Context is required for exportToUri" }
             val payload = captureCurrentPayload()
             val json = serializeBackupJson(payload)
             val bytes = json.toByteArray(Charsets.UTF_8)
-            context.contentResolver.openOutputStream(uri, "wt")?.use { out ->
+            nonNullContext.contentResolver.openOutputStream(uri, "wt")?.use { out ->
                 out.write(bytes)
                 out.flush()
             } ?: throw IllegalStateException("تعذر فتح ملف التصدير للكتابة")
@@ -129,7 +149,8 @@ class BackupManager(
 
     suspend fun importFromUri(uri: Uri): Result<BackupRestoreSummary> = withContext(Dispatchers.IO) {
         runCatching {
-            val rawJson = context.contentResolver.openInputStream(uri)?.use { input ->
+            val nonNullContext = requireNotNull(context) { "Context is required for importFromUri" }
+            val rawJson = nonNullContext.contentResolver.openInputStream(uri)?.use { input ->
                 input.readBytes().toString(Charsets.UTF_8)
             } ?: throw IllegalStateException("تعذر قراءة ملف النسخة الاحتياطية")
 
@@ -158,10 +179,10 @@ class BackupManager(
 
         val primarySub = subtitleRepository.primaryStyle.first()
         val secondarySub = subtitleRepository.secondaryStyle.first()
-        val autoLock = vaultSecurityPreferences.autoLockTimeout.first()
+        val autoLock = vaultSecurityStore.autoLockTimeout.first()
 
-        val playlists = databaseHelper.getPlaylists().map { playlist ->
-            val items = databaseHelper.getItemsForPlaylist(playlist.id).map { item ->
+        val playlists = playlistStore.getPlaylists().map { playlist ->
+            val items = playlistStore.getItemsForPlaylist(playlist.id).map { item ->
                 BackupPlaylistItemData(
                     videoId = item.videoId,
                     videoTitle = item.videoTitle,
@@ -205,20 +226,8 @@ class BackupManager(
         )
     }
 
-    suspend fun applyPayload(payload: BackupPayload) {
-        themeRepository.setAppTheme(payload.settings.selectedTheme)
-        themeRepository.setThemeMode(payload.settings.themeMode)
-        playbackRepository.setPlaybackSpeed(VideoPlayerManager.clampPlaybackSpeed(payload.settings.playbackSpeed))
-        playbackRepository.setResizeMode(VideoResizeMode.fromCode(payload.settings.resizeMode).storageCode)
-        playbackRepository.setPlaybackMode(payload.settings.playbackMode)
-        playbackRepository.setResumeMode(payload.settings.resumeMode)
-        playbackRepository.restoreSavedPositions(payload.resumePositions)
-
-        subtitleRepository.updatePrimaryFontSize(payload.subtitles.primaryFontSizeSp.coerceIn(12f, 36f))
-        subtitleRepository.updateSecondaryFontSize(payload.subtitles.secondaryFontSizeSp.coerceIn(10f, 32f))
-        vaultSecurityPreferences.setAutoLockTimeout(payload.vaultSecurity.autoLockTimeout)
-
-        val dbEntries = payload.playlists.map { pl ->
+    private fun toDatabaseEntries(playlists: List<BackupPlaylistData>): List<Pair<Playlist, List<PlaylistItem>>> {
+        return playlists.map { pl ->
             val playlist = Playlist(
                 id = 0L,
                 title = pl.title,
@@ -241,12 +250,68 @@ class BackupManager(
             }
             playlist to items
         }
-        databaseHelper.replaceAllPlaylistsAndItems(dbEntries)
+    }
+
+    suspend fun applyPayload(payload: BackupPayload) {
+        val previousSnapshot = captureCurrentPayload()
+        val targetDbEntries = toDatabaseEntries(payload.playlists)
+
+        // Commit transactional DB replacement first: if SQLite fails or returns -1,
+        // no DataStore preferences are touched.
+        playlistStore.replaceAllPlaylistsAndItems(targetDbEntries)
+
+        try {
+            themeRepository.setAppTheme(payload.settings.selectedTheme)
+            themeRepository.setThemeMode(payload.settings.themeMode)
+            playbackRepository.setPlaybackSpeed(VideoPlayerManager.clampPlaybackSpeed(payload.settings.playbackSpeed))
+            playbackRepository.setResizeMode(VideoResizeMode.fromCode(payload.settings.resizeMode).storageCode)
+            playbackRepository.setPlaybackMode(payload.settings.playbackMode)
+            playbackRepository.setResumeMode(payload.settings.resumeMode)
+            playbackRepository.replaceSavedPositions(payload.resumePositions)
+
+            subtitleRepository.updatePrimaryFontSize(payload.subtitles.primaryFontSizeSp.coerceIn(12f, 36f))
+            subtitleRepository.updateSecondaryFontSize(payload.subtitles.secondaryFontSizeSp.coerceIn(10f, 32f))
+            vaultSecurityStore.setAutoLockTimeout(payload.vaultSecurity.autoLockTimeout)
+        } catch (e: Throwable) {
+            try {
+                playlistStore.replaceAllPlaylistsAndItems(toDatabaseEntries(previousSnapshot.playlists))
+                themeRepository.setAppTheme(previousSnapshot.settings.selectedTheme)
+                themeRepository.setThemeMode(previousSnapshot.settings.themeMode)
+                playbackRepository.setPlaybackSpeed(previousSnapshot.settings.playbackSpeed)
+                playbackRepository.setResizeMode(previousSnapshot.settings.resizeMode)
+                playbackRepository.setPlaybackMode(previousSnapshot.settings.playbackMode)
+                playbackRepository.setResumeMode(previousSnapshot.settings.resumeMode)
+                playbackRepository.replaceSavedPositions(previousSnapshot.resumePositions)
+                subtitleRepository.updatePrimaryFontSize(previousSnapshot.subtitles.primaryFontSizeSp)
+                subtitleRepository.updateSecondaryFontSize(previousSnapshot.subtitles.secondaryFontSizeSp)
+                vaultSecurityStore.setAutoLockTimeout(previousSnapshot.vaultSecurity.autoLockTimeout)
+            } catch (rollbackError: Throwable) {
+                e.addSuppressed(rollbackError)
+            }
+            throw e
+        }
     }
 
     companion object {
         const val SCHEMA_VERSION = 2
         val SUPPORTED_SCHEMA_VERSIONS = setOf(1, 2)
+
+        internal fun createForTesting(
+            themeRepository: ThemePreferencesRepository,
+            playbackRepository: PlaybackPreferencesRepository,
+            subtitleRepository: SubtitlePreferencesStore,
+            vaultSecurityStore: VaultSecurityBackupStore,
+            playlistStore: BackupPlaylistStore
+        ): BackupManager {
+            return BackupManager(
+                context = null,
+                themeRepository = themeRepository,
+                playbackRepository = playbackRepository,
+                subtitleRepository = subtitleRepository,
+                vaultSecurityStore = vaultSecurityStore,
+                playlistStore = playlistStore
+            )
+        }
 
         fun serializeBackupJson(payload: BackupPayload): String {
             val canonicalBody = buildCanonicalBodyJson(payload)

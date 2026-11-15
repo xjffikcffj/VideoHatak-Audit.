@@ -8,11 +8,22 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 class ThemeViewModel(private val repository: ThemePreferencesRepository) : ViewModel() {
+
+    private val _persistedThemeMode = MutableStateFlow(ThemeMode.SYSTEM)
+
+    init {
+        viewModelScope.launch {
+            repository.themeModeFlow.collect { mode ->
+                _persistedThemeMode.value = mode
+            }
+        }
+    }
 
     val themeState: StateFlow<ThemeState> = repository.themeModeFlow
         .map<ThemeMode, ThemeState> { ThemeState.Success(it) }
@@ -81,7 +92,10 @@ class ThemeViewModel(private val repository: ThemePreferencesRepository) : ViewM
     fun startPreviewTheme(theme: AppThemeId) {
         if (theme == appTheme.value && _previewAppTheme.value == null) return
         _previewAppTheme.value = theme
-        _previewThemeMode.value = if (theme.isLightTheme) ThemeMode.LIGHT else ThemeMode.DARK
+        val baseMode = _previewThemeMode.value ?: _persistedThemeMode.value
+        if (baseMode != ThemeMode.SYSTEM) {
+            _previewThemeMode.value = if (theme.isLightTheme) ThemeMode.LIGHT else ThemeMode.DARK
+        }
     }
 
     fun startPreviewThemeMode(mode: ThemeMode) {
@@ -94,12 +108,13 @@ class ThemeViewModel(private val repository: ThemePreferencesRepository) : ViewM
         _previewAppTheme.value = null
         _previewThemeMode.value = null
         viewModelScope.launch {
+            val currentSavedMode = repository.themeModeFlow.first()
             if (targetTheme != null) {
                 repository.setAppTheme(targetTheme)
             }
             if (targetMode != null) {
                 repository.setThemeMode(targetMode)
-            } else if (targetTheme != null) {
+            } else if (targetTheme != null && currentSavedMode != ThemeMode.SYSTEM) {
                 repository.setThemeMode(if (targetTheme.isLightTheme) ThemeMode.LIGHT else ThemeMode.DARK)
             }
         }
@@ -112,6 +127,7 @@ class ThemeViewModel(private val repository: ThemePreferencesRepository) : ViewM
 
     fun setThemeMode(mode: ThemeMode) {
         _previewThemeMode.value = null
+        _persistedThemeMode.value = mode
         viewModelScope.launch {
             repository.setThemeMode(mode)
         }
@@ -121,8 +137,11 @@ class ThemeViewModel(private val repository: ThemePreferencesRepository) : ViewM
         _previewAppTheme.value = null
         _previewThemeMode.value = null
         viewModelScope.launch {
+            val currentSavedMode = repository.themeModeFlow.first()
             repository.setAppTheme(theme)
-            repository.setThemeMode(if (theme.isLightTheme) ThemeMode.LIGHT else ThemeMode.DARK)
+            if (currentSavedMode != ThemeMode.SYSTEM) {
+                repository.setThemeMode(if (theme.isLightTheme) ThemeMode.LIGHT else ThemeMode.DARK)
+            }
         }
     }
 

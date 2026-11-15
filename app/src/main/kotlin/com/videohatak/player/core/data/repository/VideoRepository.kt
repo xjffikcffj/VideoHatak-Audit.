@@ -51,6 +51,12 @@ sealed interface PendingVideoFileOp {
     data class DeletePermanent(val video: VideoItem, val trashItemId: Long? = null) : PendingVideoFileOp
 }
 
+sealed interface MediaExistenceResult {
+    data object Exists : MediaExistenceResult
+    data object Missing : MediaExistenceResult
+    data class Unverifiable(val reason: String) : MediaExistenceResult
+}
+
 interface VideoRepository {
     fun observeVideos(): Flow<List<VideoItem>>
     suspend fun getVideos(): List<VideoItem>
@@ -62,7 +68,10 @@ interface VideoRepository {
     ): List<VideoItem>
     fun groupIntoFolders(videos: List<VideoItem>): List<VideoFolder>
 
-    suspend fun doesMediaExist(video: VideoItem): Boolean = true
+    suspend fun checkMediaExistence(video: VideoItem): MediaExistenceResult = MediaExistenceResult.Exists
+
+    suspend fun doesMediaExist(video: VideoItem): Boolean =
+        checkMediaExistence(video) is MediaExistenceResult.Exists
 
     suspend fun renameVideo(video: VideoItem, newName: String): VideoFileOperationResult {
         return VideoFileOperationResult.Error("غير مدعوم")
@@ -87,10 +96,10 @@ interface VideoRepository {
         video: VideoItem,
         trashItemId: Long? = null
     ): VideoFileOperationResult {
-        return if (!doesMediaExist(video)) {
-            VideoFileOperationResult.Success
-        } else {
-            deleteVideoPermanently(video, trashItemId)
+        return when (val existence = checkMediaExistence(video)) {
+            MediaExistenceResult.Missing -> VideoFileOperationResult.Success
+            MediaExistenceResult.Exists -> deleteVideoPermanently(video, trashItemId)
+            is MediaExistenceResult.Unverifiable -> VideoFileOperationResult.Error(existence.reason)
         }
     }
 }
@@ -397,27 +406,42 @@ class LocalVideoRepositoryImpl(
         }
     }
 
-    override suspend fun doesMediaExist(video: VideoItem): Boolean = withContext(Dispatchers.IO) {
+    override suspend fun checkMediaExistence(video: VideoItem): MediaExistenceResult = withContext(Dispatchers.IO) {
+        if (!PermissionHelper.hasAnyAccess(PermissionHelper.checkPermissionStatus(context))) {
+            return@withContext MediaExistenceResult.Unverifiable("لا توجد صلاحية وصول للوسائط للتحقق من وجود الملف")
+        }
+
         if (video.path.isNotBlank() && Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
             val file = File(video.path)
-            if (file.exists()) return@withContext true
+            if (file.exists()) return@withContext MediaExistenceResult.Exists
         }
-        val existsInStore = try {
-            contentResolver.query(
+
+        val storeCheckResult: MediaExistenceResult? = try {
+            val found = contentResolver.query(
                 video.contentUri,
                 arrayOf(MediaStore.Video.Media._ID),
                 null,
                 null,
                 null
             )?.use { cursor -> cursor.count > 0 } ?: false
-        } catch (_: Exception) {
-            false
+            if (found) MediaExistenceResult.Exists else null
+        } catch (_: SecurityException) {
+            MediaExistenceResult.Unverifiable("تعذر التحقق من الملف بسبب قيود الصلاحيات")
+        } catch (e: Exception) {
+            MediaExistenceResult.Unverifiable(e.localizedMessage ?: "تعذر التحقق من حالة الملف حاليًا")
         }
-        if (existsInStore) return@withContext true
+
+        if (storeCheckResult != null) return@withContext storeCheckResult
+
         try {
-            contentResolver.openAssetFileDescriptor(video.contentUri, "r")?.use { true } ?: false
-        } catch (_: Exception) {
-            false
+            val opened = contentResolver.openAssetFileDescriptor(video.contentUri, "r")?.use { true } ?: false
+            if (opened) MediaExistenceResult.Exists else MediaExistenceResult.Missing
+        } catch (_: java.io.FileNotFoundException) {
+            MediaExistenceResult.Missing
+        } catch (_: SecurityException) {
+            MediaExistenceResult.Unverifiable("صلاحية الوصول إلى هذا الملف مقيدة")
+        } catch (e: Exception) {
+            MediaExistenceResult.Unverifiable(e.localizedMessage ?: "تعذر التحقق من وجود الملف")
         }
     }
 
@@ -432,7 +456,7 @@ class LocalVideoRepositoryImpl(
                 } catch (_: SecurityException) {
                     0
                 }
-                if (deleted > 0 || !doesMediaExist(video)) {
+                if (deleted > 0 || checkMediaExistence(video) is MediaExistenceResult.Missing) {
                     return@withContext VideoFileOperationResult.Success
                 }
                 val pi = MediaStore.createDeleteRequest(contentResolver, listOf(video.contentUri))
@@ -442,7 +466,7 @@ class LocalVideoRepositoryImpl(
                 )
             } else if (Build.VERSION.SDK_INT == Build.VERSION_CODES.Q) {
                 val deleted = contentResolver.delete(video.contentUri, null, null)
-                if (deleted > 0 || !doesMediaExist(video)) {
+                if (deleted > 0 || checkMediaExistence(video) is MediaExistenceResult.Missing) {
                     VideoFileOperationResult.Success
                 } else {
                     VideoFileOperationResult.Error("تعذر حذف ملف الفيديو نهائيًا")
@@ -491,13 +515,15 @@ class LocalVideoRepositoryImpl(
         video: VideoItem,
         trashItemId: Long?
     ): VideoFileOperationResult = withContext(Dispatchers.IO) {
-        if (!doesMediaExist(video)) {
-            return@withContext VideoFileOperationResult.Success
+        when (val currentExistence = checkMediaExistence(video)) {
+            MediaExistenceResult.Missing -> return@withContext VideoFileOperationResult.Success
+            is MediaExistenceResult.Unverifiable -> return@withContext VideoFileOperationResult.Error(currentExistence.reason)
+            MediaExistenceResult.Exists -> Unit
         }
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 val deleted = contentResolver.delete(video.contentUri, null, null)
-                if (deleted > 0 || !doesMediaExist(video)) {
+                if (deleted > 0 || checkMediaExistence(video) is MediaExistenceResult.Missing) {
                     VideoFileOperationResult.Success
                 } else {
                     VideoFileOperationResult.Error("لم يكتمل حذف الملف من ذاكرة الجهاز، تم الإبقاء على السجل")
@@ -506,7 +532,7 @@ class LocalVideoRepositoryImpl(
                 deleteVideoPermanently(video, trashItemId)
             }
         } catch (e: Exception) {
-            if (!doesMediaExist(video)) {
+            if (checkMediaExistence(video) is MediaExistenceResult.Missing) {
                 VideoFileOperationResult.Success
             } else {
                 VideoFileOperationResult.Error(e.localizedMessage ?: "تعذر حذف الملف بعد منح الإذن")

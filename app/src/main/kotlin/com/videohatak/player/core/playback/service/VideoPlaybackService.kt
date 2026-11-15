@@ -160,8 +160,10 @@ class VideoPlaybackService : MediaSessionService() {
 
     private fun updateNotification(player: Player, isPlaying: Boolean) {
         val session = mediaSession ?: return
-        val title = player.currentMediaItem?.mediaMetadata?.title?.toString()?.ifBlank { null }
-            ?: "فيديوهاتك — كما تحب"
+        val privacyMeta = MediaNotificationPrivacy.resolveNotificationMetadata(
+            mediaItem = player.currentMediaItem,
+            isPlaying = isPlaying
+        )
 
         val prevAction = NotificationCompat.Action.Builder(
             android.R.drawable.ic_media_previous,
@@ -198,13 +200,13 @@ class VideoPlaybackService : MediaSessionService() {
 
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_media_play)
-            .setContentTitle(title)
-            .setContentText(if (isPlaying) "قيد التشغيل في الخلفية" else "متوقف مؤقتًا")
+            .setContentTitle(privacyMeta.title)
+            .setContentText(privacyMeta.contentText)
             .setContentIntent(contentIntent)
             .setOngoing(isPlaying)
             .setOnlyAlertOnce(true)
             .setSilent(true)
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setVisibility(privacyMeta.visibility)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .addAction(prevAction)
             .addAction(playPauseAction)
@@ -214,6 +216,17 @@ class VideoPlaybackService : MediaSessionService() {
                 MediaStyleNotificationHelper.MediaStyle(session)
                     .setShowActionsInCompactView(0, 1, 2)
             )
+
+        if (privacyMeta.isVaultPrivate) {
+            val publicVersionNotification = NotificationCompat.Builder(this, CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.ic_media_play)
+                .setContentTitle(MediaNotificationPrivacy.VAULT_MASKED_TITLE)
+                .setContentText(MediaNotificationPrivacy.VAULT_MASKED_TEXT)
+                .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                .setSilent(true)
+                .build()
+            builder.setPublicVersion(publicVersionNotification)
+        }
 
         val notification = builder.build()
         if (!isForegroundStarted || isPlaying) {

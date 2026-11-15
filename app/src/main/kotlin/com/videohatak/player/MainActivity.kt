@@ -51,6 +51,7 @@ import com.videohatak.player.core.designsystem.theme.ThemePreferencesRepositoryI
 import com.videohatak.player.core.designsystem.theme.ThemeState
 import com.videohatak.player.core.designsystem.theme.ThemeViewModel
 import com.videohatak.player.core.designsystem.theme.VideoHatakTheme
+import com.videohatak.player.core.designsystem.theme.resolveIsDarkTheme
 import com.videohatak.player.core.designsystem.theme.themeDataStore
 import com.videohatak.player.core.model.VideoItem
 import com.videohatak.player.core.permission.PermissionHelper
@@ -113,12 +114,14 @@ class MainActivity : FragmentActivity() {
 
     private val pipReceiver = PipActionReceiver()
     private val isInPipModeState = mutableStateOf(false)
+    private val canUseBiometricsState = mutableStateOf(true)
     private var activeVideoState: VideoItem? = null
 
     @OptIn(ExperimentalMaterial3WindowSizeClassApi::class)
     override fun onCreate(savedInstanceState: Bundle?) {
         val splashScreen = installSplashScreen()
         super.onCreate(savedInstanceState)
+        canUseBiometricsState.value = vaultViewModel.canUseBiometrics()
 
         val pipFilter = IntentFilter().apply {
             addAction(PipHelper.ACTION_PIP_PLAY_PAUSE)
@@ -155,11 +158,7 @@ class MainActivity : FragmentActivity() {
                 is ThemeState.Loading -> effectiveThemeMode
             }
 
-            val isDark = when (currentThemeMode) {
-                ThemeMode.DARK -> true
-                ThemeMode.LIGHT -> false
-                ThemeMode.SYSTEM -> if (selectedAppTheme.isLightTheme) false else (isSystemInDarkTheme() || !selectedAppTheme.isLightTheme)
-            }
+            val isDark = resolveIsDarkTheme(currentThemeMode, isSystemInDarkTheme())
 
             DisposableEffect(isDark) {
                 val insetsController = WindowInsetsControllerCompat(window, window.decorView)
@@ -253,7 +252,11 @@ class MainActivity : FragmentActivity() {
             val vaultError by vaultViewModel.vaultError.collectAsStateWithLifecycle()
             val vaultHasPinConfigured by vaultViewModel.hasPinConfigured.collectAsStateWithLifecycle()
             val vaultAutoLockTimeout by vaultViewModel.autoLockTimeout.collectAsStateWithLifecycle()
+            val vaultCanUseBiometrics by canUseBiometricsState
             val trashItems by libraryViewModel.trashItems.collectAsStateWithLifecycle()
+            val trashError by libraryViewModel.trashError.collectAsStateWithLifecycle()
+            val trashExistenceMap by libraryViewModel.trashExistenceMap.collectAsStateWithLifecycle()
+            val missingTrashItemPendingRemoval by libraryViewModel.missingTrashItemPendingRemoval.collectAsStateWithLifecycle()
 
             val exportBackupLauncher = rememberLauncherForActivityResult(
                 contract = ActivityResultContracts.CreateDocument("application/json")
@@ -330,7 +333,15 @@ class MainActivity : FragmentActivity() {
                 }
             }
 
+            var previousTab by remember { mutableStateOf(currentTab) }
             LaunchedEffect(currentTab) {
+                if (previousTab == LibraryTab.VAULT && currentTab != LibraryTab.VAULT) {
+                    vaultViewModel.onVaultTabExited()
+                }
+                if (currentTab == LibraryTab.TRASH) {
+                    libraryViewModel.refreshTrashStatus()
+                }
+                previousTab = currentTab
                 if (currentTab != LibraryTab.SETTINGS) {
                     themeViewModel.cancelPreview()
                 }
@@ -473,7 +484,14 @@ class MainActivity : FragmentActivity() {
                                 },
                                 onMoveVideoToTrash = libraryViewModel::moveToTrash,
                                 trashItems = trashItems,
+                                trashError = trashError,
+                                trashExistenceMap = trashExistenceMap,
+                                missingTrashItemPendingRemoval = missingTrashItemPendingRemoval,
+                                onRefreshTrashStatus = libraryViewModel::refreshTrashStatus,
+                                onDismissTrashError = libraryViewModel::dismissTrashError,
                                 onRestoreFromTrash = libraryViewModel::restoreFromTrash,
+                                onConfirmRemoveMissingTrashRecord = libraryViewModel::confirmRemoveMissingTrashRecord,
+                                onDismissMissingTrashRemoval = libraryViewModel::dismissMissingTrashRemoval,
                                 onPermanentDeleteTrashItem = libraryViewModel::deleteTrashItemPermanently,
                                 onEmptyTrashBin = libraryViewModel::emptyTrashBin,
                                 selectedAppTheme = selectedAppTheme,
@@ -529,6 +547,7 @@ class MainActivity : FragmentActivity() {
                                 vaultBiometricError = vaultBiometricError,
                                 vaultError = vaultError,
                                 vaultHasPinConfigured = vaultHasPinConfigured,
+                                vaultCanUseBiometrics = vaultCanUseBiometrics,
                                 vaultAutoLockTimeout = vaultAutoLockTimeout,
                                 onVaultAuthenticate = {
                                     vaultViewModel.authenticateWithBiometrics(this@MainActivity)
@@ -597,6 +616,7 @@ class MainActivity : FragmentActivity() {
 
     override fun onResume() {
         super.onResume()
+        canUseBiometricsState.value = vaultViewModel.canUseBiometrics()
         vaultViewModel.checkTimeoutOnForeground()
         val currentStatus = PermissionHelper.checkPermissionStatus(this, this)
         libraryViewModel.onPermissionStatusChanged(currentStatus)

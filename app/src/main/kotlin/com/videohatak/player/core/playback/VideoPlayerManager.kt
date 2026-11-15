@@ -12,6 +12,7 @@ import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import com.videohatak.player.core.model.VideoItem
+import com.videohatak.player.core.playback.service.MediaNotificationPrivacy
 import com.videohatak.player.core.playback.service.VideoPlaybackService
 import com.videohatak.player.core.playlist.model.PlaylistRepeatMode
 import com.videohatak.player.core.subtitle.model.SubtitleCue
@@ -75,6 +76,7 @@ class VideoPlayerManager internal constructor(
     private var lastReportedPositionMs: Long = 0L
     val restorationCoordinator = PlaybackRestorationCoordinator()
     val knownDurations = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val internalTitlesByMediaKey = java.util.concurrent.ConcurrentHashMap<String, String>()
 
     fun getCurrentPlaybackGeneration(): Long = restorationCoordinator.getCurrentPlaybackGeneration()
 
@@ -238,8 +240,12 @@ class VideoPlayerManager internal constructor(
                 val isRepeat = reason == Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT
                 val isRealTransition = restorationCoordinator.onMediaItemTransition(transitionKey, isRepeat)
 
-                val title = mediaItem.mediaMetadata.title?.toString() ?: ""
                 val uri = mediaItem.localConfiguration?.uri
+                val uriKey = uri?.toString().orEmpty()
+                val title = internalTitlesByMediaKey[mediaItem.mediaId]
+                    ?: internalTitlesByMediaKey[uriKey]
+                    ?: mediaItem.mediaMetadata.title?.toString()
+                    ?: ""
                 lastReportedPositionMs = 0L
                 _uiState.update {
                     it.copy(
@@ -328,7 +334,12 @@ class VideoPlayerManager internal constructor(
             )
         }
 
-        if (uri.scheme == "vault") {
+        val isVault = MediaNotificationPrivacy.isVaultUri(uri)
+        internalTitlesByMediaKey.clear()
+        internalTitlesByMediaKey[uri.toString()] = title
+        val publicMetadataTitle = MediaNotificationPrivacy.sanitizeMediaMetadataTitle(isVault, title)
+
+        if (isVault) {
             val nonNullContext = checkNotNull(context) { "Context is required for vault encrypted media source" }
             val dataSourceFactory = { EncryptedVaultDataSource(nonNullContext) }
             val mediaSource = DefaultMediaSourceFactory(dataSourceFactory)
@@ -338,7 +349,7 @@ class VideoPlayerManager internal constructor(
                         .setUri(uri)
                         .setMediaMetadata(
                             androidx.media3.common.MediaMetadata.Builder()
-                                .setTitle(title)
+                                .setTitle(publicMetadataTitle)
                                 .build()
                         )
                         .build()
@@ -350,7 +361,7 @@ class VideoPlayerManager internal constructor(
                 .setUri(uri)
                 .setMediaMetadata(
                     androidx.media3.common.MediaMetadata.Builder()
-                        .setTitle(title)
+                        .setTitle(publicMetadataTitle)
                         .build()
                 )
                 .build()
@@ -382,13 +393,25 @@ class VideoPlayerManager internal constructor(
         exoPlayer.stop()
         exoPlayer.clearMediaItems()
 
+        internalTitlesByMediaKey.clear()
         val mediaItems = items.map { video ->
+            val mediaId = if (MediaNotificationPrivacy.isVaultVideo(video)) {
+                video.contentUri.toString()
+            } else {
+                video.id.toString()
+            }
+            internalTitlesByMediaKey[mediaId] = video.safeTitle
+            internalTitlesByMediaKey[video.contentUri.toString()] = video.safeTitle
+            val metadataTitle = MediaNotificationPrivacy.sanitizeMediaMetadataTitle(
+                isVault = MediaNotificationPrivacy.isVaultVideo(video),
+                originalTitle = video.safeTitle
+            )
             MediaItem.Builder()
-                .setMediaId(video.id.toString())
+                .setMediaId(mediaId)
                 .setUri(video.contentUri)
                 .setMediaMetadata(
                     androidx.media3.common.MediaMetadata.Builder()
-                        .setTitle(video.safeTitle)
+                        .setTitle(metadataTitle)
                         .build()
                 )
                 .build()
@@ -590,6 +613,7 @@ class VideoPlayerManager internal constructor(
     fun stopPlayback() {
         saveCurrentExoPlayerPositionDirectly()
         restorationCoordinator.onPlaybackStopped()
+        internalTitlesByMediaKey.clear()
         exoPlayer.stop()
         exoPlayer.clearMediaItems()
         stopProgressPolling()

@@ -26,5 +26,5 @@ enum class SortOrder(val field: VideoSortField, val direction: SortDirection) {
     DURATION_DESC(VideoSortField.DURATION, SortDirection.DESCENDING);
 
     val asVideoSortOrder: VideoSortOrder
-        get() = VideoSortOrder(field, direction)
+        get() = VideoSortOrder(this.field, this.direction)
 }

@@ -45,11 +45,18 @@ enum class VaultAutoLockTimeout(
     }
 }
 
+data class PinHashRecord(
+    val hashBase64: String,
+    val saltBase64: String,
+    val algorithm: String
+)
+
 object VaultPinHasher {
     private const val ITERATIONS = 65536
     private const val KEY_LENGTH_BITS = 256
     private const val SALT_BYTES = 16
-    private const val ALGORITHM = "PBKDF2WithHmacSHA256"
+    const val ALGORITHM_SHA256 = "PBKDF2WithHmacSHA256"
+    const val ALGORITHM_SHA1 = "PBKDF2WithHmacSHA1"
 
     private val secureRandom = SecureRandom()
 
@@ -57,23 +64,65 @@ object VaultPinHasher {
         return pin.length in 4..12 && pin.all { it.isDigit() }
     }
 
-    fun hashPin(pin: String): Pair<String, String> {
+    fun isAlgorithmSupported(algorithm: String): Boolean {
+        return try {
+            SecretKeyFactory.getInstance(algorithm)
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    fun selectPreferredAlgorithm(
+        isSupported: (String) -> Boolean = ::isAlgorithmSupported
+    ): String {
+        return if (isSupported(ALGORITHM_SHA256)) ALGORITHM_SHA256 else ALGORITHM_SHA1
+    }
+
+    fun hashPinWithAlgorithm(
+        pin: String,
+        preferredAlgorithm: String = selectPreferredAlgorithm()
+    ): PinHashRecord {
         require(isValidPinFormat(pin)) { "PIN must be 4 to 12 numeric digits" }
         val salt = ByteArray(SALT_BYTES).apply { secureRandom.nextBytes(this) }
-        val derived = derive(pin, salt)
+        var effectiveAlgorithm = preferredAlgorithm
+        val derived = try {
+            derive(pin, salt, effectiveAlgorithm)
+        } catch (e: Exception) {
+            if (effectiveAlgorithm != ALGORITHM_SHA1) {
+                effectiveAlgorithm = ALGORITHM_SHA1
+                derive(pin, salt, effectiveAlgorithm)
+            } else {
+                throw e
+            }
+        }
         return try {
-            VaultBase64.encodeNoWrap(derived) to VaultBase64.encodeNoWrap(salt)
+            PinHashRecord(
+                hashBase64 = VaultBase64.encodeNoWrap(derived),
+                saltBase64 = VaultBase64.encodeNoWrap(salt),
+                algorithm = effectiveAlgorithm
+            )
         } finally {
             derived.fill(0)
         }
     }
 
-    fun verifyPin(pin: String, storedHashBase64: String, storedSaltBase64: String): Boolean {
+    fun hashPin(pin: String): Pair<String, String> {
+        val record = hashPinWithAlgorithm(pin)
+        return record.hashBase64 to record.saltBase64
+    }
+
+    fun verifyPin(
+        pin: String,
+        storedHashBase64: String,
+        storedSaltBase64: String,
+        algorithm: String = selectPreferredAlgorithm()
+    ): Boolean {
         if (pin.isEmpty() || storedHashBase64.isBlank() || storedSaltBase64.isBlank()) return false
         return try {
             val expectedHash = VaultBase64.decode(storedHashBase64)
             val salt = VaultBase64.decode(storedSaltBase64)
-            val candidateHash = derive(pin, salt)
+            val candidateHash = derive(pin, salt, algorithm)
             try {
                 MessageDigest.isEqual(candidateHash, expectedHash)
             } finally {
@@ -84,10 +133,10 @@ object VaultPinHasher {
         }
     }
 
-    private fun derive(pin: String, salt: ByteArray): ByteArray {
+    private fun derive(pin: String, salt: ByteArray, algorithm: String): ByteArray {
         val spec = PBEKeySpec(pin.toCharArray(), salt, ITERATIONS, KEY_LENGTH_BITS)
         return try {
-            val factory = SecretKeyFactory.getInstance(ALGORITHM)
+            val factory = SecretKeyFactory.getInstance(algorithm)
             factory.generateSecret(spec).encoded
         } finally {
             spec.clearPassword()
@@ -114,13 +163,19 @@ object VaultPinLockoutPolicy {
     }
 }
 
+interface VaultSecurityBackupStore {
+    val autoLockTimeout: Flow<VaultAutoLockTimeout>
+    suspend fun setAutoLockTimeout(timeout: VaultAutoLockTimeout)
+}
+
 class VaultSecurityPreferences(
     private val dataStore: DataStore<Preferences>
-) {
+) : VaultSecurityBackupStore {
     constructor(context: Context) : this(context.vaultSecurityDataStore)
 
     private val pinHashKey = stringPreferencesKey("vault_pin_hash_v1")
     private val pinSaltKey = stringPreferencesKey("vault_pin_salt_v1")
+    private val pinAlgoKey = stringPreferencesKey("vault_pin_algo_v1")
     private val autoLockKey = stringPreferencesKey("vault_auto_lock_timeout_v1")
     private val failedAttemptsKey = intPreferencesKey("vault_pin_failed_attempts_v1")
     private val lockoutUntilKey = longPreferencesKey("vault_pin_lockout_until_ms_v1")
@@ -129,7 +184,7 @@ class VaultSecurityPreferences(
         !prefs[pinHashKey].isNullOrBlank() && !prefs[pinSaltKey].isNullOrBlank()
     }
 
-    val autoLockTimeout: Flow<VaultAutoLockTimeout> = dataStore.data.map { prefs ->
+    override val autoLockTimeout: Flow<VaultAutoLockTimeout> = dataStore.data.map { prefs ->
         VaultAutoLockTimeout.fromName(prefs[autoLockKey])
     }
 
@@ -140,10 +195,15 @@ class VaultSecurityPreferences(
 
     suspend fun setPin(pin: String): Boolean {
         if (!VaultPinHasher.isValidPinFormat(pin)) return false
-        val (hash, salt) = VaultPinHasher.hashPin(pin)
+        val record = try {
+            VaultPinHasher.hashPinWithAlgorithm(pin)
+        } catch (_: Exception) {
+            return false
+        }
         dataStore.edit { prefs ->
-            prefs[pinHashKey] = hash
-            prefs[pinSaltKey] = salt
+            prefs[pinHashKey] = record.hashBase64
+            prefs[pinSaltKey] = record.saltBase64
+            prefs[pinAlgoKey] = record.algorithm
             prefs[failedAttemptsKey] = 0
             prefs[lockoutUntilKey] = 0L
         }
@@ -180,7 +240,8 @@ class VaultSecurityPreferences(
             )
         }
 
-        val isMatch = VaultPinHasher.verifyPin(pin, storedHash, storedSalt)
+        val storedAlgo = prefs[pinAlgoKey] ?: VaultPinHasher.ALGORITHM_SHA256
+        val isMatch = VaultPinHasher.verifyPin(pin, storedHash, storedSalt, storedAlgo)
         if (isMatch) {
             if (currentAttempts > 0 || lockoutUntil > 0L) {
                 resetPinLockout()
@@ -211,12 +272,13 @@ class VaultSecurityPreferences(
         dataStore.edit { prefs ->
             prefs.remove(pinHashKey)
             prefs.remove(pinSaltKey)
+            prefs.remove(pinAlgoKey)
             prefs.remove(failedAttemptsKey)
             prefs.remove(lockoutUntilKey)
         }
     }
 
-    suspend fun setAutoLockTimeout(timeout: VaultAutoLockTimeout) {
+    override suspend fun setAutoLockTimeout(timeout: VaultAutoLockTimeout) {
         dataStore.edit { prefs ->
             prefs[autoLockKey] = timeout.name
         }

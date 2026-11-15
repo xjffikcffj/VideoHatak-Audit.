@@ -206,7 +206,7 @@ fun PlayerControlsOverlay(
                             val selected = kotlin.math.abs(uiState.playbackSpeed - speedOption) < 0.02f
                             Surface(
                                 shape = RoundedCornerShape(10.dp),
-                                color = if (selected) palette.accent.copy(alpha = 0.22f) else palette.surfaceVariant,
+                                color = if (selected) palette.accent.copy(alpha = 0.22f) else palette.surfaceElevated,
                                 border = BorderStroke(
                                     width = 1.dp,
                                     color = if (selected) palette.accent else palette.border

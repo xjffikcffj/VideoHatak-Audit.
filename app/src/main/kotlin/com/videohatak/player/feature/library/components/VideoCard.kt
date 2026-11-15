@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Lock
@@ -62,6 +63,7 @@ fun VideoCard(
     onRenameClick: () -> Unit = {},
     onMoveToFolderClick: () -> Unit = {},
     onAddToVaultClick: () -> Unit = {},
+    onMoveToTrashClick: (() -> Unit)? = null,
     onInfoClick: () -> Unit = {},
     onMoreClick: (() -> Unit)? = null,
     modifier: Modifier = Modifier
@@ -201,11 +203,13 @@ fun VideoCard(
                     )
                 }
 
-                DropdownMenu(
-                    expanded = menuExpanded,
-                    onDismissRequest = { menuExpanded = false },
-                    containerColor = palette.surface
+                MaterialTheme(
+                    colorScheme = MaterialTheme.colorScheme.copy(surface = palette.surface)
                 ) {
+                    DropdownMenu(
+                        expanded = menuExpanded,
+                        onDismissRequest = { menuExpanded = false }
+                    ) {
                     DropdownMenuItem(
                         text = { Text("إضافة إلى القائمة", color = palette.onSurface) },
                         leadingIcon = { Icon(Icons.Default.PlaylistAdd, contentDescription = null, tint = palette.accent) },
@@ -230,14 +234,31 @@ fun VideoCard(
                             onAddToVaultClick()
                         }
                     )
-                    DropdownMenuItem(
-                        text = { Text("معلومات الفيديو", color = palette.onSurface) },
-                        leadingIcon = { Icon(Icons.Default.Info, contentDescription = null, tint = palette.accent) },
-                        onClick = {
-                            menuExpanded = false
-                            onInfoClick()
+                        DropdownMenuItem(
+                            text = { Text("معلومات الفيديو", color = palette.onSurface) },
+                            leadingIcon = { Icon(Icons.Default.Info, contentDescription = null, tint = palette.accent) },
+                            onClick = {
+                                menuExpanded = false
+                                onInfoClick()
+                            }
+                        )
+                        if (onMoveToTrashClick != null) {
+                            DropdownMenuItem(
+                                text = { Text("نقل إلى السلة", color = MaterialTheme.colorScheme.error) },
+                                leadingIcon = {
+                                    Icon(
+                                        Icons.Default.DeleteOutline,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.error
+                                    )
+                                },
+                                onClick = {
+                                    menuExpanded = false
+                                    onMoveToTrashClick()
+                                }
+                            )
                         }
-                    )
+                    }
                 }
             }
         }

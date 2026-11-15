@@ -37,6 +37,9 @@ interface PlaybackPreferencesRepository {
     suspend fun getSavedVideoPosition(videoUri: String, durationMs: Long = 0L, legacyVideoId: Long? = null): Long
     suspend fun exportSavedPositions(): Map<String, Long> = emptyMap()
     suspend fun restoreSavedPositions(positions: Map<String, Long>) {}
+    suspend fun replaceSavedPositions(positions: Map<String, Long>) {
+        restoreSavedPositions(positions)
+    }
 }
 
 class PlaybackPreferencesRepositoryImpl(
@@ -173,6 +176,24 @@ class PlaybackPreferencesRepositoryImpl(
     override suspend fun restoreSavedPositions(positions: Map<String, Long>) {
         if (positions.isEmpty()) return
         dataStore.edit { prefs ->
+            for ((rawKey, posMs) in positions) {
+                if (posMs <= 0L || rawKey.isBlank()) continue
+                val prefKey = if (rawKey.startsWith("vid_pos_") && rawKey.length in 10..64) {
+                    longPreferencesKey(rawKey)
+                } else {
+                    positionKey(rawKey)
+                }
+                prefs[prefKey] = posMs
+            }
+        }
+    }
+
+    override suspend fun replaceSavedPositions(positions: Map<String, Long>) {
+        dataStore.edit { prefs ->
+            val existingPosKeys = prefs.asMap().keys.filter { it.name.startsWith("vid_pos_") }
+            for (oldKey in existingPosKeys) {
+                prefs.remove(oldKey)
+            }
             for ((rawKey, posMs) in positions) {
                 if (posMs <= 0L || rawKey.isBlank()) continue
                 val prefKey = if (rawKey.startsWith("vid_pos_") && rawKey.length in 10..64) {

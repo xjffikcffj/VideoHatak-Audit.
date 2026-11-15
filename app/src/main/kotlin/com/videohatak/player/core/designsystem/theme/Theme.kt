@@ -5,6 +5,15 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 
+fun resolveIsDarkTheme(
+    themeMode: ThemeMode,
+    systemIsDark: Boolean
+): Boolean = when (themeMode) {
+    ThemeMode.DARK -> true
+    ThemeMode.LIGHT -> false
+    ThemeMode.SYSTEM -> systemIsDark
+}
+
 @Composable
 fun VideoHatakTheme(
     themeMode: ThemeMode = ThemeMode.SYSTEM,
@@ -13,11 +22,8 @@ fun VideoHatakTheme(
     dynamicColor: Boolean = false,
     content: @Composable () -> Unit
 ) {
-    val isDark = darkTheme ?: when (themeMode) {
-        ThemeMode.SYSTEM -> if (appTheme.isLightTheme) false else isSystemInDarkTheme() || !appTheme.isLightTheme
-        ThemeMode.DARK -> true
-        ThemeMode.LIGHT -> false
-    }
+    val systemIsDark = isSystemInDarkTheme()
+    val isDark = darkTheme ?: resolveIsDarkTheme(themeMode, systemIsDark)
 
     val palette = paletteForTheme(
         themeId = appTheme,

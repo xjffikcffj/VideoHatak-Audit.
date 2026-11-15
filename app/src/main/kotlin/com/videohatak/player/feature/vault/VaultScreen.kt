@@ -78,6 +78,7 @@ fun VaultScreen(
     biometricError: String?,
     vaultError: String? = null,
     hasPinConfigured: Boolean = false,
+    canUseBiometrics: Boolean = true,
     autoLockTimeout: VaultAutoLockTimeout = VaultAutoLockTimeout.IMMEDIATE,
     onAuthenticateClick: () -> Unit,
     onUnlockWithPin: (String) -> Unit = {},
@@ -248,34 +249,66 @@ fun VaultScreen(
 
                 Spacer(modifier = Modifier.height(28.dp))
 
-                Button(
-                    onClick = onAuthenticateClick,
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = palette.accent,
-                        contentColor = MaterialTheme.colorScheme.onPrimary
-                    ),
-                    modifier = Modifier
-                        .fillMaxWidth(0.85f)
-                        .height(48.dp)
-                ) {
-                    Icon(Icons.Default.LockOpen, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text("فتح الخزنة بالبصمة أو القفل", fontWeight = FontWeight.Bold)
+                if (!canUseBiometrics) {
+                    Text(
+                        text = if (hasPinConfigured) {
+                            "التحقق الحيوي غير متاح على هذا الجهاز حاليًا — يمكنك الفتح برمز PIN."
+                        } else {
+                            "يرجى تفعيل البصمة أو قفل الشاشة في إعدادات الجهاز أو فتح الخزنة وتعيين رمز PIN."
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = palette.onSurfaceMuted,
+                        textAlign = TextAlign.Center
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                }
+
+                if (canUseBiometrics || !hasPinConfigured) {
+                    Button(
+                        onClick = onAuthenticateClick,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = palette.accent,
+                            contentColor = MaterialTheme.colorScheme.onPrimary
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth(0.85f)
+                            .height(48.dp)
+                    ) {
+                        Icon(Icons.Default.LockOpen, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("فتح الخزنة بالبصمة أو القفل", fontWeight = FontWeight.Bold)
+                    }
                 }
 
                 if (hasPinConfigured) {
-                    Spacer(modifier = Modifier.height(10.dp))
-
-                    OutlinedButton(
-                        onClick = { showPinUnlockDialog = true },
-                        border = BorderStroke(1.dp, palette.accent),
-                        modifier = Modifier
-                            .fillMaxWidth(0.85f)
-                            .height(46.dp)
-                    ) {
-                        Icon(Icons.Default.Pin, contentDescription = null, tint = palette.accent, modifier = Modifier.size(18.dp))
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text("فتح برمز PIN", color = palette.accent, fontWeight = FontWeight.Bold)
+                    if (canUseBiometrics) {
+                        Spacer(modifier = Modifier.height(10.dp))
+                        OutlinedButton(
+                            onClick = { showPinUnlockDialog = true },
+                            border = BorderStroke(1.dp, palette.accent),
+                            modifier = Modifier
+                                .fillMaxWidth(0.85f)
+                                .height(46.dp)
+                        ) {
+                            Icon(Icons.Default.Pin, contentDescription = null, tint = palette.accent, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("فتح برمز PIN", color = palette.accent, fontWeight = FontWeight.Bold)
+                        }
+                    } else {
+                        Button(
+                            onClick = { showPinUnlockDialog = true },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = palette.accent,
+                                contentColor = MaterialTheme.colorScheme.onPrimary
+                            ),
+                            modifier = Modifier
+                                .fillMaxWidth(0.85f)
+                                .height(48.dp)
+                        ) {
+                            Icon(Icons.Default.Pin, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("فتح الخزنة برمز PIN", fontWeight = FontWeight.Bold)
+                        }
                     }
                 }
 

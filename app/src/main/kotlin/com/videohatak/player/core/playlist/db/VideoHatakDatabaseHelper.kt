@@ -8,12 +8,25 @@ import com.videohatak.player.core.playlist.model.Playlist
 import com.videohatak.player.core.playlist.model.PlaylistItem
 import com.videohatak.player.core.trash.model.TrashItem
 
+interface TrashDatabaseStore {
+    fun insertTrashItem(item: TrashItem): Long
+    fun getAllTrashItems(): List<TrashItem>
+    fun deleteTrashItemById(id: Long): Int
+    fun clearAllTrashItems(): Int
+}
+
+interface BackupPlaylistStore {
+    fun getPlaylists(): List<Playlist>
+    fun getItemsForPlaylist(playlistId: Long): List<PlaylistItem>
+    fun replaceAllPlaylistsAndItems(entries: List<Pair<Playlist, List<PlaylistItem>>>)
+}
+
 class VideoHatakDatabaseHelper(context: Context) : SQLiteOpenHelper(
     context,
     DATABASE_NAME,
     null,
     DATABASE_VERSION
-) {
+), TrashDatabaseStore, BackupPlaylistStore {
     companion object {
         private const val DATABASE_NAME = "videohatak_playlists.db"
         const val DATABASE_VERSION = 3
@@ -255,7 +268,7 @@ class VideoHatakDatabaseHelper(context: Context) : SQLiteOpenHelper(
         return db.delete(TABLE_PLAYLISTS, "$COL_P_ID = ?", arrayOf(id.toString()))
     }
 
-    fun getPlaylists(): List<Playlist> {
+    override fun getPlaylists(): List<Playlist> {
         val list = mutableListOf<Playlist>()
         val db = readableDatabase
         val query = """
@@ -321,7 +334,7 @@ class VideoHatakDatabaseHelper(context: Context) : SQLiteOpenHelper(
         return rows
     }
 
-    fun getItemsForPlaylist(playlistId: Long): List<PlaylistItem> {
+    override fun getItemsForPlaylist(playlistId: Long): List<PlaylistItem> {
         val list = mutableListOf<PlaylistItem>()
         val db = readableDatabase
         val cursor = db.query(
@@ -406,7 +419,7 @@ class VideoHatakDatabaseHelper(context: Context) : SQLiteOpenHelper(
         db.update(TABLE_PLAYLISTS, values, "$COL_P_ID = ?", arrayOf(playlistId.toString()))
     }
 
-    fun insertTrashItem(item: TrashItem): Long {
+    override fun insertTrashItem(item: TrashItem): Long {
         val db = writableDatabase
         val values = ContentValues().apply {
             put(COL_T_VIDEO_ID, item.videoId)
@@ -427,7 +440,7 @@ class VideoHatakDatabaseHelper(context: Context) : SQLiteOpenHelper(
         return db.insertWithOnConflict(TABLE_TRASH, null, values, SQLiteDatabase.CONFLICT_REPLACE)
     }
 
-    fun getAllTrashItems(): List<TrashItem> {
+    override fun getAllTrashItems(): List<TrashItem> {
         val list = mutableListOf<TrashItem>()
         val db = readableDatabase
         val cursor = db.query(TABLE_TRASH, null, null, null, null, null, "$COL_T_TRASHED_AT DESC")
@@ -473,17 +486,17 @@ class VideoHatakDatabaseHelper(context: Context) : SQLiteOpenHelper(
         return list
     }
 
-    fun deleteTrashItemById(id: Long): Int {
+    override fun deleteTrashItemById(id: Long): Int {
         val db = writableDatabase
         return db.delete(TABLE_TRASH, "$COL_T_ID = ?", arrayOf(id.toString()))
     }
 
-    fun clearAllTrashItems(): Int {
+    override fun clearAllTrashItems(): Int {
         val db = writableDatabase
         return db.delete(TABLE_TRASH, null, null)
     }
 
-    fun replaceAllPlaylistsAndItems(entries: List<Pair<Playlist, List<PlaylistItem>>>) {
+    override fun replaceAllPlaylistsAndItems(entries: List<Pair<Playlist, List<PlaylistItem>>>) {
         val db = writableDatabase
         db.beginTransaction()
         try {
@@ -496,20 +509,24 @@ class VideoHatakDatabaseHelper(context: Context) : SQLiteOpenHelper(
                     put(COL_P_UPDATED_AT, playlist.updatedAt)
                 }
                 val newPlaylistId = db.insert(TABLE_PLAYLISTS, null, pValues)
-                if (newPlaylistId > 0L) {
-                    items.forEachIndexed { idx, item ->
-                        val iValues = ContentValues().apply {
-                            put(COL_I_PLAYLIST_ID, newPlaylistId)
-                            put(COL_I_VIDEO_ID, item.videoId)
-                            put(COL_I_ORDER_INDEX, idx)
-                            put(COL_I_TITLE, item.videoTitle)
-                            put(COL_I_DURATION, item.durationMs)
-                            put(COL_I_SIZE, item.sizeBytes)
-                            put(COL_I_DATE_ADDED, item.dateAddedSec)
-                            put(COL_I_URI, item.contentUri)
-                            put(COL_I_IS_AVAILABLE, if (item.isAvailable) 1 else 0)
-                        }
-                        db.insert(TABLE_PLAYLIST_ITEMS, null, iValues)
+                if (newPlaylistId <= 0L) {
+                    throw IllegalStateException("تعذر إدراج قائمة التشغيل \"${playlist.title}\" في قاعدة البيانات")
+                }
+                items.forEachIndexed { idx, item ->
+                    val iValues = ContentValues().apply {
+                        put(COL_I_PLAYLIST_ID, newPlaylistId)
+                        put(COL_I_VIDEO_ID, item.videoId)
+                        put(COL_I_ORDER_INDEX, idx)
+                        put(COL_I_TITLE, item.videoTitle)
+                        put(COL_I_DURATION, item.durationMs)
+                        put(COL_I_SIZE, item.sizeBytes)
+                        put(COL_I_DATE_ADDED, item.dateAddedSec)
+                        put(COL_I_URI, item.contentUri)
+                        put(COL_I_IS_AVAILABLE, if (item.isAvailable) 1 else 0)
+                    }
+                    val newItemId = db.insert(TABLE_PLAYLIST_ITEMS, null, iValues)
+                    if (newItemId <= 0L) {
+                        throw IllegalStateException("تعذر إدراج المقطع \"${item.videoTitle}\" في قائمة التشغيل")
                     }
                 }
             }

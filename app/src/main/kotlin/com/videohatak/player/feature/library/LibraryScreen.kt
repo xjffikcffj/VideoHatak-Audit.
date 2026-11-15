@@ -27,6 +27,7 @@ import androidx.compose.material.icons.filled.ArrowDownward
 import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Lock
@@ -61,6 +62,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.videohatak.player.core.data.repository.MediaExistenceResult
 import com.videohatak.player.core.designsystem.theme.AppThemeId
 import com.videohatak.player.core.designsystem.theme.LocalVideoHatakPalette
 import com.videohatak.player.core.designsystem.theme.ThemeMode
@@ -89,7 +91,7 @@ import com.videohatak.player.feature.playlist.components.CreatePlaylistDialog
 import com.videohatak.player.feature.playlist.components.RenamePlaylistDialog
 import com.videohatak.player.feature.settings.BackupImportConfirmDialog
 import com.videohatak.player.feature.settings.SettingsScreen
-import com.videohatak.player.feature.settings.TrashBinDialog
+import com.videohatak.player.feature.trash.TrashScreen
 import com.videohatak.player.feature.vault.VaultImportState
 import com.videohatak.player.feature.vault.VaultScreen
 
@@ -115,7 +117,14 @@ fun LibraryScreen(
     onMoveVideoToTrash: (VideoItem) -> Unit = {},
     // Trash Bin state & callbacks
     trashItems: List<TrashItem> = emptyList(),
+    trashError: String? = null,
+    trashExistenceMap: Map<Long, MediaExistenceResult> = emptyMap(),
+    missingTrashItemPendingRemoval: TrashItem? = null,
+    onRefreshTrashStatus: () -> Unit = {},
+    onDismissTrashError: () -> Unit = {},
     onRestoreFromTrash: (TrashItem) -> Unit = {},
+    onConfirmRemoveMissingTrashRecord: (TrashItem) -> Unit = {},
+    onDismissMissingTrashRemoval: () -> Unit = {},
     onPermanentDeleteTrashItem: (TrashItem) -> Unit = {},
     onEmptyTrashBin: () -> Unit = {},
     // Settings state & callbacks
@@ -152,6 +161,7 @@ fun LibraryScreen(
     vaultBiometricError: String?,
     vaultError: String? = null,
     vaultHasPinConfigured: Boolean = false,
+    vaultCanUseBiometrics: Boolean = true,
     vaultAutoLockTimeout: VaultAutoLockTimeout = VaultAutoLockTimeout.IMMEDIATE,
     onVaultAuthenticate: () -> Unit,
     onVaultUnlockWithPin: (String) -> Unit = {},
@@ -179,14 +189,14 @@ fun LibraryScreen(
     var videoForInfo by remember { mutableStateOf<VideoItem?>(null) }
     var showCreatePlaylistDialog by remember { mutableStateOf(false) }
     var playlistToRename by remember { mutableStateOf<Playlist?>(null) }
-    var showTrashBinDialog by remember { mutableStateOf(false) }
     var showBackupImportConfirmDialog by remember { mutableStateOf(false) }
 
-    // Hardware / gesture Back button handling inside nested folders, playlists, vault, search, and settings
+    // Hardware / gesture Back button handling inside nested folders, playlists, vault, trash, search, and settings
     BackHandler(
         enabled = selectedFolder != null ||
             selectedPlaylistWithItems != null ||
             currentTab == LibraryTab.VAULT ||
+            currentTab == LibraryTab.TRASH ||
             currentTab == LibraryTab.SETTINGS ||
             (isSearchExpanded && searchQuery.isNotEmpty())
     ) {
@@ -194,6 +204,7 @@ fun LibraryScreen(
             selectedFolder != null -> clearFolderSelection()
             selectedPlaylistWithItems != null -> onSelectPlaylist(null)
             currentTab == LibraryTab.VAULT -> onTabSelected(LibraryTab.SETTINGS)
+            currentTab == LibraryTab.TRASH -> onTabSelected(LibraryTab.VIDEOS)
             isSearchExpanded -> {
                 isSearchExpanded = false
                 onSearchQueryChanged("")
@@ -242,6 +253,16 @@ fun LibraryScreen(
                     colors = itemColors,
                     icon = { Icon(Icons.Default.PlaylistPlay, contentDescription = null) },
                     label = { Text("قوائم") }
+                )
+                NavigationBarItem(
+                    selected = currentTab == LibraryTab.TRASH,
+                    onClick = {
+                        clearFolderSelection()
+                        onTabSelected(LibraryTab.TRASH)
+                    },
+                    colors = itemColors,
+                    icon = { Icon(Icons.Default.DeleteOutline, contentDescription = null) },
+                    label = { Text("السلة") }
                 )
                 NavigationBarItem(
                     selected = currentTab == LibraryTab.SETTINGS || currentTab == LibraryTab.VAULT,
@@ -445,6 +466,7 @@ fun LibraryScreen(
                                             onRenameClick = { videoToRename = video },
                                             onMoveToFolderClick = { videoToMove = video },
                                             onAddToVaultClick = { onAddVideoToVault(video) },
+                                            onMoveToTrashClick = { onMoveVideoToTrash(video) },
                                             onInfoClick = { videoForInfo = video }
                                         )
                                     }
@@ -612,6 +634,22 @@ fun LibraryScreen(
                     }
                 }
 
+                LibraryTab.TRASH -> {
+                    TrashScreen(
+                        trashItems = trashItems,
+                        trashError = trashError,
+                        existenceMap = trashExistenceMap,
+                        missingItemPendingRemoval = missingTrashItemPendingRemoval,
+                        onRefreshStatus = onRefreshTrashStatus,
+                        onDismissError = onDismissTrashError,
+                        onRestoreItem = onRestoreFromTrash,
+                        onConfirmRemoveMissingRecord = onConfirmRemoveMissingTrashRecord,
+                        onDismissMissingRemoval = onDismissMissingTrashRemoval,
+                        onPermanentDeleteItem = onPermanentDeleteTrashItem,
+                        onEmptyTrash = onEmptyTrashBin
+                    )
+                }
+
                 LibraryTab.SETTINGS -> {
                     SettingsScreen(
                         selectedTheme = selectedAppTheme,
@@ -629,7 +667,7 @@ fun LibraryScreen(
                         onSelectPlaybackMode = onSelectPlaybackMode,
                         onSelectResumeMode = onSelectResumeMode,
                         onOpenVault = { onTabSelected(LibraryTab.VAULT) },
-                        onOpenTrashBin = { showTrashBinDialog = true },
+                        onOpenTrashBin = { onTabSelected(LibraryTab.TRASH) },
                         onExportBackup = onExportBackup,
                         onImportBackup = { showBackupImportConfirmDialog = true }
                     )
@@ -663,6 +701,7 @@ fun LibraryScreen(
                             biometricError = vaultBiometricError,
                             vaultError = vaultError,
                             hasPinConfigured = vaultHasPinConfigured,
+                            canUseBiometrics = vaultCanUseBiometrics,
                             autoLockTimeout = vaultAutoLockTimeout,
                             onAuthenticateClick = onVaultAuthenticate,
                             onUnlockWithPin = onVaultUnlockWithPin,
@@ -739,16 +778,6 @@ fun LibraryScreen(
                 onMoveToFolderClick = { videoToMove = video },
                 onMoveToTrashClick = { onMoveVideoToTrash(video) },
                 onDismiss = { videoForInfo = null }
-            )
-        }
-
-        if (showTrashBinDialog) {
-            TrashBinDialog(
-                trashItems = trashItems,
-                onRestoreItem = onRestoreFromTrash,
-                onPermanentDeleteItem = onPermanentDeleteTrashItem,
-                onEmptyTrash = onEmptyTrashBin,
-                onDismiss = { showTrashBinDialog = false }
             )
         }
 

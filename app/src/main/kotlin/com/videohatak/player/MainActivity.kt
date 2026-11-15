@@ -1,0 +1,615 @@
+package com.videohatak.player
+
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.res.Configuration
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.provider.Settings
+import android.view.WindowManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.IntentSenderRequest
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.windowsizeclass.ExperimentalMaterial3WindowSizeClassApi
+import androidx.compose.material3.windowsizeclass.calculateWindowSizeClass
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
+import androidx.core.content.ContextCompat
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import androidx.core.view.WindowInsetsControllerCompat
+import androidx.fragment.app.FragmentActivity
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.videohatak.player.core.backup.BackupManager
+import com.videohatak.player.core.data.repository.LocalVideoRepositoryImpl
+import com.videohatak.player.core.designsystem.component.VideoHatakTopBar
+import com.videohatak.player.core.designsystem.theme.LocalVideoHatakPalette
+import com.videohatak.player.core.designsystem.theme.LocalWindowSizeClass
+import com.videohatak.player.core.designsystem.theme.ThemeMode
+import com.videohatak.player.core.designsystem.theme.ThemePreferencesRepositoryImpl
+import com.videohatak.player.core.designsystem.theme.ThemeState
+import com.videohatak.player.core.designsystem.theme.ThemeViewModel
+import com.videohatak.player.core.designsystem.theme.VideoHatakTheme
+import com.videohatak.player.core.designsystem.theme.themeDataStore
+import com.videohatak.player.core.model.VideoItem
+import com.videohatak.player.core.permission.PermissionHelper
+import com.videohatak.player.core.playback.PlaybackPreferencesRepositoryImpl
+import com.videohatak.player.core.playback.pip.PipActionReceiver
+import com.videohatak.player.core.playback.pip.PipHelper
+import com.videohatak.player.core.playback.playbackDataStore
+import com.videohatak.player.core.playlist.model.toVideoItem
+import com.videohatak.player.core.playlist.repository.PlaylistRepositoryImpl
+import com.videohatak.player.core.trash.repository.TrashRepositoryImpl
+import com.videohatak.player.core.vault.model.toVideoItem
+import com.videohatak.player.core.vault.repository.VaultRepositoryImpl
+import com.videohatak.player.feature.library.LibraryScreen
+import com.videohatak.player.feature.library.LibraryTab
+import com.videohatak.player.feature.library.LibraryUiEvent
+import com.videohatak.player.feature.library.LibraryViewModel
+import com.videohatak.player.feature.player.PlayerScreen
+import com.videohatak.player.feature.player.PlayerViewModel
+import com.videohatak.player.feature.player.components.MiniPlayerBar
+import com.videohatak.player.feature.playlist.PlaylistViewModel
+import com.videohatak.player.feature.vault.VaultViewModel
+import kotlinx.coroutines.launch
+
+class MainActivity : FragmentActivity() {
+
+    private val themeViewModel: ThemeViewModel by viewModels {
+        ThemeViewModel.provideFactory(
+            ThemePreferencesRepositoryImpl(applicationContext.themeDataStore)
+        )
+    }
+
+    private val libraryViewModel: LibraryViewModel by viewModels {
+        LibraryViewModel.provideFactory(
+            LocalVideoRepositoryImpl(applicationContext),
+            TrashRepositoryImpl(applicationContext)
+        )
+    }
+
+    private val playerViewModel: PlayerViewModel by viewModels {
+        PlayerViewModel.provideFactory(
+            application,
+            PlaybackPreferencesRepositoryImpl(applicationContext.playbackDataStore)
+        )
+    }
+
+    private val playlistViewModel: PlaylistViewModel by viewModels {
+        PlaylistViewModel.provideFactory(
+            PlaylistRepositoryImpl(applicationContext)
+        )
+    }
+
+    private val vaultViewModel: VaultViewModel by viewModels {
+        VaultViewModel.provideFactory(
+            VaultRepositoryImpl.getInstance(applicationContext),
+            applicationContext
+        )
+    }
+
+    private val backupManager by lazy { BackupManager(applicationContext) }
+
+    private val pipReceiver = PipActionReceiver()
+    private val isInPipModeState = mutableStateOf(false)
+    private var activeVideoState: VideoItem? = null
+
+    @OptIn(ExperimentalMaterial3WindowSizeClassApi::class)
+    override fun onCreate(savedInstanceState: Bundle?) {
+        val splashScreen = installSplashScreen()
+        super.onCreate(savedInstanceState)
+
+        val pipFilter = IntentFilter().apply {
+            addAction(PipHelper.ACTION_PIP_PLAY_PAUSE)
+            addAction(PipHelper.ACTION_PIP_FORWARD)
+            addAction(PipHelper.ACTION_PIP_REPLAY)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ContextCompat.registerReceiver(this, pipReceiver, pipFilter, ContextCompat.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(pipReceiver, pipFilter)
+        }
+
+        val startTimestamp = System.currentTimeMillis()
+        splashScreen.setKeepOnScreenCondition {
+            val isLoading = themeViewModel.themeState.value is ThemeState.Loading
+            val isTimedOut = (System.currentTimeMillis() - startTimestamp) > 400
+            isLoading && !isTimedOut
+        }
+
+        enableEdgeToEdge()
+
+        setContent {
+            val windowSizeClass = calculateWindowSizeClass(this)
+            val themeState by themeViewModel.themeState.collectAsStateWithLifecycle()
+            val persistedAppTheme by themeViewModel.appTheme.collectAsStateWithLifecycle()
+            val selectedAppTheme by themeViewModel.effectiveAppTheme.collectAsStateWithLifecycle()
+            val effectiveThemeMode by themeViewModel.effectiveThemeMode.collectAsStateWithLifecycle()
+            val isThemePreviewActive by themeViewModel.isPreviewActive.collectAsStateWithLifecycle()
+            val snackbarHostState = remember { SnackbarHostState() }
+            val uiScope = rememberCoroutineScope()
+
+            val currentThemeMode = when (themeState) {
+                is ThemeState.Success -> effectiveThemeMode
+                is ThemeState.Loading -> effectiveThemeMode
+            }
+
+            val isDark = when (currentThemeMode) {
+                ThemeMode.DARK -> true
+                ThemeMode.LIGHT -> false
+                ThemeMode.SYSTEM -> if (selectedAppTheme.isLightTheme) false else (isSystemInDarkTheme() || !selectedAppTheme.isLightTheme)
+            }
+
+            DisposableEffect(isDark) {
+                val insetsController = WindowInsetsControllerCompat(window, window.decorView)
+                insetsController.isAppearanceLightStatusBars = !isDark
+                insetsController.isAppearanceLightNavigationBars = !isDark
+                onDispose {}
+            }
+
+            // Dedicated Media Permission Launcher (safe against cancel / empty result / OEM quirks)
+            val mediaPermissionLauncher = rememberLauncherForActivityResult(
+                contract = ActivityResultContracts.RequestMultiplePermissions()
+            ) { _ ->
+                val status = PermissionHelper.checkPermissionStatus(this@MainActivity, this@MainActivity)
+                libraryViewModel.onPermissionStatusChanged(status)
+            }
+
+            // Optional Notification Permission Launcher for background media controls (Android 13+)
+            val notificationPermissionLauncher = rememberLauncherForActivityResult(
+                contract = ActivityResultContracts.RequestPermission()
+            ) { _ -> }
+
+            // Scoped Storage MediaStore write consent launcher for Rename & Move
+            val writePermissionLauncher = rememberLauncherForActivityResult(
+                contract = ActivityResultContracts.StartIntentSenderForResult()
+            ) { result ->
+                libraryViewModel.onWritePermissionGranted(result.resultCode == RESULT_OK)
+            }
+
+            // Legacy API 24-28 WRITE_EXTERNAL_STORAGE permission launcher for Delete/Rename/Move
+            val legacyFileWritePermissionLauncher = rememberLauncherForActivityResult(
+                contract = ActivityResultContracts.RequestPermission()
+            ) { granted ->
+                libraryViewModel.onWritePermissionGranted(granted)
+            }
+
+            LaunchedEffect(Unit) {
+                val initialStatus = PermissionHelper.checkPermissionStatus(this@MainActivity, this@MainActivity)
+                libraryViewModel.onPermissionStatusChanged(initialStatus)
+            }
+
+            LaunchedEffect(Unit) {
+                libraryViewModel.events.collect { event ->
+                    when (event) {
+                        is LibraryUiEvent.ShowMessage -> {
+                            snackbarHostState.showSnackbar(event.message)
+                        }
+                        is LibraryUiEvent.LaunchWritePermission -> {
+                            runCatching {
+                                writePermissionLauncher.launch(
+                                    IntentSenderRequest.Builder(event.intentSender).build()
+                                )
+                            }.onFailure {
+                                uiScope.launch {
+                                    snackbarHostState.showSnackbar("تعذر فتح نافذة إذن تعديل الملف")
+                                }
+                            }
+                        }
+                        is LibraryUiEvent.RequestLegacyWritePermission -> {
+                            runCatching {
+                                legacyFileWritePermissionLauncher.launch(event.permission)
+                            }.onFailure {
+                                libraryViewModel.onWritePermissionGranted(false)
+                            }
+                        }
+                    }
+                }
+            }
+
+            var activeVideoForPlayback by remember { mutableStateOf<VideoItem?>(null) }
+            var activeContextVideos by remember { mutableStateOf<List<VideoItem>>(emptyList()) }
+            activeVideoState = activeVideoForPlayback
+
+            val isInPip by isInPipModeState
+
+            val uiState by libraryViewModel.uiState.collectAsStateWithLifecycle()
+            val searchQuery by libraryViewModel.searchQuery.collectAsStateWithLifecycle()
+            val sortOrder by libraryViewModel.sortOrder.collectAsStateWithLifecycle()
+            val currentTab by libraryViewModel.currentTab.collectAsStateWithLifecycle()
+            val selectedFolder by libraryViewModel.selectedFolder.collectAsStateWithLifecycle()
+            val playerUiState by playerViewModel.uiState.collectAsStateWithLifecycle()
+            val playbackMode by playerViewModel.playbackMode.collectAsStateWithLifecycle()
+            val resumeMode by playerViewModel.resumeMode.collectAsStateWithLifecycle()
+
+            val playlists by playlistViewModel.playlists.collectAsStateWithLifecycle()
+            val selectedPlaylistWithItems by playlistViewModel.selectedPlaylistWithItems.collectAsStateWithLifecycle()
+
+            val vaultIsUnlocked by vaultViewModel.isUnlocked.collectAsStateWithLifecycle()
+            val vaultVideos by vaultViewModel.vaultVideos.collectAsStateWithLifecycle()
+            val vaultImportState by vaultViewModel.importState.collectAsStateWithLifecycle()
+            val vaultBiometricError by vaultViewModel.biometricError.collectAsStateWithLifecycle()
+            val vaultError by vaultViewModel.vaultError.collectAsStateWithLifecycle()
+            val vaultHasPinConfigured by vaultViewModel.hasPinConfigured.collectAsStateWithLifecycle()
+            val vaultAutoLockTimeout by vaultViewModel.autoLockTimeout.collectAsStateWithLifecycle()
+            val trashItems by libraryViewModel.trashItems.collectAsStateWithLifecycle()
+
+            val exportBackupLauncher = rememberLauncherForActivityResult(
+                contract = ActivityResultContracts.CreateDocument("application/json")
+            ) { uri: Uri? ->
+                if (uri != null) {
+                    uiScope.launch {
+                        backupManager.exportToUri(uri)
+                            .onSuccess { summary ->
+                                snackbarHostState.showSnackbar(
+                                    "تم تصدير النسخة الاحتياطية (${summary.playlistCount} قوائم، ${summary.playlistItemCount} مقطع)"
+                                )
+                            }
+                            .onFailure { err ->
+                                snackbarHostState.showSnackbar(err.localizedMessage ?: "فشل تصدير النسخة الاحتياطية")
+                            }
+                    }
+                }
+            }
+
+            val importBackupLauncher = rememberLauncherForActivityResult(
+                contract = ActivityResultContracts.OpenDocument()
+            ) { uri: Uri? ->
+                if (uri != null) {
+                    uiScope.launch {
+                        backupManager.importFromUri(uri)
+                            .onSuccess { summary ->
+                                playlistViewModel.refresh()
+                                vaultViewModel.refresh()
+                                snackbarHostState.showSnackbar(
+                                    "تمت الاستعادة بنجاح (${summary.playlistCount} قوائم، ${summary.playlistItemCount} مقطع)"
+                                )
+                            }
+                            .onFailure { err ->
+                                snackbarHostState.showSnackbar(err.localizedMessage ?: "فشل استيراد النسخة الاحتياطية")
+                            }
+                    }
+                }
+            }
+
+            val vaultImportLauncher = rememberLauncherForActivityResult(
+                contract = ActivityResultContracts.GetContent()
+            ) { uri: Uri? ->
+                if (uri != null) {
+                    vaultViewModel.importVideoFromUri(
+                        sourceUri = uri,
+                        displayName = null,
+                        deleteOriginal = false
+                    )
+                }
+            }
+
+            val isVaultActive = currentTab == LibraryTab.VAULT || activeVideoForPlayback?.bucketId == "secure_vault"
+            DisposableEffect(isVaultActive) {
+                if (isVaultActive) {
+                    window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                } else {
+                    window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                }
+                onDispose {
+                    window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                }
+            }
+
+            LaunchedEffect(vaultIsUnlocked) {
+                if (!vaultIsUnlocked) {
+                    val activeIsVault = activeVideoForPlayback?.bucketId == "secure_vault" ||
+                        activeVideoForPlayback?.contentUri?.scheme == "vault"
+                    val playerIsVault = playerViewModel.currentVideo?.bucketId == "secure_vault" ||
+                        playerViewModel.currentVideo?.contentUri?.scheme == "vault"
+                    if (activeIsVault || playerIsVault) {
+                        activeVideoForPlayback = null
+                        playerViewModel.stopPlaybackCompletely()
+                    }
+                }
+            }
+
+            LaunchedEffect(currentTab) {
+                if (currentTab != LibraryTab.SETTINGS) {
+                    themeViewModel.cancelPreview()
+                }
+            }
+
+            LaunchedEffect(playerViewModel.currentVideo) {
+                if (activeVideoForPlayback != null && playerViewModel.currentVideo != null) {
+                    activeVideoForPlayback = playerViewModel.currentVideo
+                }
+            }
+
+            fun requestNotificationIfNeeded() {
+                val notifPerm = PermissionHelper.getNotificationPermission()
+                if (notifPerm != null && !PermissionHelper.hasNotificationPermission(this@MainActivity)) {
+                    runCatching { notificationPermissionLauncher.launch(notifPerm) }
+                }
+            }
+
+            CompositionLocalProvider(LocalWindowSizeClass provides windowSizeClass) {
+                VideoHatakTheme(
+                    themeMode = currentThemeMode,
+                    appTheme = selectedAppTheme,
+                    darkTheme = isDark
+                ) {
+                    val palette = LocalVideoHatakPalette.current
+                    val activeVideo = activeVideoForPlayback
+
+                    if (activeVideo != null) {
+                        PlayerScreen(
+                            video = activeVideo,
+                            contextVideos = activeContextVideos,
+                            viewModel = playerViewModel,
+                            isInPipMode = isInPip,
+                            onUserInteraction = {
+                                if (activeVideo.bucketId == "secure_vault" || activeVideo.contentUri.scheme == "vault") {
+                                    vaultViewModel.recordUserActivity()
+                                }
+                            },
+                            onBackClick = {
+                                activeVideoForPlayback = null
+                            }
+                        )
+                    } else {
+                        Scaffold(
+                            modifier = Modifier.fillMaxSize(),
+                            containerColor = palette.background,
+                            snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
+                            topBar = {
+                                VideoHatakTopBar(
+                                    title = stringResource(id = R.string.app_name),
+                                    actions = {
+                                        // Discreet single lock action in top bar (dark mode & themes moved cleanly inside Settings)
+                                        IconButton(
+                                            onClick = {
+                                                libraryViewModel.clearFolderSelection()
+                                                libraryViewModel.onTabSelected(
+                                                    if (currentTab == LibraryTab.VAULT) LibraryTab.VIDEOS else LibraryTab.VAULT
+                                                )
+                                            }
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Lock,
+                                                contentDescription = "الخزنة الخاصة",
+                                                tint = if (currentTab == LibraryTab.VAULT) palette.accent else palette.onSurfaceMuted
+                                            )
+                                        }
+                                    }
+                                )
+                            },
+                            bottomBar = {
+                                val backgroundVideo = playerViewModel.currentVideo
+                                if (backgroundVideo != null && (playerUiState.isPlaying || playerUiState.currentPositionMs > 0)) {
+                                    MiniPlayerBar(
+                                        video = backgroundVideo,
+                                        uiState = playerUiState,
+                                        onExpand = {
+                                            activeVideoForPlayback = backgroundVideo
+                                        },
+                                        onTogglePlayPause = playerViewModel.playerManager::togglePlayPause,
+                                        onPreviousTrack = { playerViewModel.previousTrack() },
+                                        onNextTrack = { playerViewModel.nextTrack() },
+                                        onClose = playerViewModel::stopPlaybackCompletely
+                                    )
+                                }
+                            }
+                        ) { innerPadding ->
+                            LibraryScreen(
+                                uiState = uiState,
+                                searchQuery = searchQuery,
+                                onSearchQueryChanged = libraryViewModel::onSearchQueryChanged,
+                                sortOrder = sortOrder,
+                                onSortOrderChanged = libraryViewModel::onSortOrderChanged,
+                                currentTab = currentTab,
+                                onTabSelected = libraryViewModel::onTabSelected,
+                                selectedFolder = selectedFolder,
+                                onFolderSelected = libraryViewModel::onFolderSelected,
+                                clearFolderSelection = libraryViewModel::clearFolderSelection,
+                                onRequestPermission = {
+                                    PermissionHelper.markMediaPermissionRequested(this@MainActivity)
+                                    val perms = PermissionHelper.getMediaPermissions()
+                                    val launched = runCatching {
+                                        mediaPermissionLauncher.launch(perms)
+                                    }.isSuccess
+                                    if (!launched) {
+                                        runCatching {
+                                            startActivity(
+                                                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                                                    data = Uri.fromParts("package", packageName, null)
+                                                }
+                                            )
+                                        }
+                                    }
+                                },
+                                onOpenSettings = {
+                                    runCatching {
+                                        startActivity(
+                                            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                                                data = Uri.fromParts("package", packageName, null)
+                                            }
+                                        )
+                                    }
+                                },
+                                onRefresh = libraryViewModel::refresh,
+                                onVideoClick = { video, contextList ->
+                                    requestNotificationIfNeeded()
+                                    activeContextVideos = contextList
+                                    activeVideoForPlayback = video
+                                },
+                                onRenameVideo = libraryViewModel::renameVideo,
+                                onMoveVideoToFolder = libraryViewModel::moveVideoToFolder,
+                                onAddVideoToVault = { video ->
+                                    vaultViewModel.importVideoFromUri(
+                                        sourceUri = video.contentUri,
+                                        displayName = video.safeTitle,
+                                        deleteOriginal = false
+                                    )
+                                    uiScope.launch {
+                                        snackbarHostState.showSnackbar("تم بدء تشفير وإضافة \"${video.safeTitle}\" إلى الخزنة الخاصة")
+                                    }
+                                },
+                                onMoveVideoToTrash = libraryViewModel::moveToTrash,
+                                trashItems = trashItems,
+                                onRestoreFromTrash = libraryViewModel::restoreFromTrash,
+                                onPermanentDeleteTrashItem = libraryViewModel::deleteTrashItemPermanently,
+                                onEmptyTrashBin = libraryViewModel::emptyTrashBin,
+                                selectedAppTheme = selectedAppTheme,
+                                persistedAppTheme = persistedAppTheme,
+                                isThemePreviewActive = isThemePreviewActive,
+                                themeMode = currentThemeMode,
+                                playbackMode = playbackMode,
+                                resumeMode = resumeMode,
+                                onSelectAppTheme = themeViewModel::startPreviewTheme,
+                                onApplyThemePreview = themeViewModel::applyPreview,
+                                onCancelThemePreview = themeViewModel::cancelPreview,
+                                onSelectThemeMode = { mode ->
+                                    if (isThemePreviewActive) {
+                                        themeViewModel.startPreviewThemeMode(mode)
+                                    } else {
+                                        themeViewModel.setThemeMode(mode)
+                                    }
+                                },
+                                onSelectPlaybackMode = playerViewModel::setPlaybackMode,
+                                onSelectResumeMode = playerViewModel::setResumeMode,
+                                onExportBackup = {
+                                    exportBackupLauncher.launch("videohatak_backup_${System.currentTimeMillis()}.json")
+                                },
+                                onImportBackup = {
+                                    importBackupLauncher.launch(arrayOf("application/json", "text/plain", "*/*"))
+                                },
+                                playlists = playlists,
+                                selectedPlaylistWithItems = selectedPlaylistWithItems,
+                                onSelectPlaylist = playlistViewModel::selectPlaylist,
+                                onCreatePlaylist = playlistViewModel::createPlaylist,
+                                onRenamePlaylist = playlistViewModel::renamePlaylist,
+                                onDeletePlaylist = playlistViewModel::deletePlaylist,
+                                onRemovePlaylistItem = playlistViewModel::removeItemFromPlaylist,
+                                onMovePlaylistItemUp = { index -> playlistViewModel.moveItem(index, index - 1) },
+                                onMovePlaylistItemDown = { index -> playlistViewModel.moveItem(index, index + 1) },
+                                onPlayPlaylist = { playlistId, startVideoId, shuffle ->
+                                    requestNotificationIfNeeded()
+                                    activeContextVideos = emptyList()
+                                    playerViewModel.playPlaylist(playlistId, startVideoId, shuffle)
+                                    val targetItem = if (startVideoId != null) {
+                                        selectedPlaylistWithItems?.second?.firstOrNull { it.videoId == startVideoId }
+                                    } else {
+                                        selectedPlaylistWithItems?.second?.firstOrNull { it.isAvailable }
+                                    }
+                                    if (targetItem != null) {
+                                        activeVideoForPlayback = targetItem.toVideoItem()
+                                    }
+                                },
+                                onAddToPlaylists = playlistViewModel::addVideoToPlaylists,
+                                vaultIsUnlocked = vaultIsUnlocked,
+                                vaultVideos = vaultVideos,
+                                vaultImportState = vaultImportState,
+                                vaultBiometricError = vaultBiometricError,
+                                vaultError = vaultError,
+                                vaultHasPinConfigured = vaultHasPinConfigured,
+                                vaultAutoLockTimeout = vaultAutoLockTimeout,
+                                onVaultAuthenticate = {
+                                    vaultViewModel.authenticateWithBiometrics(this@MainActivity)
+                                },
+                                onVaultUnlockWithPin = { pin ->
+                                    vaultViewModel.unlockWithPin(pin)
+                                },
+                                onVaultSetPin = { newPin ->
+                                    vaultViewModel.setVaultPin(newPin) { _, msg ->
+                                        uiScope.launch { snackbarHostState.showSnackbar(msg) }
+                                    }
+                                },
+                                onVaultRemovePin = {
+                                    vaultViewModel.removeVaultPin {
+                                        uiScope.launch { snackbarHostState.showSnackbar("تم إلغاء رمز PIN للخزنة") }
+                                    }
+                                },
+                                onVaultSelectAutoLockTimeout = vaultViewModel::setAutoLockTimeout,
+                                onVaultLock = vaultViewModel::lockVault,
+                                onVaultImportRequest = {
+                                    vaultImportLauncher.launch("video/*")
+                                },
+                                onVaultCancelImport = vaultViewModel::cancelImport,
+                                onVaultDismissImportState = vaultViewModel::dismissImportState,
+                                onVaultDismissError = vaultViewModel::clearError,
+                                onVaultVideoClick = { vaultVideo ->
+                                    requestNotificationIfNeeded()
+                                    vaultViewModel.recordUserActivity()
+                                    activeContextVideos = emptyList()
+                                    activeVideoForPlayback = vaultVideo.toVideoItem()
+                                },
+                                onVaultRenameVideo = vaultViewModel::renameVideo,
+                                onVaultDeleteVideo = vaultViewModel::deleteVideo,
+                                onVaultUserInteraction = vaultViewModel::recordUserActivity,
+                                modifier = Modifier.padding(innerPadding)
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    override fun onStop() {
+        super.onStop()
+        vaultViewModel.onAppBackgrounded()
+    }
+
+    override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean, newConfig: Configuration) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        isInPipModeState.value = isInPictureInPictureMode
+    }
+
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        val video = activeVideoState
+        if (video != null && video.bucketId != "secure_vault" && playerViewModel.playerManager.exoPlayer.isPlaying) {
+            PipHelper.enterPip(
+                activity = this,
+                videoWidth = video.width,
+                videoHeight = video.height,
+                isPlaying = true
+            )
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        vaultViewModel.checkTimeoutOnForeground()
+        val currentStatus = PermissionHelper.checkPermissionStatus(this, this)
+        libraryViewModel.onPermissionStatusChanged(currentStatus)
+        if (activeVideoState != null || playerViewModel.currentVideo != null) {
+            playerViewModel.playerManager.syncWithCurrentPlayer()
+        }
+    }
+
+    override fun onDestroy() {
+        try {
+            unregisterReceiver(pipReceiver)
+        } catch (_: Exception) {
+        }
+        super.onDestroy()
+    }
+}

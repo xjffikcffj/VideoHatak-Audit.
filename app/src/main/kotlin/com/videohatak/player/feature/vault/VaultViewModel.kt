@@ -1,0 +1,319 @@
+package com.videohatak.player.feature.vault
+
+import android.content.Context
+import android.net.Uri
+import androidx.fragment.app.FragmentActivity
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
+import com.videohatak.player.core.vault.biometric.VaultBiometricHelper
+import com.videohatak.player.core.vault.model.VaultVideo
+import com.videohatak.player.core.vault.repository.VaultRepository
+import com.videohatak.player.core.vault.security.PinVerifyResult
+import com.videohatak.player.core.vault.security.VaultAutoLockTimeout
+import com.videohatak.player.core.vault.security.VaultPinHasher
+import com.videohatak.player.core.vault.security.VaultSecurityPreferences
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+
+class VaultViewModel(
+    private val repository: VaultRepository,
+    private val biometricHelper: VaultBiometricHelper,
+    private val securityPreferences: VaultSecurityPreferences? = null
+) : ViewModel() {
+
+    val vaultVideos: StateFlow<List<VaultVideo>> = repository.vaultVideos
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val videos: StateFlow<List<VaultVideo>> = vaultVideos
+
+    private val _isUnlocked = MutableStateFlow(false)
+    val isUnlocked: StateFlow<Boolean> = _isUnlocked.asStateFlow()
+
+    val hasPinConfigured: StateFlow<Boolean> = securityPreferences?.hasPin
+        ?.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
+        ?: MutableStateFlow(false)
+
+    val autoLockTimeout: StateFlow<VaultAutoLockTimeout> = securityPreferences?.autoLockTimeout
+        ?.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), VaultAutoLockTimeout.IMMEDIATE)
+        ?: MutableStateFlow(VaultAutoLockTimeout.IMMEDIATE)
+
+    val vaultError: StateFlow<String?> = repository.vaultError
+
+    private val _importState = MutableStateFlow<VaultImportState>(VaultImportState.Idle)
+    val importState: StateFlow<VaultImportState> = _importState.asStateFlow()
+
+    private val _biometricError = MutableStateFlow<String?>(null)
+    val biometricError: StateFlow<String?> = _biometricError.asStateFlow()
+
+    val errorMessage: StateFlow<String?> = biometricError
+    val isImporting: StateFlow<Boolean> = MutableStateFlow(false)
+
+    private var importJob: Job? = null
+    private var inactivityJob: Job? = null
+    private var isImportCancelled = false
+
+    init {
+        viewModelScope.launch {
+            repository.isUnlocked.collect { unlocked ->
+                _isUnlocked.value = unlocked
+                if (unlocked) {
+                    startInactivityMonitor()
+                } else {
+                    inactivityJob?.cancel()
+                }
+            }
+        }
+        refresh()
+    }
+
+    private fun startInactivityMonitor() {
+        inactivityJob?.cancel()
+        inactivityJob = viewModelScope.launch {
+            while (isActive && repository.isUnlocked.value) {
+                delay(5000L)
+                val timeout = autoLockTimeout.value
+                if (timeout.isInactivityExpired(repository.lastActivityTimestampMs, System.currentTimeMillis())) {
+                    lockVault()
+                    break
+                }
+            }
+        }
+    }
+
+    fun recordUserActivity() {
+        repository.recordActivity()
+    }
+
+    fun onAppBackgrounded() {
+        if (repository.isUnlocked.value && autoLockTimeout.value.shouldAutoLockOnBackground()) {
+            lockVault()
+        }
+    }
+
+    fun checkTimeoutOnForeground(nowMs: Long = System.currentTimeMillis()): Boolean {
+        if (!repository.isUnlocked.value) return false
+        val expired = autoLockTimeout.value.isInactivityExpired(repository.lastActivityTimestampMs, nowMs)
+        if (expired) {
+            lockVault()
+            return true
+        }
+        return false
+    }
+
+    fun refresh() {
+        viewModelScope.launch {
+            repository.refresh()
+        }
+    }
+
+    fun canUseBiometrics(): Boolean = biometricHelper.canAuthenticate()
+
+    fun authenticateWithBiometrics(
+        activity: FragmentActivity,
+        onSuccess: () -> Unit = {},
+        onError: (String) -> Unit = {}
+    ) {
+        unlockVault(activity, onSuccess, onError)
+    }
+
+    fun unlockVault(
+        activity: FragmentActivity,
+        onSuccess: () -> Unit = {},
+        onError: (String) -> Unit = {}
+    ) {
+        biometricHelper.promptBiometric(
+            activity = activity,
+            title = "الخزنة المشفرة",
+            subtitle = "يرجى تأكيد هويتك لفتح مقاطع الفيديو المحمية",
+            onSuccess = {
+                viewModelScope.launch { securityPreferences?.resetPinLockout() }
+                repository.setUnlocked(true)
+                _isUnlocked.value = true
+                _biometricError.value = null
+                refresh()
+                onSuccess()
+            },
+            onError = { err ->
+                _biometricError.value = err
+                onError(err)
+            }
+        )
+    }
+
+    fun unlockWithPin(
+        pin: String,
+        nowMs: Long = System.currentTimeMillis(),
+        onResult: (Boolean) -> Unit = {}
+    ) {
+        viewModelScope.launch {
+            val prefs = securityPreferences
+            if (prefs == null) {
+                _biometricError.value = "رمز PIN غير مهيأ على هذا الجهاز"
+                onResult(false)
+                return@launch
+            }
+            when (val result = prefs.verifyPinWithRateLimit(pin, nowMs)) {
+                is PinVerifyResult.Success -> {
+                    repository.setUnlocked(true)
+                    _isUnlocked.value = true
+                    _biometricError.value = null
+                    refresh()
+                    onResult(true)
+                }
+                is PinVerifyResult.InvalidPin -> {
+                    _biometricError.value = "رمز PIN غير صحيح (المحاولة ${result.failedAttempts})"
+                    onResult(false)
+                }
+                is PinVerifyResult.LockedOut -> {
+                    val waitSec = ((result.remainingMs + 999L) / 1000L).coerceAtLeast(1L)
+                    _biometricError.value = "تم تعليق المحاولة مؤقتًا بعد عدة أخطاء — انتظر $waitSec ثانية"
+                    onResult(false)
+                }
+            }
+        }
+    }
+
+    fun setVaultPin(pin: String, onComplete: (Boolean, String) -> Unit = { _, _ -> }) {
+        if (!VaultPinHasher.isValidPinFormat(pin)) {
+            onComplete(false, "يجب أن يتكون الرمز من 4 إلى 12 رقمًا فقط")
+            return
+        }
+        viewModelScope.launch {
+            val saved = securityPreferences?.setPin(pin) == true
+            repository.recordActivity()
+            if (saved) {
+                onComplete(true, "تم حفظ رمز PIN للخزنة بأمان (تشفير PBKDF2)")
+            } else {
+                onComplete(false, "تعذر حفظ رمز PIN")
+            }
+        }
+    }
+
+    fun removeVaultPin(onComplete: () -> Unit = {}) {
+        viewModelScope.launch {
+            securityPreferences?.clearPin()
+            repository.recordActivity()
+            onComplete()
+        }
+    }
+
+    fun setAutoLockTimeout(timeout: VaultAutoLockTimeout) {
+        viewModelScope.launch {
+            securityPreferences?.setAutoLockTimeout(timeout)
+            repository.recordActivity()
+        }
+    }
+
+    fun lockVault() {
+        inactivityJob?.cancel()
+        repository.setUnlocked(false)
+        _isUnlocked.value = false
+    }
+
+    fun importVideoFromUri(
+        sourceUri: Uri,
+        displayName: String? = null,
+        deleteOriginal: Boolean = false
+    ) {
+        importJob?.cancel()
+        isImportCancelled = false
+        repository.recordActivity()
+
+        importJob = viewModelScope.launch {
+            _importState.value = VaultImportState.Encrypting(
+                currentBytes = 0L,
+                totalBytes = 0L,
+                progress = 0f
+            )
+
+            val result = repository.importVideo(
+                sourceUri = sourceUri,
+                displayName = displayName,
+                onProgress = { progress ->
+                    _importState.update {
+                        if (it is VaultImportState.Encrypting) {
+                            it.copy(progress = progress)
+                        } else it
+                    }
+                },
+                isCancelled = { isImportCancelled }
+            )
+
+            if (result != null) {
+                _importState.value = VaultImportState.Success
+                refresh()
+            } else {
+                _importState.value = if (isImportCancelled) {
+                    VaultImportState.Idle
+                } else {
+                    VaultImportState.Error("فشل تشفير واستيراد الفيديو إلى الخزنة")
+                }
+            }
+        }
+    }
+
+    fun importVideoFromUri(
+        uri: Uri,
+        title: String,
+        durationMs: Long,
+        onComplete: (Boolean) -> Unit = {}
+    ) {
+        importVideoFromUri(sourceUri = uri, displayName = title, deleteOriginal = false)
+        onComplete(true)
+    }
+
+    fun cancelImport() {
+        isImportCancelled = true
+        importJob?.cancel()
+        _importState.value = VaultImportState.Idle
+    }
+
+    fun dismissImportState() {
+        _importState.value = VaultImportState.Idle
+    }
+
+    fun renameVideo(videoId: Long, newTitle: String) {
+        viewModelScope.launch {
+            repository.renameVideo(videoId, newTitle)
+        }
+    }
+
+    fun deleteVideo(videoId: Long) {
+        viewModelScope.launch {
+            repository.deleteVaultVideo(videoId)
+        }
+    }
+
+    fun clearError() {
+        _biometricError.value = null
+        repository.clearError()
+    }
+
+    override fun onCleared() {
+        inactivityJob?.cancel()
+        super.onCleared()
+    }
+
+    companion object {
+        fun provideFactory(
+            repository: VaultRepository,
+            context: Context
+        ): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
+            @Suppress("UNCHECKED_CAST")
+            override fun <T : ViewModel> create(modelClass: Class<T>): T {
+                val biometricHelper = VaultBiometricHelper(context)
+                val securityPrefs = VaultSecurityPreferences(context)
+                return VaultViewModel(repository, biometricHelper, securityPrefs) as T
+            }
+        }
+    }
+}

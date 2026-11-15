@@ -1,0 +1,14 @@
+<resources>
+    <style name="Theme.VideoHatak" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">@color/obsidian_bg</item>
+        <item name="android:navigationBarColor">@color/obsidian_bg</item>
+        <item name="android:windowBackground">@color/obsidian_bg</item>
+    </style>
+
+    <style name="Theme.VideoHatak.Starting" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">@color/obsidian_bg</item>
+        <item name="windowSplashScreenAnimatedIcon">@drawable/ic_launcher_foreground_img</item>
+        <item name="windowSplashScreenIconBackgroundColor">@color/obsidian_bg</item>
+        <item name="postSplashScreenTheme">@style/Theme.VideoHatak</item>
+    </style>
+</resources>

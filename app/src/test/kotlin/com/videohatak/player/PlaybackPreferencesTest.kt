@@ -12,6 +12,7 @@ import com.videohatak.player.core.playback.PlaybackPreferencesRepositoryImpl
 import com.videohatak.player.core.playback.PlaybackRestorationCoordinator
 import com.videohatak.player.core.playback.PositionSavePolicy
 import com.videohatak.player.core.playback.PositionSaveRequest
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -277,15 +278,17 @@ class PlaybackPreferencesTest {
         // Enqueue older request (10_000L)
         val req1 = manager.enqueueSave(uri, positionMs = 10_000L, durationMs = 120_000L)
         assertNotNull(req1)
+        val verifiedReq1 = req1 ?: throw AssertionError("req1 must not be null")
 
         // Wait until older request has actually entered saveVideoPosition
         olderWriteEntered.await()
-        assertEquals(req1, manager.inFlightRequest)
+        assertEquals(verifiedReq1, manager.inFlightRequest)
 
         // Enqueue newer update (55_000L) while older write is paused in-flight
         val req2 = manager.enqueueSave(uri, positionMs = 55_000L, durationMs = 120_000L)
         assertNotNull(req2)
-        assertTrue(req2!!.sequenceNumber > req1.sequenceNumber)
+        val verifiedReq2 = req2 ?: throw AssertionError("req2 must not be null")
+        assertTrue(verifiedReq2.sequenceNumber > verifiedReq1.sequenceNumber)
 
         // Release older write
         allowOlderWriteToFinish.complete(Unit)

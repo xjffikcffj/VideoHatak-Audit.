@@ -48,6 +48,7 @@ class LibraryViewModel(
     private var pendingFileOp: PendingVideoFileOp? = null
     private var pendingBulkTrashItems: MutableList<TrashItem> = mutableListOf()
     private var pendingBulkDeletedCount: Int = 0
+    private var pendingBulkFailedCount: Int = 0
 
     val searchQuery = MutableStateFlow("")
     val sortOrder = MutableStateFlow(SortOrder.DATE_DESC)
@@ -255,6 +256,8 @@ class LibraryViewModel(
         viewModelScope.launch {
             pendingBulkTrashItems.clear()
             pendingBulkDeletedCount = 0
+            pendingBulkFailedCount = 0
+            val label = trashItem.title.ifBlank { trashItem.displayName }
             when (val existence = videoRepository.checkMediaExistence(trashItem.toVideoItem())) {
                 is MediaExistenceResult.Unverifiable -> {
                     _trashExistenceMap.value = _trashExistenceMap.value + (trashItem.id to existence)
@@ -264,22 +267,41 @@ class LibraryViewModel(
                     return@launch
                 }
                 MediaExistenceResult.Missing -> {
-                    trashRepository?.removeRecord(trashItem.id)
-                    _trashExistenceMap.value = _trashExistenceMap.value - trashItem.id
-                    _events.tryEmit(LibraryUiEvent.ShowMessage("الملف مفقود بالفعل على الجهاز — تمت إزالة السجل من السلة"))
+                    _trashExistenceMap.value = _trashExistenceMap.value + (trashItem.id to MediaExistenceResult.Missing)
+                    val removed = trashRepository?.removeRecord(trashItem.id) == true
+                    if (removed) {
+                        _trashExistenceMap.value = _trashExistenceMap.value - trashItem.id
+                        _events.tryEmit(LibraryUiEvent.ShowMessage("الملف مفقود بالفعل على الجهاز — تمت إزالة السجل من السلة"))
+                    } else {
+                        val err = trashRepository?.trashError?.value
+                            ?: "الملف مفقود على الجهاز، لكن تعذر إزالة سجل \"$label\" من سلة المحذوفات"
+                        _events.tryEmit(LibraryUiEvent.ShowMessage(err))
+                    }
                     return@launch
                 }
                 MediaExistenceResult.Exists -> Unit
             }
             val result = videoRepository.deleteVideoPermanently(trashItem.toVideoItem(), trashItem.id)
             if (result is VideoFileOperationResult.Success) {
-                trashRepository?.removeRecord(trashItem.id)
-                _trashExistenceMap.value = _trashExistenceMap.value - trashItem.id
+                val removed = trashRepository?.removeRecord(trashItem.id) == true
+                if (removed) {
+                    _trashExistenceMap.value = _trashExistenceMap.value - trashItem.id
+                    handleFileOpResult(
+                        result = result,
+                        successMessage = "تم حذف الفيديو نهائيًا"
+                    )
+                } else {
+                    loadVideos()
+                    val err = trashRepository?.trashError?.value
+                        ?: "تم حذف الملف، لكن تعذر إزالة سجل \"$label\" من سلة المحذوفات"
+                    _events.tryEmit(LibraryUiEvent.ShowMessage(err))
+                }
+            } else {
+                handleFileOpResult(
+                    result = result,
+                    successMessage = "تم حذف الفيديو نهائيًا"
+                )
             }
-            handleFileOpResult(
-                result = result,
-                successMessage = "تم حذف الفيديو نهائيًا"
-            )
         }
     }
 
@@ -288,6 +310,7 @@ class LibraryViewModel(
             val items = trashItems.value
             pendingBulkTrashItems = items.toMutableList()
             pendingBulkDeletedCount = 0
+            pendingBulkFailedCount = 0
             processNextBulkDeleteItem()
         }
     }
@@ -295,16 +318,26 @@ class LibraryViewModel(
     private suspend fun processNextBulkDeleteItem() {
         while (pendingBulkTrashItems.isNotEmpty()) {
             val item = pendingBulkTrashItems.removeAt(0)
+            val label = item.title.ifBlank { item.displayName }
             when (val existence = videoRepository.checkMediaExistence(item.toVideoItem())) {
                 is MediaExistenceResult.Unverifiable -> {
                     _trashExistenceMap.value = _trashExistenceMap.value + (item.id to existence)
-                    _events.tryEmit(LibraryUiEvent.ShowMessage("تم تجاوز \"${item.title.ifBlank { item.displayName }}\": ${existence.reason}"))
+                    pendingBulkFailedCount++
+                    _events.tryEmit(LibraryUiEvent.ShowMessage("تم تجاوز \"$label\": ${existence.reason}"))
                     continue
                 }
                 MediaExistenceResult.Missing -> {
-                    trashRepository?.removeRecord(item.id)
-                    _trashExistenceMap.value = _trashExistenceMap.value - item.id
-                    pendingBulkDeletedCount++
+                    _trashExistenceMap.value = _trashExistenceMap.value + (item.id to MediaExistenceResult.Missing)
+                    val removed = trashRepository?.removeRecord(item.id) == true
+                    if (removed) {
+                        _trashExistenceMap.value = _trashExistenceMap.value - item.id
+                        pendingBulkDeletedCount++
+                    } else {
+                        pendingBulkFailedCount++
+                        val err = trashRepository?.trashError?.value
+                            ?: "الملف مفقود، وتعذر إزالة سجل \"$label\" من سلة المحذوفات"
+                        _events.tryEmit(LibraryUiEvent.ShowMessage(err))
+                    }
                     continue
                 }
                 MediaExistenceResult.Exists -> Unit
@@ -312,9 +345,16 @@ class LibraryViewModel(
             val res = videoRepository.deleteVideoPermanently(item.toVideoItem(), item.id)
             when (res) {
                 is VideoFileOperationResult.Success -> {
-                    trashRepository?.removeRecord(item.id)
-                    _trashExistenceMap.value = _trashExistenceMap.value - item.id
-                    pendingBulkDeletedCount++
+                    val removed = trashRepository?.removeRecord(item.id) == true
+                    if (removed) {
+                        _trashExistenceMap.value = _trashExistenceMap.value - item.id
+                        pendingBulkDeletedCount++
+                    } else {
+                        pendingBulkFailedCount++
+                        val err = trashRepository?.trashError?.value
+                            ?: "تم حذف \"$label\"، لكن تعذر إزالة سجله من سلة المحذوفات"
+                        _events.tryEmit(LibraryUiEvent.ShowMessage(err))
+                    }
                 }
                 is VideoFileOperationResult.RequiresPermission -> {
                     pendingFileOp = res.pendingOp
@@ -327,14 +367,23 @@ class LibraryViewModel(
                     return
                 }
                 is VideoFileOperationResult.Error -> {
+                    pendingBulkFailedCount++
                     _events.tryEmit(LibraryUiEvent.ShowMessage(res.message))
                 }
             }
         }
         val count = pendingBulkDeletedCount
+        val failed = pendingBulkFailedCount
         pendingBulkDeletedCount = 0
+        pendingBulkFailedCount = 0
         loadVideos()
-        _events.tryEmit(LibraryUiEvent.ShowMessage("تم حذف $count فيديو من سلة المحذوفات"))
+        val summaryMessage = when {
+            count > 0 && failed == 0 -> "تم حذف $count فيديو من سلة المحذوفات"
+            count > 0 && failed > 0 -> "تم حذف $count فيديو من السلة، وتعذر إكمال $failed عنصر"
+            failed > 0 -> "تعذر إفراغ العناصر المتبقية في سلة المحذوفات ($failed عنصر)"
+            else -> "سلة المحذوفات فارغة"
+        }
+        _events.tryEmit(LibraryUiEvent.ShowMessage(summaryMessage))
     }
 
     fun onWritePermissionGranted(granted: Boolean) {
@@ -343,6 +392,7 @@ class LibraryViewModel(
         if (!granted || op == null) {
             pendingBulkTrashItems.clear()
             pendingBulkDeletedCount = 0
+            pendingBulkFailedCount = 0
             if (!granted) {
                 _events.tryEmit(LibraryUiEvent.ShowMessage("لم يتم منح صلاحية تعديل الملف"))
             }
@@ -361,17 +411,39 @@ class LibraryViewModel(
                 is PendingVideoFileOp.DeletePermanent -> {
                     val verifyResult = videoRepository.completePermanentDeleteAfterPermission(op.video, op.trashItemId)
                     if (verifyResult is VideoFileOperationResult.Success) {
-                        op.trashItemId?.let { trashRepository?.removeRecord(it) }
+                        val trashId = op.trashItemId
+                        val removed = if (trashId != null) {
+                            trashRepository?.removeRecord(trashId) == true
+                        } else {
+                            true
+                        }
+                        if (removed && trashId != null) {
+                            _trashExistenceMap.value = _trashExistenceMap.value - trashId
+                        }
                         if (pendingBulkTrashItems.isNotEmpty()) {
-                            pendingBulkDeletedCount++
+                            if (removed) {
+                                pendingBulkDeletedCount++
+                            } else {
+                                pendingBulkFailedCount++
+                                val err = trashRepository?.trashError?.value
+                                    ?: "تعذر إزالة السجل من سلة المحذوفات"
+                                _events.tryEmit(LibraryUiEvent.ShowMessage(err))
+                            }
                             processNextBulkDeleteItem()
                         } else {
                             loadVideos()
-                            _events.tryEmit(LibraryUiEvent.ShowMessage("تم حذف الفيديو نهائيًا"))
+                            if (removed) {
+                                _events.tryEmit(LibraryUiEvent.ShowMessage("تم حذف الفيديو نهائيًا"))
+                            } else {
+                                val err = trashRepository?.trashError?.value
+                                    ?: "تم حذف الملف، لكن تعذر إزالة السجل من سلة المحذوفات"
+                                _events.tryEmit(LibraryUiEvent.ShowMessage(err))
+                            }
                         }
                     } else {
                         pendingBulkTrashItems.clear()
                         pendingBulkDeletedCount = 0
+                        pendingBulkFailedCount = 0
                         handleFileOpResult(
                             result = verifyResult,
                             successMessage = "تم حذف الفيديو نهائيًا"

@@ -1,6 +1,5 @@
 package com.videohatak.player
 
-import android.net.Uri
 import com.videohatak.player.core.playlist.model.Playlist
 import com.videohatak.player.core.playlist.model.PlaylistItem
 import com.videohatak.player.core.playlist.model.PlaylistPlaybackState

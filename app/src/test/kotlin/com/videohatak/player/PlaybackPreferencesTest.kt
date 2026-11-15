@@ -17,19 +17,24 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.Timeout
 import org.junit.runner.RunWith
 import org.junit.runners.JUnit4
 import java.io.File
@@ -59,6 +64,9 @@ import java.io.IOException
 @OptIn(ExperimentalCoroutinesApi::class)
 @RunWith(JUnit4::class)
 class PlaybackPreferencesTest {
+
+    @get:Rule
+    val timeoutRule: Timeout = Timeout.seconds(30)
 
     private val tempFiles = mutableListOf<File>()
     private val activeManagers = mutableListOf<PlaybackPositionManager>()
@@ -172,6 +180,10 @@ class PlaybackPreferencesTest {
         // Verify restoration from the active repository
         val restored = realRepo.getSavedVideoPosition(uri, durationMs = 120_000L)
         assertEquals(42_000L, restored)
+
+        // Shut down first manager and cancel+join first DataStore scope before opening a second DataStore on the same file
+        manager.shutdown(drainTimeoutMs = 1000L)
+        scope.coroutineContext[Job]?.cancelAndJoin()
 
         // Verify genuine persistence on disk by reading via a fresh second repository instance
         val freshScope = createTestScope()
@@ -556,6 +568,9 @@ class PlaybackPreferencesTest {
         val migratedPos = realRepo.getSavedVideoPosition(mediaStoreUri, durationMs = 120_000L, legacyVideoId = 888L)
         assertEquals("Must successfully read and migrate legacy position", 65_000L, migratedPos)
 
+        // Cancel+join first DataStore scope before opening a second DataStore on the same file
+        scope.coroutineContext[Job]?.cancelAndJoin()
+
         // Verify modern key is now written by opening fresh repository instance and reading without legacy ID
         val scope2 = createTestScope()
         val dataStore2 = PreferenceDataStoreFactory.create(scope = scope2, produceFile = { file })
@@ -723,31 +738,35 @@ class PlaybackPreferencesTest {
         val manager = createManager(faultRepo, scope)
         val uri = "content://media/external/video/media/cancel_during_delay"
 
-        val firstAttemptFailed = CompletableDeferred<Unit>()
-        faultRepo.onAfterFailure = { saveUri, _, _ ->
-            if (saveUri == uri) {
-                firstAttemptFailed.complete(Unit)
+        val enteredRetryDelay = CompletableDeferred<Unit>()
+        val allowRetryDelayProceed = CompletableDeferred<Unit>()
+        manager.onBeforeRetryDelayForTesting = { reqInRetry ->
+            if (reqInRetry.uri == uri) {
+                enteredRetryDelay.complete(Unit)
+                allowRetryDelayProceed.await()
             }
         }
 
-        // 1. Fail first attempt so it enters backoff delay
+        // 1. Fail first attempt so it enters retry backoff inside try/catch(CancellationException)
         faultRepo.failCount = 1
         val req = manager.enqueueSave(uri, positionMs = 42_000L, durationMs = 100_000L)
         assertNotNull(req)
 
-        // Wait until it fails attempt 1 and enters delay(50L * (1 shl 1))
-        firstAttemptFailed.await()
+        // Deterministically wait until worker is inside the retry backoff try block
+        enteredRetryDelay.await()
 
-        // 2. Cancel the active writer job while in backoff delay
+        // 2. Cancel the active writer job while in backoff delay and clear test barrier
         val currentWriter = manager.getWriterJobForTesting()
         assertNotNull(currentWriter)
         currentWriter?.cancel(CancellationException("Simulated worker cancellation during delay"))
+        manager.onBeforeRetryDelayForTesting = null
+        allowRetryDelayProceed.complete(Unit)
 
         // 3. The manager automatically catches CancellationException, re-queues the request,
         // restarts the writer, and finishes saving the request since failCount is now 0.
-        assertTrue("flushPending must succeed after worker restart", manager.flushPending(timeoutMs = 4000L))
+        assertTrue("awaitRequest must succeed after worker restart", manager.awaitRequest(req!!, timeoutMs = 2000L))
 
-        // 4. Verify position was persisted
+        // 4. Verify position was persisted cleanly
         assertEquals(42_000L, realRepo.getSavedVideoPosition(uri, 100_000L))
         assertEquals(0, manager.getPendingCount())
     }
@@ -1055,5 +1074,39 @@ class PlaybackPreferencesTest {
         // 3. Read back from repository without duration filtering
         val storedRaw = realRepo.getSavedVideoPosition(uri, durationMs = 0L)
         assertEquals("Raw position must be faithfully stored even when duration was 0L", 42_500L, storedRaw)
+    }
+
+    // -------------------------------------------------------------
+    // Test 30: Closing saveChannel Terminates Writer Without Infinite Restart Loop
+    // -------------------------------------------------------------
+    @Test
+    fun test30_ClosingSaveChannelDoesNotRestartWriterAndShutdownCompletesCleanly() = runBlocking {
+        val scope = createTestScope()
+        val (dataStore, _) = createRealDataStore(scope)
+        val realRepo = PlaybackPreferencesRepositoryImpl(dataStore)
+        val manager = createManager(realRepo, scope)
+
+        val initialStarts = manager.getWriterStartCountForTesting()
+        assertEquals(1, initialStarts)
+        val writerJob = manager.getWriterJobForTesting()
+        assertNotNull(writerJob)
+
+        // Closing saveChannel externally must exit the for-loop cleanly without restarting
+        manager.saveChannel.close()
+        withTimeout(2_000L) {
+            writerJob?.join()
+        }
+
+        assertEquals(
+            "Writer must NOT restart after saveChannel is closed",
+            initialStarts,
+            manager.getWriterStartCountForTesting()
+        )
+        assertFalse("Writer must remain inactive after channel closure", manager.isWriterActiveForTesting())
+
+        // shutdown() after channel close completes cleanly
+        withTimeout(2_000L) {
+            manager.shutdown(drainTimeoutMs = 500L)
+        }
     }
 }

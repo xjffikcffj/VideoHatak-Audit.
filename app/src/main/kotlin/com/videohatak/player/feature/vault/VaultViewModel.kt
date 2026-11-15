@@ -19,6 +19,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
@@ -27,7 +28,8 @@ import kotlinx.coroutines.launch
 class VaultViewModel(
     private val repository: VaultRepository,
     private val biometricHelper: VaultBiometricHelper,
-    private val securityPreferences: VaultSecurityPreferences? = null
+    private val securityPreferences: VaultSecurityPreferences? = null,
+    private val nowMsProvider: () -> Long = { System.currentTimeMillis() }
 ) : ViewModel() {
 
     val vaultVideos: StateFlow<List<VaultVideo>> = repository.vaultVideos
@@ -63,12 +65,15 @@ class VaultViewModel(
 
     init {
         viewModelScope.launch {
-            repository.isUnlocked.collect { unlocked ->
+            combine(repository.isUnlocked, autoLockTimeout) { unlocked, timeout ->
+                unlocked to timeout
+            }.collect { (unlocked, timeout) ->
                 _isUnlocked.value = unlocked
-                if (unlocked) {
+                if (unlocked && timeout.timeoutMs > 0L) {
                     startInactivityMonitor()
                 } else {
                     inactivityJob?.cancel()
+                    inactivityJob = null
                 }
             }
         }
@@ -79,9 +84,13 @@ class VaultViewModel(
         inactivityJob?.cancel()
         inactivityJob = viewModelScope.launch {
             while (isActive && repository.isUnlocked.value) {
-                delay(5000L)
                 val timeout = autoLockTimeout.value
-                if (timeout.isInactivityExpired(repository.lastActivityTimestampMs, System.currentTimeMillis())) {
+                if (timeout.timeoutMs <= 0L) break
+                delay(5000L)
+                if (!isActive || !repository.isUnlocked.value) break
+                val latestTimeout = autoLockTimeout.value
+                if (latestTimeout.timeoutMs <= 0L) break
+                if (latestTimeout.isInactivityExpired(repository.lastActivityTimestampMs, nowMsProvider())) {
                     lockVault()
                     break
                 }
@@ -90,7 +99,7 @@ class VaultViewModel(
     }
 
     fun recordUserActivity() {
-        repository.recordActivity()
+        repository.recordActivity(nowMsProvider())
     }
 
     fun onAppBackgrounded() {
@@ -105,7 +114,7 @@ class VaultViewModel(
         }
     }
 
-    fun checkTimeoutOnForeground(nowMs: Long = System.currentTimeMillis()): Boolean {
+    fun checkTimeoutOnForeground(nowMs: Long = nowMsProvider()): Boolean {
         if (!repository.isUnlocked.value) return false
         val expired = autoLockTimeout.value.isInactivityExpired(repository.lastActivityTimestampMs, nowMs)
         if (expired) {
@@ -142,7 +151,9 @@ class VaultViewModel(
             subtitle = "يرجى تأكيد هويتك لفتح مقاطع الفيديو المحمية",
             onSuccess = {
                 viewModelScope.launch { securityPreferences?.resetPinLockout() }
+                val now = nowMsProvider()
                 repository.setUnlocked(true)
+                repository.recordActivity(now)
                 _isUnlocked.value = true
                 _biometricError.value = null
                 refresh()
@@ -157,7 +168,7 @@ class VaultViewModel(
 
     fun unlockWithPin(
         pin: String,
-        nowMs: Long = System.currentTimeMillis(),
+        nowMs: Long = nowMsProvider(),
         onResult: (Boolean) -> Unit = {}
     ) {
         viewModelScope.launch {
@@ -170,6 +181,7 @@ class VaultViewModel(
             when (val result = prefs.verifyPinWithRateLimit(pin, nowMs)) {
                 is PinVerifyResult.Success -> {
                     repository.setUnlocked(true)
+                    repository.recordActivity(nowMs)
                     _isUnlocked.value = true
                     _biometricError.value = null
                     refresh()
@@ -195,7 +207,7 @@ class VaultViewModel(
         }
         viewModelScope.launch {
             val saved = securityPreferences?.setPin(pin) == true
-            repository.recordActivity()
+            repository.recordActivity(nowMsProvider())
             if (saved) {
                 onComplete(true, "تم حفظ رمز PIN للخزنة بأمان (تشفير PBKDF2)")
             } else {
@@ -207,7 +219,7 @@ class VaultViewModel(
     fun removeVaultPin(onComplete: () -> Unit = {}) {
         viewModelScope.launch {
             securityPreferences?.clearPin()
-            repository.recordActivity()
+            repository.recordActivity(nowMsProvider())
             onComplete()
         }
     }
@@ -215,12 +227,13 @@ class VaultViewModel(
     fun setAutoLockTimeout(timeout: VaultAutoLockTimeout) {
         viewModelScope.launch {
             securityPreferences?.setAutoLockTimeout(timeout)
-            repository.recordActivity()
+            repository.recordActivity(nowMsProvider())
         }
     }
 
     fun lockVault() {
         inactivityJob?.cancel()
+        inactivityJob = null
         repository.setUnlocked(false)
         _isUnlocked.value = false
     }
@@ -232,7 +245,7 @@ class VaultViewModel(
     ) {
         importJob?.cancel()
         isImportCancelled = false
-        repository.recordActivity()
+        repository.recordActivity(nowMsProvider())
 
         importJob = viewModelScope.launch {
             _importState.value = VaultImportState.Encrypting(
@@ -306,7 +319,12 @@ class VaultViewModel(
 
     override fun onCleared() {
         inactivityJob?.cancel()
+        inactivityJob = null
         super.onCleared()
+    }
+
+    internal fun clearForTesting() {
+        onCleared()
     }
 
     companion object {

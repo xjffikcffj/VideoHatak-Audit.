@@ -14,6 +14,10 @@ import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
+import org.junit.rules.Timeout
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.RandomAccessFile
@@ -39,10 +43,15 @@ import javax.crypto.AEADBadTagException
  * 12. Cancellation during encryption: ensures immediate abort and cleanup of temporary files.
  * 13. File header parsing accuracy.
  */
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [34], manifest = Config.NONE)
 class VaultCryptoTest {
 
     @get:Rule
     val tempFolder = TemporaryFolder()
+
+    @get:Rule
+    val timeoutRule: Timeout = Timeout.seconds(30)
 
     private lateinit var cryptoManager: VaultCryptoManager
 

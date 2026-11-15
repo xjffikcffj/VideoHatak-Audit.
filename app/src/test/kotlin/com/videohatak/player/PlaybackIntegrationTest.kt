@@ -9,6 +9,7 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import com.videohatak.player.core.model.VideoItem
+import com.videohatak.player.core.playback.PlaybackMode
 import com.videohatak.player.core.playback.PlaybackPositionManager
 import com.videohatak.player.core.playback.PlaybackPreferencesRepository
 import com.videohatak.player.core.playback.PlaybackPreferencesRepositoryImpl
@@ -17,8 +18,12 @@ import com.videohatak.player.feature.player.PlayerViewModel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.resetMain
@@ -29,9 +34,13 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.Timeout
 import org.junit.runner.RunWith
-import org.junit.runners.JUnit4
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
+import org.robolectric.annotation.Config
 import java.io.File
 import java.lang.reflect.InvocationHandler
 import java.lang.reflect.Method
@@ -47,15 +56,19 @@ import java.lang.reflect.Proxy
  * - Real DataStore persistence on disk
  */
 @OptIn(ExperimentalCoroutinesApi::class)
-@RunWith(JUnit4::class)
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [34], manifest = Config.NONE)
 class PlaybackIntegrationTest {
+
+    @get:Rule
+    val timeoutRule: Timeout = Timeout.seconds(30)
 
     private val tempFiles = mutableListOf<File>()
     private val activeManagers = mutableListOf<PlaybackPositionManager>()
     private val activeScopes = mutableListOf<CoroutineScope>()
     private val testDispatcher = StandardTestDispatcher()
 
-    class TestApplication : Application()
+    private fun testApp(): Application = RuntimeEnvironment.getApplication()
 
     /**
      * FakeExoPlayer: Complete dynamic proxy for ExoPlayer that simulates player events,
@@ -257,6 +270,7 @@ class PlaybackIntegrationTest {
         activeManagers.clear()
         for (scope in activeScopes) {
             try {
+                scope.coroutineContext[Job]?.cancelAndJoin()
                 scope.cancel()
             } catch (_: Exception) {}
         }
@@ -267,6 +281,21 @@ class PlaybackIntegrationTest {
             } catch (_: Exception) {}
         }
         tempFiles.clear()
+    }
+
+    private suspend fun drainMainAndIo(
+        timeoutMs: Long = 5_000L,
+        condition: suspend () -> Boolean
+    ) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (!condition()) {
+            testDispatcher.scheduler.advanceUntilIdle()
+            if (condition()) return
+            if (System.currentTimeMillis() >= deadline) {
+                throw AssertionError("Timed out after ${timeoutMs}ms waiting for async Main/IO condition")
+            }
+            delay(10L)
+        }
     }
 
     // -------------------------------------------------------------
@@ -286,7 +315,7 @@ class PlaybackIntegrationTest {
         val playerManager = VideoPlayerManager.createForTesting(fakePlayer.exoPlayer)
 
         val viewModel = PlayerViewModel(
-            application = TestApplication(),
+            application = testApp(),
             playerManager = playerManager,
             playbackPreferences = realRepo,
             positionManager = posManager,
@@ -339,7 +368,7 @@ class PlaybackIntegrationTest {
         val playerManager = VideoPlayerManager.createForTesting(fakePlayer.exoPlayer)
 
         val viewModel = PlayerViewModel(
-            application = TestApplication(),
+            application = testApp(),
             playerManager = playerManager,
             playbackPreferences = realRepo,
             positionManager = posManager,
@@ -533,7 +562,7 @@ class PlaybackIntegrationTest {
         val playerManager = VideoPlayerManager.createForTesting(fakePlayer.exoPlayer)
 
         val viewModel = PlayerViewModel(
-            application = TestApplication(),
+            application = testApp(),
             playerManager = playerManager,
             playbackPreferences = countingRepo,
             positionManager = posManager,
@@ -626,7 +655,7 @@ class PlaybackIntegrationTest {
         val playerManager = VideoPlayerManager.createForTesting(fakePlayer.exoPlayer)
 
         val viewModel = PlayerViewModel(
-            application = TestApplication(),
+            application = testApp(),
             playerManager = playerManager,
             playbackPreferences = trackingRepo,
             positionManager = posManager,
@@ -636,6 +665,11 @@ class PlaybackIntegrationTest {
 
         // 1. Initial play of video: triggers initial restoration query
         viewModel.playVideo(videoItem)
+        drainMainAndIo {
+            restorationQueriesCount.get() >= 1 &&
+                (playerManager.restorationCoordinator.pendingUri != null ||
+                    playerManager.restorationCoordinator.isRestorationApplied)
+        }
         testDispatcher.scheduler.advanceUntilIdle()
 
         val initialQueries = restorationQueriesCount.get()
@@ -697,7 +731,7 @@ class PlaybackIntegrationTest {
         val playerManager = VideoPlayerManager.createForTesting(fakePlayer.exoPlayer)
 
         val viewModel = PlayerViewModel(
-            application = TestApplication(),
+            application = testApp(),
             playerManager = playerManager,
             playbackPreferences = trackingRepo,
             positionManager = posManager,
@@ -705,14 +739,19 @@ class PlaybackIntegrationTest {
             thumbnailManager = null
         )
 
-        // Setup playlist items in ViewModel
-        val playlistField = PlayerViewModel::class.java.getDeclaredField("playlistVideos")
-        playlistField.isAccessible = true
-        playlistField.set(viewModel, listOf(itemA, itemB))
+        // Configure REPEAT_PLAYLIST and queue playlist context [itemA, itemB]
+        viewModel.setPlaybackMode(PlaybackMode.REPEAT_PLAYLIST)
+        drainMainAndIo {
+            realRepo.playbackMode.first() == PlaybackMode.REPEAT_PLAYLIST &&
+                playerManager.uiState.value.playbackMode == PlaybackMode.REPEAT_PLAYLIST
+        }
 
-        // Initial play on Item A
-        viewModel.playVideo(itemA)
-        testDispatcher.scheduler.advanceUntilIdle()
+        // Initial play on Item A within playlist context
+        viewModel.playVideoInContext(itemA, listOf(itemA, itemB))
+        drainMainAndIo {
+            restorationQueriesCount.get() >= 1 &&
+                playerManager.restorationCoordinator.pendingUri == uriA.toString()
+        }
         fakePlayer.triggerPlaybackStateChanged(Player.STATE_READY)
         testDispatcher.scheduler.advanceUntilIdle()
 
@@ -728,7 +767,10 @@ class PlaybackIntegrationTest {
         fakePlayer.playbackState = Player.STATE_READY
         val mediaItemB = MediaItem.Builder().setMediaId("222").setUri(uriB).build()
         playerManager.playerListener.onMediaItemTransition(mediaItemB, Player.MEDIA_ITEM_TRANSITION_REASON_AUTO)
-        testDispatcher.scheduler.advanceUntilIdle()
+        drainMainAndIo {
+            restorationQueriesCount.get() > queriesAfterA &&
+                fakePlayer.seekCalls.contains(40_000L)
+        }
 
         // Simulate ExoPlayer reaching STATE_READY for Item B
         fakePlayer.triggerPlaybackStateChanged(Player.STATE_READY)

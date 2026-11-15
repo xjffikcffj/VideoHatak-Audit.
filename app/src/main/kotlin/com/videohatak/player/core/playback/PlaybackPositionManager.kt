@@ -5,14 +5,18 @@ import android.util.Log
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 data class PositionSaveRequest(
@@ -78,20 +82,28 @@ class PlaybackPositionManager(
     var inFlightRequest: PositionSaveRequest? = null
         internal set
 
+    @Volatile
     var onRequestPermanentlyFailedForTesting: ((PositionSaveRequest) -> Unit)? = null
 
+    @Volatile
+    internal var onBeforeRetryDelayForTesting: (suspend (PositionSaveRequest) -> Unit)? = null
+
+    private val writerStartCount = AtomicInteger(0)
     private var writerJob: Job? = null
 
     init {
         startWriter()
     }
 
+    @OptIn(ExperimentalCoroutinesApi::class)
     private fun startWriter() {
         synchronized(stateLock) {
-            if (isClosed) return
+            if (isClosed || saveChannel.isClosedForReceive || !scope.isActive) return
             val currentJob = writerJob
             if (currentJob != null && currentJob.isActive) return
+            writerStartCount.incrementAndGet()
             writerJob = scope.launch {
+                var channelClosedNormally = false
                 try {
                     for (req in saveChannel) {
                         try {
@@ -102,6 +114,7 @@ class PlaybackPositionManager(
                             Log.e(TAG, "Unexpected error processing single request for ${req.uri}", e)
                         }
                     }
+                    channelClosedNormally = true
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Throwable) {
@@ -111,7 +124,7 @@ class PlaybackPositionManager(
                         if (writerJob == coroutineContext[Job]) {
                             writerJob = null
                         }
-                        if (!isClosed) {
+                        if (!isClosed && !channelClosedNormally && !saveChannel.isClosedForReceive && scope.isActive) {
                             Log.i(TAG, "Restarting save worker...")
                             startWriter()
                         }
@@ -198,9 +211,10 @@ class PlaybackPositionManager(
         }
 
         var permanentlyFailed: PositionSaveRequest? = null
+        var current = req
+        var requeuedOnCancel = false
         try {
             inFlightRequest = req
-            var current = req
 
             while (current.retryCount <= MAX_RETRIES) {
                 // Check if a newer request for this URI arrived while we were waiting/retrying
@@ -216,15 +230,15 @@ class PlaybackPositionManager(
                 try {
                     withContext(NonCancellable) {
                         repository.saveVideoPosition(current.uri, current.positionMs, current.durationMs)
-                    }
-                    lastSavedSequencePerUri[current.uri] = current.sequenceNumber
+                        lastSavedSequencePerUri[current.uri] = current.sequenceNumber
 
-                    synchronized(stateLock) {
-                        // Only remove from pending if current request matches the pending request
-                        if (pendingByUri[current.uri]?.sequenceNumber == current.sequenceNumber) {
-                            pendingByUri.remove(current.uri)
+                        synchronized(stateLock) {
+                            // Only remove from pending if current request matches the pending request
+                            if (pendingByUri[current.uri]?.sequenceNumber == current.sequenceNumber) {
+                                pendingByUri.remove(current.uri)
+                            }
+                            failedRequestsMap.remove(current.uri)
                         }
-                        failedRequestsMap.remove(current.uri)
                     }
                     Log.d(TAG, "Successfully persisted position for ${current.uri}: ${current.positionMs}ms (seq=${current.sequenceNumber})")
                     break
@@ -234,13 +248,16 @@ class PlaybackPositionManager(
                     if (current.retryCount < MAX_RETRIES) {
                         current = current.copy(retryCount = current.retryCount + 1)
                         try {
+                            onBeforeRetryDelayForTesting?.invoke(current)
                             delay(50L * (1 shl current.retryCount))
                         } catch (ce: CancellationException) {
                             synchronized(stateLock) {
                                 val isStillPending = pendingByUri[current.uri]?.sequenceNumber == current.sequenceNumber
                                 val lastSaved = lastSavedSequencePerUri[current.uri] ?: 0L
-                                if (!isClosed && isStillPending && lastSaved < current.sequenceNumber) {
-                                    saveChannel.trySend(current)
+                                if (!isClosed && !requeuedOnCancel && isStillPending && lastSaved < current.sequenceNumber) {
+                                    if (saveChannel.trySend(current).isSuccess) {
+                                        requeuedOnCancel = true
+                                    }
                                 }
                             }
                             throw ce
@@ -259,6 +276,17 @@ class PlaybackPositionManager(
                     }
                 }
             }
+        } catch (ce: CancellationException) {
+            synchronized(stateLock) {
+                val isStillPending = pendingByUri[current.uri]?.sequenceNumber == current.sequenceNumber
+                val lastSaved = lastSavedSequencePerUri[current.uri] ?: 0L
+                if (!isClosed && !requeuedOnCancel && isStillPending && lastSaved < current.sequenceNumber) {
+                    if (saveChannel.trySend(current).isSuccess) {
+                        requeuedOnCancel = true
+                    }
+                }
+            }
+            throw ce
         } finally {
             // Guaranteed cleanup of inFlightRequest even if cancelled or on exception
             inFlightRequest = null
@@ -400,7 +428,13 @@ class PlaybackPositionManager(
         }
         flushPending(drainTimeoutMs)
         saveChannel.close()
-        writerJob?.cancel()
+        val jobToJoin = synchronized(stateLock) { writerJob }
+        jobToJoin?.cancel()
+        if (jobToJoin != null) {
+            withTimeoutOrNull(500L) {
+                jobToJoin.join()
+            }
+        }
     }
 
     fun getFailedRequests(): Map<String, PositionSaveRequest> = failedRequestsMap.toMap()
@@ -412,4 +446,8 @@ class PlaybackPositionManager(
     fun getCurrentSequenceNumber(): Long = sequenceCounter.get()
 
     fun getWriterJobForTesting(): Job? = synchronized(stateLock) { writerJob }
+
+    internal fun getWriterStartCountForTesting(): Int = writerStartCount.get()
+
+    internal fun isWriterActiveForTesting(): Boolean = synchronized(stateLock) { writerJob?.isActive == true }
 }

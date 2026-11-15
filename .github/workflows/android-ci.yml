@@ -46,7 +46,19 @@ jobs:
         run: chmod +x ./gradlew
 
       - name: Run unit tests
-        run: ./gradlew --no-daemon testDebugUnitTest --stacktrace
+        timeout-minutes: 20
+        run: ./gradlew --no-daemon testDebugUnitTest --stacktrace --console=plain
+
+      - name: Upload unit test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: videohatak-unit-test-reports
+          path: |
+            app/build/reports/tests/
+            app/build/test-results/
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Build debug APK
         run: ./gradlew --no-daemon assembleDebug --stacktrace

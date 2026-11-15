@@ -8,7 +8,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
@@ -17,10 +17,15 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Before
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.Timeout
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ThemeViewModelTest {
+
+    @get:Rule
+    val timeoutRule: Timeout = Timeout.seconds(30)
 
     private val testDispatcher = StandardTestDispatcher()
 
@@ -49,6 +54,7 @@ class ThemeViewModelTest {
     @Test
     fun defaultState_loadsFromRepository() = runTest(testDispatcher) {
         val viewModel = ThemeViewModel(fakeRepository)
+        val collectJob = backgroundScope.launch { viewModel.themeState.collect {} }
 
         // Advance dispatcher to collect the initial flow emission
         testDispatcher.scheduler.advanceUntilIdle()
@@ -56,11 +62,13 @@ class ThemeViewModelTest {
         val state = viewModel.themeState.value
         assertTrue("Expected ThemeState.Success but was $state", state is ThemeState.Success)
         assertEquals(ThemeMode.SYSTEM, (state as ThemeState.Success).themeMode)
+        collectJob.cancel()
     }
 
     @Test
     fun setThemeMode_updatesRepositoryAndState() = runTest(testDispatcher) {
         val viewModel = ThemeViewModel(fakeRepository)
+        val collectJob = backgroundScope.launch { viewModel.themeState.collect {} }
         testDispatcher.scheduler.advanceUntilIdle()
 
         viewModel.setThemeMode(ThemeMode.DARK)
@@ -70,11 +78,13 @@ class ThemeViewModelTest {
         assertTrue(state is ThemeState.Success)
         assertEquals(ThemeMode.DARK, (state as ThemeState.Success).themeMode)
         assertEquals(ThemeMode.DARK, fakeRepository.flow.value)
+        collectJob.cancel()
     }
 
     @Test
     fun setThemeMode_switchToLight_updatesCorrectly() = runTest(testDispatcher) {
         val viewModel = ThemeViewModel(fakeRepository)
+        val collectJob = backgroundScope.launch { viewModel.themeState.collect {} }
         testDispatcher.scheduler.advanceUntilIdle()
 
         viewModel.setThemeMode(ThemeMode.LIGHT)
@@ -84,5 +94,6 @@ class ThemeViewModelTest {
         assertTrue(state is ThemeState.Success)
         assertEquals(ThemeMode.LIGHT, (state as ThemeState.Success).themeMode)
         assertEquals(ThemeMode.LIGHT, fakeRepository.flow.value)
+        collectJob.cancel()
     }
 }

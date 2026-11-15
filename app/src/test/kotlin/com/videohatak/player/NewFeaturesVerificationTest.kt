@@ -25,8 +25,11 @@ import com.videohatak.player.feature.player.PlayerViewModel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
@@ -43,10 +46,15 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.Timeout
 import org.junit.runner.RunWith
-import org.junit.runners.JUnit4
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
+import org.robolectric.annotation.Config
 import java.io.File
+import kotlin.math.abs
 
 /**
  * Unit & integration verification tests for:
@@ -57,15 +65,19 @@ import java.io.File
  * 5. Permission state modeling (including permanent denial state).
  */
 @OptIn(ExperimentalCoroutinesApi::class)
-@RunWith(JUnit4::class)
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [34], manifest = Config.NONE)
 class NewFeaturesVerificationTest {
+
+    @get:Rule
+    val timeoutRule: Timeout = Timeout.seconds(30)
 
     private val testDispatcher = StandardTestDispatcher()
     private val tempFiles = mutableListOf<File>()
     private val activeManagers = mutableListOf<PlaybackPositionManager>()
     private val activeScopes = mutableListOf<CoroutineScope>()
 
-    private class FakeApp : Application()
+    private fun testApp(): Application = RuntimeEnvironment.getApplication()
 
     private class InMemoryThemePreferencesRepository : ThemePreferencesRepository {
         private val modeFlow = MutableStateFlow(ThemeMode.DARK)
@@ -106,10 +118,28 @@ class NewFeaturesVerificationTest {
         Dispatchers.resetMain()
         activeManagers.forEach { runCatching { it.shutdown(500L) } }
         activeManagers.clear()
-        activeScopes.forEach { runCatching { it.cancel() } }
+        activeScopes.forEach { scope ->
+            runCatching { scope.coroutineContext[Job]?.cancelAndJoin() }
+            runCatching { scope.cancel() }
+        }
         activeScopes.clear()
         tempFiles.forEach { if (it.exists()) it.delete() }
         tempFiles.clear()
+    }
+
+    private suspend fun drainMainAndIo(
+        timeoutMs: Long = 5_000L,
+        condition: suspend () -> Boolean
+    ) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (!condition()) {
+            testDispatcher.scheduler.advanceUntilIdle()
+            if (condition()) return
+            if (System.currentTimeMillis() >= deadline) {
+                throw AssertionError("Timed out after ${timeoutMs}ms waiting for async Main/IO condition")
+            }
+            delay(10L)
+        }
     }
 
     @Test
@@ -217,7 +247,7 @@ class NewFeaturesVerificationTest {
         }
         val playerManager = VideoPlayerManager.createForTesting(fakePlayer.exoPlayer)
         val vm = PlayerViewModel(
-            application = FakeApp(),
+            application = testApp(),
             playerManager = playerManager,
             playbackPreferences = repo,
             positionManager = posManager,
@@ -227,8 +257,12 @@ class NewFeaturesVerificationTest {
 
         // 1. START_FROM_BEGINNING always resets start to 0ms even when 45,000ms is saved
         repo.setResumeMode(ResumeMode.START_FROM_BEGINNING)
+        drainMainAndIo { vm.uiState.value.resumeMode == ResumeMode.START_FROM_BEGINNING }
         vm.playVideo(video)
-        testDispatcher.scheduler.advanceUntilIdle()
+        drainMainAndIo {
+            playerManager.restorationCoordinator.pendingUri != null ||
+                playerManager.restorationCoordinator.isRestorationApplied
+        }
         fakePlayer.triggerPlaybackStateChanged(Player.STATE_READY)
         testDispatcher.scheduler.advanceUntilIdle()
 
@@ -237,9 +271,10 @@ class NewFeaturesVerificationTest {
 
         // 2. ASK_EVERY_TIME opens prompt and leaves user in control
         repo.setResumeMode(ResumeMode.ASK_EVERY_TIME)
+        drainMainAndIo { vm.uiState.value.resumeMode == ResumeMode.ASK_EVERY_TIME }
         fakePlayer.isPlaying = true
         vm.playVideo(video)
-        testDispatcher.scheduler.advanceUntilIdle()
+        drainMainAndIo { vm.pendingResumePrompt.value != null }
         fakePlayer.triggerPlaybackStateChanged(Player.STATE_READY)
         testDispatcher.scheduler.advanceUntilIdle()
 
@@ -264,7 +299,7 @@ class NewFeaturesVerificationTest {
         val fakePlayer = PlaybackIntegrationTest.FakeExoPlayer()
         val playerManager = VideoPlayerManager.createForTesting(fakePlayer.exoPlayer)
         val vm = PlayerViewModel(
-            application = FakeApp(),
+            application = testApp(),
             playerManager = playerManager,
             playbackPreferences = repo,
             positionManager = posManager,
@@ -273,7 +308,10 @@ class NewFeaturesVerificationTest {
         )
 
         vm.setPlaybackSpeed(1.25f)
-        testDispatcher.scheduler.advanceUntilIdle()
+        drainMainAndIo {
+            abs(repo.playbackSpeed.first() - 1.25f) < 0.001f &&
+                abs(vm.uiState.value.playbackSpeed - 1.25f) < 0.001f
+        }
         assertEquals(1.25f, vm.uiState.value.playbackSpeed, 0.001f)
         assertEquals(1.25f, repo.playbackSpeed.first(), 0.001f)
 

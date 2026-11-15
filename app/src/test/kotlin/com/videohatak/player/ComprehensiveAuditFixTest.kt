@@ -46,11 +46,15 @@ import com.videohatak.player.core.vault.security.VaultPinHasher
 import com.videohatak.player.core.vault.security.VaultSecurityBackupStore
 import com.videohatak.player.core.vault.security.VaultSecurityPreferences
 import com.videohatak.player.feature.vault.VaultViewModel
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -62,6 +66,7 @@ import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.withContext
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -69,7 +74,9 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.Timeout
 import org.junit.runner.RunWith
 import org.junit.runners.JUnit4
 import java.io.File
@@ -78,6 +85,9 @@ import java.io.IOException
 @OptIn(ExperimentalCoroutinesApi::class)
 @RunWith(JUnit4::class)
 class ComprehensiveAuditFixTest {
+
+    @get:Rule
+    val timeoutRule: Timeout = Timeout.seconds(30)
 
     private val testDispatcher = StandardTestDispatcher()
     private val tempFiles = mutableListOf<File>()
@@ -106,10 +116,32 @@ class ComprehensiveAuditFixTest {
     @After
     fun tearDown() {
         Dispatchers.resetMain()
-        activeScopes.forEach { runCatching { it.cancel() } }
+        runBlocking {
+            activeScopes.forEach { scope ->
+                runCatching { scope.coroutineContext[Job]?.cancelAndJoin() }
+                runCatching { scope.cancel() }
+            }
+        }
         activeScopes.clear()
         tempFiles.forEach { if (it.exists()) it.delete() }
         tempFiles.clear()
+    }
+
+    private suspend fun awaitIoAndDrainMain(
+        timeoutMs: Long = 5_000L,
+        condition: () -> Boolean
+    ) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (!condition()) {
+            testDispatcher.scheduler.runCurrent()
+            if (condition()) return
+            if (System.currentTimeMillis() >= deadline) {
+                throw AssertionError("Timed out after ${timeoutMs}ms waiting for IO/Main state")
+            }
+            withContext(Dispatchers.Default) {
+                delay(10L)
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -277,16 +309,28 @@ class ComprehensiveAuditFixTest {
         val scope = createScope()
         val securityPrefs = VaultSecurityPreferences(createDataStore(scope, "vault_vm_"))
         val fakeRepo = FakeVaultRepository()
-        val vm = VaultViewModel(fakeRepo, VaultBiometricHelper(FakeApp()), securityPrefs)
+        val nowMsProvider: () -> Long = { 10_000L + testDispatcher.scheduler.currentTime }
+        val vm = VaultViewModel(
+            repository = fakeRepo,
+            biometricHelper = VaultBiometricHelper(FakeApp()),
+            securityPreferences = securityPrefs,
+            nowMsProvider = nowMsProvider
+        )
 
         val collectJob = backgroundScope.launch {
             vm.autoLockTimeout.collect {}
         }
 
         assertTrue(securityPrefs.setPin("2468"))
-        vm.unlockWithPin("2468")
-        testDispatcher.scheduler.advanceUntilIdle()
+        val unlock1Done = CompletableDeferred<Boolean>()
+        vm.unlockWithPin("2468") { unlock1Done.complete(it) }
+        awaitIoAndDrainMain { unlock1Done.isCompleted }
+        assertTrue(unlock1Done.await())
         assertTrue(vm.isUnlocked.value)
+
+        // Advance virtual time under IMMEDIATE policy: must NOT hang in infinite loop
+        testDispatcher.scheduler.advanceTimeBy(10_000L)
+        testDispatcher.scheduler.runCurrent()
 
         // Default timeout is IMMEDIATE: exiting Vault tab MUST lock immediately
         vm.onVaultTabExited()
@@ -294,10 +338,14 @@ class ComprehensiveAuditFixTest {
 
         // Switch policy to SECONDS_30 and unlock again
         vm.setAutoLockTimeout(VaultAutoLockTimeout.SECONDS_30)
-        testDispatcher.scheduler.advanceUntilIdle()
-        vm.unlockWithPin("2468")
-        testDispatcher.scheduler.advanceUntilIdle()
-        fakeRepo.recordActivity(10_000L)
+        awaitIoAndDrainMain { vm.autoLockTimeout.value == VaultAutoLockTimeout.SECONDS_30 }
+
+        val unlock2Done = CompletableDeferred<Boolean>()
+        vm.unlockWithPin("2468") { unlock2Done.complete(it) }
+        awaitIoAndDrainMain { unlock2Done.isCompleted }
+        assertTrue(unlock2Done.await())
+        val baseTime = nowMsProvider()
+        fakeRepo.recordActivity(baseTime)
         assertTrue(vm.isUnlocked.value)
 
         // Exiting tab or backgrounding under SECONDS_30 must NOT prematurely lock before timeout
@@ -305,14 +353,32 @@ class ComprehensiveAuditFixTest {
         assertTrue(vm.isUnlocked.value)
         vm.onAppBackgrounded()
         assertTrue(vm.isUnlocked.value)
-        assertFalse(vm.checkTimeoutOnForeground(nowMs = 39_000L))
+        assertFalse(vm.checkTimeoutOnForeground(nowMs = baseTime + 29_000L))
         assertTrue(vm.isUnlocked.value)
 
-        // Returning after 30,000ms elapsed MUST lock automatically
+        // Inactivity monitor checks every 5s: 25s elapsed must stay unlocked
+        testDispatcher.scheduler.advanceTimeBy(25_000L)
+        testDispatcher.scheduler.runCurrent()
+        assertTrue(vm.isUnlocked.value)
+
+        // Reaching 30,000ms triggers automatic lock via monitor
+        testDispatcher.scheduler.advanceTimeBy(5_000L)
+        testDispatcher.scheduler.runCurrent()
+        assertFalse(vm.isUnlocked.value)
+
+        // Also verify checkTimeoutOnForeground locks when elapsed >= 30,000ms
+        val unlock3Done = CompletableDeferred<Boolean>()
+        vm.unlockWithPin("2468") { unlock3Done.complete(it) }
+        awaitIoAndDrainMain { unlock3Done.isCompleted }
+        assertTrue(unlock3Done.await())
+        fakeRepo.recordActivity(10_000L)
         assertTrue(vm.checkTimeoutOnForeground(nowMs = 40_500L))
         assertFalse(vm.isUnlocked.value)
 
+        vm.lockVault()
         collectJob.cancel()
+        vm.clearForTesting()
+        testDispatcher.scheduler.runCurrent()
     }
 
     // -------------------------------------------------------------------------

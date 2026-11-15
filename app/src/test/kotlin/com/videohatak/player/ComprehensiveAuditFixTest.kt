@@ -467,22 +467,22 @@ class ComprehensiveAuditFixTest {
     }
 
     private class FakeBackupPlaylistStore : BackupPlaylistStore {
-        val playlists = mutableListOf<Pair<Playlist, List<PlaylistItem>>>()
+        private val storedPlaylists = mutableListOf<Pair<Playlist, List<PlaylistItem>>>()
         var failOnReplace = false
 
-        override fun getPlaylists(): List<Playlist> = playlists.map { it.first }
+        override fun getPlaylists(): List<Playlist> = storedPlaylists.map { it.first }
 
         override fun getItemsForPlaylist(playlistId: Long): List<PlaylistItem> =
-            playlists.firstOrNull { it.first.id == playlistId }?.second ?: emptyList()
+            storedPlaylists.firstOrNull { it.first.id == playlistId }?.second ?: emptyList()
 
         override fun replaceAllPlaylistsAndItems(entries: List<Pair<Playlist, List<PlaylistItem>>>) {
             if (failOnReplace) {
                 throw IllegalStateException("SQLite insert failed (-1)")
             }
-            playlists.clear()
+            storedPlaylists.clear()
             entries.forEachIndexed { idx, (pl, items) ->
                 val newId = (idx + 1).toLong()
-                playlists.add(
+                storedPlaylists.add(
                     pl.copy(id = newId, itemCount = items.size) to
                         items.mapIndexed { itemIdx, it ->
                             it.copy(id = (idx * 100L + itemIdx + 1L), playlistId = newId)

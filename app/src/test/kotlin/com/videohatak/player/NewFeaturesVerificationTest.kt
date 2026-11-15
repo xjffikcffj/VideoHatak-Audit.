@@ -148,11 +148,14 @@ class NewFeaturesVerificationTest {
         assertEquals(8, themes.size)
 
         val palettes = themes.map { paletteForTheme(it) }
-        // Every theme must have unique display name, background/accent signature, and seekbar glow colors
+        val lightPalettes = themes.map { paletteForTheme(it, forceLight = true) }
+        // Every theme must have unique display name, background/accent signature, and seekbar glow colors in both dark and light modes
         assertEquals(8, themes.map { it.displayName }.toSet().size)
         assertEquals(8, themes.map { it.arabicTagline }.toSet().size)
         assertEquals(8, palettes.map { it.accent }.toSet().size)
         assertEquals(8, palettes.map { it.seekBarPlayedEnd }.toSet().size)
+        assertEquals(8, lightPalettes.map { it.accent }.toSet().size)
+        assertEquals(8, lightPalettes.map { it.seekBarPlayedEnd }.toSet().size)
 
         // Only Royal Ivory is light-by-default; remaining 7 are dark luxury themes
         assertTrue(AppThemeId.ROYAL_IVORY.isLightTheme)
@@ -255,26 +258,55 @@ class NewFeaturesVerificationTest {
             thumbnailManager = null
         )
 
-        // 1. START_FROM_BEGINNING always resets start to 0ms even when 45,000ms is saved
-        repo.setResumeMode(ResumeMode.START_FROM_BEGINNING)
-        drainMainAndIo { vm.uiState.value.resumeMode == ResumeMode.START_FROM_BEGINNING }
+        // 1. RESUME automatically restores the saved 45,000ms position
+        repo.setResumeMode(ResumeMode.RESUME)
+        drainMainAndIo {
+            repo.resumeMode.first() == ResumeMode.RESUME &&
+                vm.uiState.value.resumeMode == ResumeMode.RESUME
+        }
+        fakePlayer.playbackState = Player.STATE_IDLE
         vm.playVideo(video)
         drainMainAndIo {
-            playerManager.restorationCoordinator.pendingUri != null ||
+            playerManager.restorationCoordinator.pendingUri == uri.toString() ||
                 playerManager.restorationCoordinator.isRestorationApplied
         }
         fakePlayer.triggerPlaybackStateChanged(Player.STATE_READY)
         testDispatcher.scheduler.advanceUntilIdle()
 
         assertNull(vm.pendingResumePrompt.value)
-        assertEquals(0L, fakePlayer.currentPosition)
+        assertEquals(45_000L, fakePlayer.currentPosition)
 
-        // 2. ASK_EVERY_TIME opens prompt and leaves user in control
+        // 2. START_FROM_BEGINNING always resets start to 0ms without wiping saved 45,000ms
+        repo.setResumeMode(ResumeMode.START_FROM_BEGINNING)
+        drainMainAndIo {
+            repo.resumeMode.first() == ResumeMode.START_FROM_BEGINNING &&
+                vm.uiState.value.resumeMode == ResumeMode.START_FROM_BEGINNING
+        }
+        fakePlayer.playbackState = Player.STATE_IDLE
+        vm.playVideo(video)
+        drainMainAndIo {
+            playerManager.restorationCoordinator.pendingUri == uri.toString() ||
+                playerManager.restorationCoordinator.isRestorationApplied
+        }
+        fakePlayer.triggerPlaybackStateChanged(Player.STATE_READY)
+        testDispatcher.scheduler.advanceUntilIdle()
+        posManager.flushPending(timeoutMs = 2_000L)
+
+        assertNull(vm.pendingResumePrompt.value)
+        assertEquals(0L, fakePlayer.currentPosition)
+        assertEquals(45_000L, repo.getSavedVideoPosition(uri.toString(), 120_000L))
+
+        // 3. ASK_EVERY_TIME opens prompt, pauses playback, and leaves user in control
         repo.setResumeMode(ResumeMode.ASK_EVERY_TIME)
-        drainMainAndIo { vm.uiState.value.resumeMode == ResumeMode.ASK_EVERY_TIME }
+        drainMainAndIo {
+            repo.resumeMode.first() == ResumeMode.ASK_EVERY_TIME &&
+                vm.uiState.value.resumeMode == ResumeMode.ASK_EVERY_TIME
+        }
+        fakePlayer.playbackState = Player.STATE_IDLE
         fakePlayer.isPlaying = true
         vm.playVideo(video)
         drainMainAndIo { vm.pendingResumePrompt.value != null }
+        assertFalse("ASK_EVERY_TIME must pause player while waiting for user choice", fakePlayer.isPlaying)
         fakePlayer.triggerPlaybackStateChanged(Player.STATE_READY)
         testDispatcher.scheduler.advanceUntilIdle()
 
@@ -313,19 +345,26 @@ class NewFeaturesVerificationTest {
                 abs(vm.uiState.value.playbackSpeed - 1.25f) < 0.001f
         }
         assertEquals(1.25f, vm.uiState.value.playbackSpeed, 0.001f)
+        assertEquals(1.25f, vm.uiState.value.effectivePlaybackSpeed, 0.001f)
+        assertEquals(1.25f, fakePlayer.playbackSpeed, 0.001f)
         assertEquals(1.25f, repo.playbackSpeed.first(), 0.001f)
 
-        // Hold for temporary 2.0x boost
+        // Hold for temporary 2.0x boost: ExoPlayer and effectivePlaybackSpeed run at 2.0x,
+        // while saved preference & base playbackSpeed remain 1.25x
         vm.setTemporaryPlaybackSpeed(2.0f)
         assertTrue(vm.uiState.value.isTemporarySpeedActive)
-        assertEquals(2.0f, vm.uiState.value.playbackSpeed, 0.001f)
+        assertEquals(2.0f, vm.uiState.value.effectivePlaybackSpeed, 0.001f)
+        assertEquals(2.0f, fakePlayer.playbackSpeed, 0.001f)
+        assertEquals(1.25f, vm.uiState.value.playbackSpeed, 0.001f)
         // Persisted preference must remain untouched at 1.25x
         assertEquals(1.25f, repo.playbackSpeed.first(), 0.001f)
 
-        // Release finger -> restores previous speed 1.25x
+        // Release finger -> restores previous speed 1.25x on both UI state and ExoPlayer
         vm.clearTemporaryPlaybackSpeed()
         assertFalse(vm.uiState.value.isTemporarySpeedActive)
         assertEquals(1.25f, vm.uiState.value.playbackSpeed, 0.001f)
+        assertEquals(1.25f, vm.uiState.value.effectivePlaybackSpeed, 0.001f)
+        assertEquals(1.25f, fakePlayer.playbackSpeed, 0.001f)
     }
 
     @Test

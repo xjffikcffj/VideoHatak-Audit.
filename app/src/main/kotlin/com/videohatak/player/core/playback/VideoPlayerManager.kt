@@ -89,8 +89,10 @@ class VideoPlayerManager internal constructor(
             if (actualDur > 0L) {
                 knownDurations[currentUri] = actualDur
             }
-            lastReportedPositionMs = actualPos
-            onPeriodicPositionUpdate?.invoke(currentUri, actualPos, actualDur)
+            if (actualPos > 0L) {
+                lastReportedPositionMs = actualPos
+                onPeriodicPositionUpdate?.invoke(currentUri, actualPos, actualDur)
+            }
             return true
         }
         return false

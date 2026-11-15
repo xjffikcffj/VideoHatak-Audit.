@@ -97,13 +97,14 @@ fun paletteForTheme(themeId: AppThemeId, forceLight: Boolean = false): VideoHata
 
     if (forceLight) {
         val (accent, glow, secondary, border) = when (effectiveId) {
+            AppThemeId.OBSIDIAN_ELITE -> QuadColor(Color(0xFF9A6700), Color(0xFFD49A1A), Color(0xFF6E4900), Color(0xFFCDB686))
             AppThemeId.SAPPHIRE_PREMIUM -> QuadColor(Color(0xFF1D6FD8), Color(0xFF60A5FA), Color(0xFF0284C7), Color(0xFFBFD7F5))
             AppThemeId.EMERALD_LUXURY -> QuadColor(Color(0xFF059669), Color(0xFF34D399), Color(0xFF0D9488), Color(0xFFB5E3D0))
             AppThemeId.GALAXY_PRO -> QuadColor(Color(0xFF7E22CE), Color(0xFFC084FC), Color(0xFFA855F7), Color(0xFFDBC7F5))
             AppThemeId.TITANIUM_NOIR -> QuadColor(Color(0xFF334155), Color(0xFF64748B), Color(0xFF475569), Color(0xFFCBD5E1))
             AppThemeId.RUBY_CINEMA -> QuadColor(Color(0xFFBE123C), Color(0xFFFB7185), Color(0xFFE11D48), Color(0xFFF3C1CC))
             AppThemeId.NEON_DREAM -> QuadColor(Color(0xFF0891B2), Color(0xFF22D3EE), Color(0xFFC026D3), Color(0xFFBAE6FD))
-            else -> QuadColor(Color(0xFFB4820A), Color(0xFFE5B84B), Color(0xFF8C6308), Color(0xFFD6C08D))
+            AppThemeId.ROYAL_IVORY -> QuadColor(Color(0xFFB4820A), Color(0xFFE5B84B), Color(0xFF8C6308), Color(0xFFD6C08D))
         }
         val isIvory = effectiveId == AppThemeId.ROYAL_IVORY
         val bg = if (isIvory) Color(0xFFFAF5EA) else Color(0xFFF6F7FB)

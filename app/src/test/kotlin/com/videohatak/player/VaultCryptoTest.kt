@@ -762,8 +762,9 @@ class VaultCryptoTest {
 
     @Test
     fun testPersistentZeroReadsThrowsIOExceptionAndCleansUpTempFile() {
-        val destFile = tempFolder.newFile("stalled_stream.enc")
+        val destFile = File(tempFolder.root, "stalled_stream.enc")
         val tempFile = File(destFile.parentFile, "${destFile.name}.tmp")
+        assertFalse(destFile.exists())
 
         // Stream that delivers 10KB then stalls completely, returning 0 repeatedly
         val stalledStream = object : java.io.InputStream() {

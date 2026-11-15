@@ -6,6 +6,7 @@ import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.datastore.preferences.core.Preferences
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import com.videohatak.player.core.model.VideoItem
@@ -84,6 +85,7 @@ class PlaybackIntegrationTest {
         var repeatMode: Int = Player.REPEAT_MODE_OFF
         var shuffleModeEnabled: Boolean = false
         var playWhenReady: Boolean = false
+        var playbackSpeed: Float = 1.0f
         val listeners = mutableListOf<Player.Listener>()
         val mediaItems = mutableListOf<MediaItem>()
         val seekCalls = mutableListOf<Long>()
@@ -190,6 +192,11 @@ class PlaybackIntegrationTest {
                     null
                 }
                 "getPlayWhenReady" -> playWhenReady
+                "setPlaybackSpeed" -> {
+                    playbackSpeed = nonNullArgs[0] as Float
+                    null
+                }
+                "getPlaybackParameters" -> PlaybackParameters(playbackSpeed)
                 "hasNextMediaItem" -> currentMediaItemIndex < mediaItems.size - 1
                 "hasPreviousMediaItem" -> currentMediaItemIndex > 0
                 "seekToNextMediaItem" -> {
@@ -481,8 +488,6 @@ class PlaybackIntegrationTest {
 
         val fakePlayer = FakeExoPlayer().apply {
             duration = 0L // Unknown duration (e.g. live stream or early preparation)
-            currentPosition = 47_300L
-            isPlaying = true
         }
         val playerManager = VideoPlayerManager.createForTesting(fakePlayer.exoPlayer)
 
@@ -493,6 +498,10 @@ class PlaybackIntegrationTest {
 
         val videoUri = Uri.parse("content://media/external/video/media/pause_zero_dur")
         playerManager.playMedia(videoUri, "Zero Duration Video")
+
+        // Simulate playback advancing to 47_300ms while duration remains unknown (0L)
+        fakePlayer.currentPosition = 47_300L
+        fakePlayer.isPlaying = true
 
         // Trigger pause
         playerManager.pause()

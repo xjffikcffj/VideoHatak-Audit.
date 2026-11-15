@@ -323,10 +323,6 @@ class VaultViewModel(
         super.onCleared()
     }
 
-    internal fun clearForTesting() {
-        onCleared()
-    }
-
     companion object {
         fun provideFactory(
             repository: VaultRepository,

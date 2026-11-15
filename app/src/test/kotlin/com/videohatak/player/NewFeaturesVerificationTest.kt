@@ -5,6 +5,9 @@ import android.net.Uri
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.datastore.preferences.core.Preferences
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.ViewModelStore
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import com.videohatak.player.core.designsystem.theme.AppThemeId
@@ -75,9 +78,22 @@ class NewFeaturesVerificationTest {
     private val testDispatcher = StandardTestDispatcher()
     private val tempFiles = mutableListOf<File>()
     private val activeManagers = mutableListOf<PlaybackPositionManager>()
+    private val activePlayerManagers = mutableListOf<VideoPlayerManager>()
+    private val activeViewModelStores = mutableListOf<ViewModelStore>()
     private val activeScopes = mutableListOf<CoroutineScope>()
 
     private fun testApp(): Application = RuntimeEnvironment.getApplication()
+
+    private inline fun <reified T : ViewModel> createManagedViewModel(
+        crossinline creator: () -> T
+    ): Pair<ViewModelStore, T> {
+        val store = ViewModelStore().also { activeViewModelStores.add(it) }
+        val factory = object : ViewModelProvider.Factory {
+            @Suppress("UNCHECKED_CAST")
+            override fun <VM : ViewModel> create(modelClass: Class<VM>): VM = creator() as VM
+        }
+        return store to ViewModelProvider(store, factory)[T::class.java]
+    }
 
     private class InMemoryThemePreferencesRepository : ThemePreferencesRepository {
         private val modeFlow = MutableStateFlow(ThemeMode.DARK)
@@ -114,17 +130,32 @@ class NewFeaturesVerificationTest {
     }
 
     @After
-    fun tearDown() = runBlocking {
-        Dispatchers.resetMain()
-        activeManagers.forEach { runCatching { it.shutdown(500L) } }
-        activeManagers.clear()
-        activeScopes.forEach { scope ->
-            runCatching { scope.coroutineContext[Job]?.cancelAndJoin() }
-            runCatching { scope.cancel() }
+    fun tearDown() {
+        try {
+            activeViewModelStores.forEach { store ->
+                runCatching { store.clear() }
+            }
+            activeViewModelStores.clear()
+            activePlayerManagers.forEach { pm ->
+                runCatching { pm.release() }
+            }
+            activePlayerManagers.clear()
+            runCatching { testDispatcher.scheduler.advanceUntilIdle() }
+            runBlocking {
+                activeManagers.forEach { runCatching { it.shutdown(500L) } }
+                activeManagers.clear()
+                activeScopes.forEach { scope ->
+                    runCatching { scope.coroutineContext[Job]?.cancelAndJoin() }
+                    runCatching { scope.cancel() }
+                }
+                activeScopes.clear()
+            }
+            runCatching { testDispatcher.scheduler.advanceUntilIdle() }
+        } finally {
+            Dispatchers.resetMain()
+            tempFiles.forEach { if (it.exists()) it.delete() }
+            tempFiles.clear()
         }
-        activeScopes.clear()
-        tempFiles.forEach { if (it.exists()) it.delete() }
-        tempFiles.clear()
     }
 
     private suspend fun drainMainAndIo(
@@ -165,7 +196,7 @@ class NewFeaturesVerificationTest {
     @Test
     fun themeViewModel_switchThemeUpdatesThemeAndLightDarkMode() = runTest(testDispatcher) {
         val repo = InMemoryThemePreferencesRepository()
-        val vm = ThemeViewModel(repo)
+        val (vmStore, vm) = createManagedViewModel { ThemeViewModel(repo) }
         testDispatcher.scheduler.advanceUntilIdle()
 
         vm.setAppTheme(AppThemeId.ROYAL_IVORY)
@@ -177,6 +208,9 @@ class NewFeaturesVerificationTest {
         testDispatcher.scheduler.advanceUntilIdle()
         assertEquals(AppThemeId.RUBY_CINEMA, repo.appThemeFlow.first())
         assertEquals(ThemeMode.DARK, repo.themeModeFlow.first())
+
+        vmStore.clear()
+        testDispatcher.scheduler.advanceUntilIdle()
     }
 
     @Test
@@ -248,15 +282,17 @@ class NewFeaturesVerificationTest {
         val fakePlayer = PlaybackIntegrationTest.FakeExoPlayer().apply {
             duration = 120_000L
         }
-        val playerManager = VideoPlayerManager.createForTesting(fakePlayer.exoPlayer)
-        val vm = PlayerViewModel(
-            application = testApp(),
-            playerManager = playerManager,
-            playbackPreferences = repo,
-            positionManager = posManager,
-            subtitlePreferences = null,
-            thumbnailManager = null
-        )
+        val playerManager = VideoPlayerManager.createForTesting(fakePlayer.exoPlayer).also { activePlayerManagers.add(it) }
+        val (vmStore, vm) = createManagedViewModel {
+            PlayerViewModel(
+                application = testApp(),
+                playerManager = playerManager,
+                playbackPreferences = repo,
+                positionManager = posManager,
+                subtitlePreferences = null,
+                thumbnailManager = null
+            )
+        }
 
         // 1. RESUME automatically restores the saved 45,000ms position
         repo.setResumeMode(ResumeMode.RESUME)
@@ -329,15 +365,17 @@ class NewFeaturesVerificationTest {
         val posManager = PlaybackPositionManager(repo, scope).also { activeManagers.add(it) }
 
         val fakePlayer = PlaybackIntegrationTest.FakeExoPlayer()
-        val playerManager = VideoPlayerManager.createForTesting(fakePlayer.exoPlayer)
-        val vm = PlayerViewModel(
-            application = testApp(),
-            playerManager = playerManager,
-            playbackPreferences = repo,
-            positionManager = posManager,
-            subtitlePreferences = null,
-            thumbnailManager = null
-        )
+        val playerManager = VideoPlayerManager.createForTesting(fakePlayer.exoPlayer).also { activePlayerManagers.add(it) }
+        val (_, vm) = createManagedViewModel {
+            PlayerViewModel(
+                application = testApp(),
+                playerManager = playerManager,
+                playbackPreferences = repo,
+                positionManager = posManager,
+                subtitlePreferences = null,
+                thumbnailManager = null
+            )
+        }
 
         vm.setPlaybackSpeed(1.25f)
         drainMainAndIo {
@@ -384,7 +422,7 @@ class NewFeaturesVerificationTest {
     @Test
     fun themeViewModel_previewBeforeApply_doesNotPersistUntilApplyAndRevertsOnCancel() = runTest(testDispatcher) {
         val repo = InMemoryThemePreferencesRepository()
-        val vm = ThemeViewModel(repo)
+        val (vmStore, vm) = createManagedViewModel { ThemeViewModel(repo) }
         val previewJob = backgroundScope.launch { vm.isPreviewActive.collect {} }
         val themeJob = backgroundScope.launch { vm.effectiveAppTheme.collect {} }
         val modeJob = backgroundScope.launch { vm.effectiveThemeMode.collect {} }
@@ -413,9 +451,11 @@ class NewFeaturesVerificationTest {
         assertEquals(AppThemeId.EMERALD_LUXURY, repo.appThemeFlow.first())
         assertEquals(ThemeMode.DARK, repo.themeModeFlow.first())
 
-        previewJob.cancel()
-        themeJob.cancel()
-        modeJob.cancel()
+        previewJob.cancelAndJoin()
+        themeJob.cancelAndJoin()
+        modeJob.cancelAndJoin()
+        vmStore.clear()
+        testDispatcher.scheduler.advanceUntilIdle()
     }
 
     @Test

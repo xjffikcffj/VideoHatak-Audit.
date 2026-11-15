@@ -5,6 +5,9 @@ import android.net.Uri
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.datastore.preferences.core.Preferences
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.ViewModelStore
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
@@ -66,10 +69,23 @@ class PlaybackIntegrationTest {
 
     private val tempFiles = mutableListOf<File>()
     private val activeManagers = mutableListOf<PlaybackPositionManager>()
+    private val activePlayerManagers = mutableListOf<VideoPlayerManager>()
+    private val activeViewModelStores = mutableListOf<ViewModelStore>()
     private val activeScopes = mutableListOf<CoroutineScope>()
     private val testDispatcher = StandardTestDispatcher()
 
     private fun testApp(): Application = RuntimeEnvironment.getApplication()
+
+    private inline fun <reified T : ViewModel> createManagedViewModel(
+        crossinline creator: () -> T
+    ): T {
+        val store = ViewModelStore().also { activeViewModelStores.add(it) }
+        val factory = object : ViewModelProvider.Factory {
+            @Suppress("UNCHECKED_CAST")
+            override fun <VM : ViewModel> create(modelClass: Class<VM>): VM = creator() as VM
+        }
+        return ViewModelProvider(store, factory)[T::class.java]
+    }
 
     /**
      * FakeExoPlayer: Complete dynamic proxy for ExoPlayer that simulates player events,
@@ -267,27 +283,42 @@ class PlaybackIntegrationTest {
     }
 
     @After
-    fun tearDown() = runBlocking {
-        Dispatchers.resetMain()
-        for (mgr in activeManagers) {
-            try {
-                mgr.shutdown(drainTimeoutMs = 500L)
-            } catch (_: Exception) {}
+    fun tearDown() {
+        try {
+            activeViewModelStores.forEach { store ->
+                runCatching { store.clear() }
+            }
+            activeViewModelStores.clear()
+            activePlayerManagers.forEach { pm ->
+                runCatching { pm.release() }
+            }
+            activePlayerManagers.clear()
+            runCatching { testDispatcher.scheduler.advanceUntilIdle() }
+            runBlocking {
+                for (mgr in activeManagers) {
+                    try {
+                        mgr.shutdown(drainTimeoutMs = 500L)
+                    } catch (_: Exception) {}
+                }
+                activeManagers.clear()
+                for (scope in activeScopes) {
+                    try {
+                        scope.coroutineContext[Job]?.cancelAndJoin()
+                        scope.cancel()
+                    } catch (_: Exception) {}
+                }
+                activeScopes.clear()
+            }
+            runCatching { testDispatcher.scheduler.advanceUntilIdle() }
+        } finally {
+            Dispatchers.resetMain()
+            for (file in tempFiles) {
+                try {
+                    file.delete()
+                } catch (_: Exception) {}
+            }
+            tempFiles.clear()
         }
-        activeManagers.clear()
-        for (scope in activeScopes) {
-            try {
-                scope.coroutineContext[Job]?.cancelAndJoin()
-                scope.cancel()
-            } catch (_: Exception) {}
-        }
-        activeScopes.clear()
-        for (file in tempFiles) {
-            try {
-                file.delete()
-            } catch (_: Exception) {}
-        }
-        tempFiles.clear()
     }
 
     private suspend fun drainMainAndIo(
@@ -319,16 +350,18 @@ class PlaybackIntegrationTest {
             duration = 120_000L
             currentPosition = 0L
         }
-        val playerManager = VideoPlayerManager.createForTesting(fakePlayer.exoPlayer)
+        val playerManager = VideoPlayerManager.createForTesting(fakePlayer.exoPlayer).also { activePlayerManagers.add(it) }
 
-        val viewModel = PlayerViewModel(
-            application = testApp(),
-            playerManager = playerManager,
-            playbackPreferences = realRepo,
-            positionManager = posManager,
-            subtitlePreferences = null,
-            thumbnailManager = null
-        )
+        val viewModel = createManagedViewModel {
+            PlayerViewModel(
+                application = testApp(),
+                playerManager = playerManager,
+                playbackPreferences = realRepo,
+                positionManager = posManager,
+                subtitlePreferences = null,
+                thumbnailManager = null
+            )
+        }
 
         val videoUri = Uri.parse("content://media/external/video/media/scrub_integ_1")
         val videoItem = VideoItem(
@@ -372,16 +405,18 @@ class PlaybackIntegrationTest {
             duration = 120_000L
             currentPosition = 0L
         }
-        val playerManager = VideoPlayerManager.createForTesting(fakePlayer.exoPlayer)
+        val playerManager = VideoPlayerManager.createForTesting(fakePlayer.exoPlayer).also { activePlayerManagers.add(it) }
 
-        val viewModel = PlayerViewModel(
-            application = testApp(),
-            playerManager = playerManager,
-            playbackPreferences = realRepo,
-            positionManager = posManager,
-            subtitlePreferences = null,
-            thumbnailManager = null
-        )
+        val viewModel = createManagedViewModel {
+            PlayerViewModel(
+                application = testApp(),
+                playerManager = playerManager,
+                playbackPreferences = realRepo,
+                positionManager = posManager,
+                subtitlePreferences = null,
+                thumbnailManager = null
+            )
+        }
 
         val videoUri = Uri.parse("content://media/external/video/media/scrub_order_test")
         val videoItem = VideoItem(
@@ -568,16 +603,18 @@ class PlaybackIntegrationTest {
             duration = 100_000L
             currentPosition = 0L
         }
-        val playerManager = VideoPlayerManager.createForTesting(fakePlayer.exoPlayer)
+        val playerManager = VideoPlayerManager.createForTesting(fakePlayer.exoPlayer).also { activePlayerManagers.add(it) }
 
-        val viewModel = PlayerViewModel(
-            application = testApp(),
-            playerManager = playerManager,
-            playbackPreferences = countingRepo,
-            positionManager = posManager,
-            subtitlePreferences = null,
-            thumbnailManager = null
-        )
+        val viewModel = createManagedViewModel {
+            PlayerViewModel(
+                application = testApp(),
+                playerManager = playerManager,
+                playbackPreferences = countingRepo,
+                positionManager = posManager,
+                subtitlePreferences = null,
+                thumbnailManager = null
+            )
+        }
 
         val videoUri = Uri.parse("content://media/external/video/media/no_redundant_saves")
         val videoItem = VideoItem(
@@ -661,16 +698,18 @@ class PlaybackIntegrationTest {
             currentPosition = 0L
             repeatMode = Player.REPEAT_MODE_ONE
         }
-        val playerManager = VideoPlayerManager.createForTesting(fakePlayer.exoPlayer)
+        val playerManager = VideoPlayerManager.createForTesting(fakePlayer.exoPlayer).also { activePlayerManagers.add(it) }
 
-        val viewModel = PlayerViewModel(
-            application = testApp(),
-            playerManager = playerManager,
-            playbackPreferences = trackingRepo,
-            positionManager = posManager,
-            subtitlePreferences = null,
-            thumbnailManager = null
-        )
+        val viewModel = createManagedViewModel {
+            PlayerViewModel(
+                application = testApp(),
+                playerManager = playerManager,
+                playbackPreferences = trackingRepo,
+                positionManager = posManager,
+                subtitlePreferences = null,
+                thumbnailManager = null
+            )
+        }
 
         // 1. Initial play of video: triggers initial restoration query
         viewModel.playVideo(videoItem)
@@ -737,16 +776,18 @@ class PlaybackIntegrationTest {
             currentPosition = 0L
             repeatMode = Player.REPEAT_MODE_ALL
         }
-        val playerManager = VideoPlayerManager.createForTesting(fakePlayer.exoPlayer)
+        val playerManager = VideoPlayerManager.createForTesting(fakePlayer.exoPlayer).also { activePlayerManagers.add(it) }
 
-        val viewModel = PlayerViewModel(
-            application = testApp(),
-            playerManager = playerManager,
-            playbackPreferences = trackingRepo,
-            positionManager = posManager,
-            subtitlePreferences = null,
-            thumbnailManager = null
-        )
+        val viewModel = createManagedViewModel {
+            PlayerViewModel(
+                application = testApp(),
+                playerManager = playerManager,
+                playbackPreferences = trackingRepo,
+                positionManager = posManager,
+                subtitlePreferences = null,
+                thumbnailManager = null
+            )
+        }
 
         // Configure REPEAT_PLAYLIST and queue playlist context [itemA, itemB]
         viewModel.setPlaybackMode(PlaybackMode.REPEAT_PLAYLIST)

@@ -7,6 +7,10 @@ import androidx.core.app.NotificationCompat
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.datastore.preferences.core.Preferences
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.ViewModelStore
+import androidx.lifecycle.viewModelScope
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import com.videohatak.player.core.backup.BackupManager
@@ -60,6 +64,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -92,6 +97,8 @@ class ComprehensiveAuditFixTest {
     private val testDispatcher = StandardTestDispatcher()
     private val tempFiles = mutableListOf<File>()
     private val activeScopes = mutableListOf<CoroutineScope>()
+    private val activeViewModelStores = mutableListOf<ViewModelStore>()
+    private val activeJobs = mutableListOf<Job>()
 
     private class FakeApp : Application()
 
@@ -108,6 +115,20 @@ class ComprehensiveAuditFixTest {
         return PreferenceDataStoreFactory.create(scope = scope, produceFile = { file })
     }
 
+    private inline fun <reified T : ViewModel> createManagedViewModel(
+        store: ViewModelStore = ViewModelStore().also { activeViewModelStores.add(it) },
+        crossinline creator: () -> T
+    ): Pair<ViewModelStore, T> {
+        if (!activeViewModelStores.contains(store)) {
+            activeViewModelStores.add(store)
+        }
+        val factory = object : ViewModelProvider.Factory {
+            @Suppress("UNCHECKED_CAST")
+            override fun <VM : ViewModel> create(modelClass: Class<VM>): VM = creator() as VM
+        }
+        return store to ViewModelProvider(store, factory)[T::class.java]
+    }
+
     @Before
     fun setUp() {
         Dispatchers.setMain(testDispatcher)
@@ -115,16 +136,35 @@ class ComprehensiveAuditFixTest {
 
     @After
     fun tearDown() {
-        Dispatchers.resetMain()
-        runBlocking {
-            activeScopes.forEach { scope ->
-                runCatching { scope.coroutineContext[Job]?.cancelAndJoin() }
-                runCatching { scope.cancel() }
+        try {
+            runBlocking {
+                activeJobs.forEach { job ->
+                    runCatching { job.cancelAndJoin() }
+                }
             }
+            activeJobs.clear()
+
+            activeViewModelStores.forEach { store ->
+                runCatching { store.clear() }
+            }
+            activeViewModelStores.clear()
+
+            runCatching { testDispatcher.scheduler.advanceUntilIdle() }
+
+            runBlocking {
+                activeScopes.forEach { scope ->
+                    runCatching { scope.coroutineContext[Job]?.cancelAndJoin() }
+                    runCatching { scope.cancel() }
+                }
+            }
+            activeScopes.clear()
+
+            runCatching { testDispatcher.scheduler.advanceUntilIdle() }
+        } finally {
+            Dispatchers.resetMain()
+            tempFiles.forEach { if (it.exists()) it.delete() }
+            tempFiles.clear()
         }
-        activeScopes.clear()
-        tempFiles.forEach { if (it.exists()) it.delete() }
-        tempFiles.clear()
     }
 
     private suspend fun awaitIoAndDrainMain(
@@ -310,16 +350,18 @@ class ComprehensiveAuditFixTest {
         val securityPrefs = VaultSecurityPreferences(createDataStore(scope, "vault_vm_"))
         val fakeRepo = FakeVaultRepository()
         val nowMsProvider: () -> Long = { 10_000L + testDispatcher.scheduler.currentTime }
-        val vm = VaultViewModel(
-            repository = fakeRepo,
-            biometricHelper = VaultBiometricHelper(FakeApp()),
-            securityPreferences = securityPrefs,
-            nowMsProvider = nowMsProvider
-        )
+        val (vmStore, vm) = createManagedViewModel {
+            VaultViewModel(
+                repository = fakeRepo,
+                biometricHelper = VaultBiometricHelper(FakeApp()),
+                securityPreferences = securityPrefs,
+                nowMsProvider = nowMsProvider
+            )
+        }
 
         val collectJob = backgroundScope.launch {
             vm.autoLockTimeout.collect {}
-        }
+        }.also { activeJobs.add(it) }
 
         assertTrue(securityPrefs.setPin("2468"))
         val unlock1Done = CompletableDeferred<Boolean>()
@@ -376,9 +418,13 @@ class ComprehensiveAuditFixTest {
         assertFalse(vm.isUnlocked.value)
 
         vm.lockVault()
-        collectJob.cancel()
-        vm.clearForTesting()
-        testDispatcher.scheduler.runCurrent()
+        collectJob.cancelAndJoin()
+        vmStore.clear()
+        assertFalse("ViewModelStore.clear() must cancel VaultViewModel.viewModelScope", vm.viewModelScope.isActive)
+        testDispatcher.scheduler.advanceUntilIdle()
+        scope.coroutineContext[Job]?.cancelAndJoin()
+        scope.cancel()
+        testDispatcher.scheduler.advanceUntilIdle()
     }
 
     // -------------------------------------------------------------------------
@@ -701,8 +747,8 @@ class ComprehensiveAuditFixTest {
 
         // Switching themes while ThemeMode.SYSTEM is active must NOT clobber ThemeMode.SYSTEM
         val repo = FakeThemeRepo(initialTheme = AppThemeId.OBSIDIAN_ELITE, initialMode = ThemeMode.SYSTEM)
-        val vm = ThemeViewModel(repo)
-        val modeJob = backgroundScope.launch { vm.effectiveThemeMode.collect {} }
+        val (vmStore, vm) = createManagedViewModel { ThemeViewModel(repo) }
+        val modeJob = backgroundScope.launch { vm.effectiveThemeMode.collect {} }.also { activeJobs.add(it) }
         testDispatcher.scheduler.advanceUntilIdle()
 
         vm.startPreviewTheme(AppThemeId.ROYAL_IVORY)
@@ -714,6 +760,8 @@ class ComprehensiveAuditFixTest {
         assertEquals(AppThemeId.ROYAL_IVORY, repo.appThemeFlow.first())
         assertEquals(ThemeMode.SYSTEM, repo.themeModeFlow.first())
 
-        modeJob.cancel()
+        modeJob.cancelAndJoin()
+        vmStore.clear()
+        testDispatcher.scheduler.advanceUntilIdle()
     }
 }

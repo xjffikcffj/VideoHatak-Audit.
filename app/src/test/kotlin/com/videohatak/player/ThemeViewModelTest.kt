@@ -1,11 +1,15 @@
 package com.videohatak.player
 
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.ViewModelStore
 import com.videohatak.player.core.designsystem.theme.ThemeMode
 import com.videohatak.player.core.designsystem.theme.ThemePreferencesRepository
 import com.videohatak.player.core.designsystem.theme.ThemeState
 import com.videohatak.player.core.designsystem.theme.ThemeViewModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
@@ -28,6 +32,7 @@ class ThemeViewModelTest {
     val timeoutRule: Timeout = Timeout.seconds(30)
 
     private val testDispatcher = StandardTestDispatcher()
+    private val activeViewModelStores = mutableListOf<ViewModelStore>()
 
     private class FakeThemePreferencesRepository : ThemePreferencesRepository {
         val flow = MutableStateFlow(ThemeMode.SYSTEM)
@@ -40,6 +45,17 @@ class ThemeViewModelTest {
 
     private lateinit var fakeRepository: FakeThemePreferencesRepository
 
+    private fun createViewModel(): Pair<ViewModelStore, ThemeViewModel> {
+        val store = ViewModelStore().also { activeViewModelStores.add(it) }
+        val factory = object : ViewModelProvider.Factory {
+            @Suppress("UNCHECKED_CAST")
+            override fun <T : ViewModel> create(modelClass: Class<T>): T {
+                return ThemeViewModel(fakeRepository) as T
+            }
+        }
+        return store to ViewModelProvider(store, factory)[ThemeViewModel::class.java]
+    }
+
     @Before
     fun setUp() {
         Dispatchers.setMain(testDispatcher)
@@ -48,12 +64,20 @@ class ThemeViewModelTest {
 
     @After
     fun tearDown() {
-        Dispatchers.resetMain()
+        try {
+            activeViewModelStores.forEach { store ->
+                runCatching { store.clear() }
+            }
+            activeViewModelStores.clear()
+            runCatching { testDispatcher.scheduler.advanceUntilIdle() }
+        } finally {
+            Dispatchers.resetMain()
+        }
     }
 
     @Test
     fun defaultState_loadsFromRepository() = runTest(testDispatcher) {
-        val viewModel = ThemeViewModel(fakeRepository)
+        val (store, viewModel) = createViewModel()
         val collectJob = backgroundScope.launch { viewModel.themeState.collect {} }
 
         // Advance dispatcher to collect the initial flow emission
@@ -62,12 +86,14 @@ class ThemeViewModelTest {
         val state = viewModel.themeState.value
         assertTrue("Expected ThemeState.Success but was $state", state is ThemeState.Success)
         assertEquals(ThemeMode.SYSTEM, (state as ThemeState.Success).themeMode)
-        collectJob.cancel()
+        collectJob.cancelAndJoin()
+        store.clear()
+        testDispatcher.scheduler.advanceUntilIdle()
     }
 
     @Test
     fun setThemeMode_updatesRepositoryAndState() = runTest(testDispatcher) {
-        val viewModel = ThemeViewModel(fakeRepository)
+        val (store, viewModel) = createViewModel()
         val collectJob = backgroundScope.launch { viewModel.themeState.collect {} }
         testDispatcher.scheduler.advanceUntilIdle()
 
@@ -78,12 +104,14 @@ class ThemeViewModelTest {
         assertTrue(state is ThemeState.Success)
         assertEquals(ThemeMode.DARK, (state as ThemeState.Success).themeMode)
         assertEquals(ThemeMode.DARK, fakeRepository.flow.value)
-        collectJob.cancel()
+        collectJob.cancelAndJoin()
+        store.clear()
+        testDispatcher.scheduler.advanceUntilIdle()
     }
 
     @Test
     fun setThemeMode_switchToLight_updatesCorrectly() = runTest(testDispatcher) {
-        val viewModel = ThemeViewModel(fakeRepository)
+        val (store, viewModel) = createViewModel()
         val collectJob = backgroundScope.launch { viewModel.themeState.collect {} }
         testDispatcher.scheduler.advanceUntilIdle()
 
@@ -94,6 +122,8 @@ class ThemeViewModelTest {
         assertTrue(state is ThemeState.Success)
         assertEquals(ThemeMode.LIGHT, (state as ThemeState.Success).themeMode)
         assertEquals(ThemeMode.LIGHT, fakeRepository.flow.value)
-        collectJob.cancel()
+        collectJob.cancelAndJoin()
+        store.clear()
+        testDispatcher.scheduler.advanceUntilIdle()
     }
 }

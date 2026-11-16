@@ -4,7 +4,9 @@ import android.graphics.Bitmap
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -19,6 +21,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.DriveFileMove
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Lock
@@ -82,22 +85,24 @@ fun VideoCard(
     Card(
         modifier = modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(14.dp))
+            .clip(RoundedCornerShape(16.dp))
             .clickable(onClick = onClick),
-        shape = RoundedCornerShape(14.dp),
+        shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.cardColors(containerColor = palette.surface),
-        border = BorderStroke(0.75.dp, palette.border.copy(alpha = 0.65f))
+        border = BorderStroke(0.75.dp, palette.border.copy(alpha = 0.6f))
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(10.dp),
+                .padding(horizontal = 12.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
+            // Medium crisp thumbnail on Start (Right side in Arabic RTL)
             Box(
                 modifier = Modifier
-                    .size(width = 112.dp, height = 68.dp)
-                    .clip(RoundedCornerShape(10.dp))
+                    .size(width = 118.dp, height = 72.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .border(0.75.dp, palette.border.copy(alpha = 0.45f), RoundedCornerShape(12.dp))
                     .background(
                         Brush.linearGradient(
                             listOf(palette.surfaceElevated, palette.background)
@@ -116,76 +121,87 @@ fun VideoCard(
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
-                            .background(Color.Black.copy(alpha = 0.16f))
+                            .background(Color.Black.copy(alpha = 0.14f))
                     )
                 }
 
                 Box(
                     modifier = Modifier
-                        .size(30.dp)
+                        .size(28.dp)
                         .clip(CircleShape)
-                        .background(Color.Black.copy(alpha = 0.55f)),
+                        .background(Color.Black.copy(alpha = 0.56f)),
                     contentAlignment = Alignment.Center
                 ) {
                     Icon(
                         imageVector = Icons.Default.PlayArrow,
                         contentDescription = null,
                         tint = palette.accent,
-                        modifier = Modifier.size(20.dp)
+                        modifier = Modifier.size(18.dp)
                     )
                 }
 
                 Box(
                     modifier = Modifier
                         .align(Alignment.BottomEnd)
-                        .padding(4.dp)
-                        .background(Color(0xCC000000), RoundedCornerShape(4.dp))
+                        .padding(5.dp)
+                        .background(Color(0xD0000000), RoundedCornerShape(5.dp))
                         .padding(horizontal = 5.dp, vertical = 1.dp)
                 ) {
                     Text(
                         text = video.formattedDuration,
                         style = MaterialTheme.typography.labelSmall,
-                        color = Color.White
+                        color = Color.White,
+                        fontWeight = FontWeight.Medium
                     )
                 }
             }
 
             Spacer(modifier = Modifier.width(12.dp))
 
+            // Clean metadata column (no progress/watch bar in library)
             Column(
-                modifier = Modifier.weight(1f)
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(5.dp)
             ) {
                 Text(
                     text = video.safeTitle,
                     style = MaterialTheme.typography.bodyLarge,
                     fontWeight = FontWeight.SemiBold,
                     color = palette.onSurface,
-                    maxLines = 1,
+                    maxLines = 2,
                     overflow = TextOverflow.Ellipsis
                 )
-                Spacer(modifier = Modifier.height(4.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        text = video.formattedSize,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = palette.onSurfaceMuted
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
                     Surface(
-                        shape = RoundedCornerShape(4.dp),
-                        color = palette.accent.copy(alpha = 0.16f)
+                        shape = RoundedCornerShape(5.dp),
+                        color = palette.accent.copy(alpha = 0.14f)
                     ) {
                         Text(
                             text = video.resolutionTag,
                             style = MaterialTheme.typography.labelSmall,
                             color = palette.accent,
                             fontWeight = FontWeight.Bold,
-                            modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
                         )
                     }
+
+                    val folderSuffix = video.bucketDisplayName.takeIf { it.isNotBlank() }?.let { " • $it" }.orEmpty()
+                    Text(
+                        text = "${video.formattedSize}$folderSuffix",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = palette.onSurfaceMuted,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
+                    )
                 }
             }
 
+            // Trailing 3-dots menu button
             Box {
                 IconButton(
                     onClick = {
@@ -210,30 +226,38 @@ fun VideoCard(
                         expanded = menuExpanded,
                         onDismissRequest = { menuExpanded = false }
                     ) {
-                    DropdownMenuItem(
-                        text = { Text("إضافة إلى القائمة", color = palette.onSurface) },
-                        leadingIcon = { Icon(Icons.Default.PlaylistAdd, contentDescription = null, tint = palette.accent) },
-                        onClick = {
-                            menuExpanded = false
-                            onAddToPlaylist()
-                        }
-                    )
-                    DropdownMenuItem(
-                        text = { Text("تغيير الاسم", color = palette.onSurface) },
-                        leadingIcon = { Icon(Icons.Default.Edit, contentDescription = null, tint = palette.accent) },
-                        onClick = {
-                            menuExpanded = false
-                            onRenameClick()
-                        }
-                    )
-                    DropdownMenuItem(
-                        text = { Text("إضافة إلى الخزنة", color = palette.onSurface) },
-                        leadingIcon = { Icon(Icons.Default.Lock, contentDescription = null, tint = palette.accent) },
-                        onClick = {
-                            menuExpanded = false
-                            onAddToVaultClick()
-                        }
-                    )
+                        DropdownMenuItem(
+                            text = { Text("إضافة إلى القائمة", color = palette.onSurface) },
+                            leadingIcon = { Icon(Icons.Default.PlaylistAdd, contentDescription = null, tint = palette.accent) },
+                            onClick = {
+                                menuExpanded = false
+                                onAddToPlaylist()
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("تغيير الاسم", color = palette.onSurface) },
+                            leadingIcon = { Icon(Icons.Default.Edit, contentDescription = null, tint = palette.accent) },
+                            onClick = {
+                                menuExpanded = false
+                                onRenameClick()
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("نقل إلى مجلد", color = palette.onSurface) },
+                            leadingIcon = { Icon(Icons.Default.DriveFileMove, contentDescription = null, tint = palette.accent) },
+                            onClick = {
+                                menuExpanded = false
+                                onMoveToFolderClick()
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("إضافة إلى الخزنة", color = palette.onSurface) },
+                            leadingIcon = { Icon(Icons.Default.Lock, contentDescription = null, tint = palette.accent) },
+                            onClick = {
+                                menuExpanded = false
+                                onAddToVaultClick()
+                            }
+                        )
                         DropdownMenuItem(
                             text = { Text("معلومات الفيديو", color = palette.onSurface) },
                             leadingIcon = { Icon(Icons.Default.Info, contentDescription = null, tint = palette.accent) },

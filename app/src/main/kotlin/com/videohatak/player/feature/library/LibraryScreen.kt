@@ -36,6 +36,7 @@ import androidx.compose.material.icons.filled.PlaylistPlay
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Sort
+import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.VideoLibrary
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -72,9 +73,11 @@ import com.videohatak.player.core.model.VideoItem
 import com.videohatak.player.core.permission.PermissionHelper
 import com.videohatak.player.core.permission.VideoPermissionStatus
 import com.videohatak.player.core.playback.PlaybackMode
+import com.videohatak.player.core.playback.PlaybackPreferencesRepository
 import com.videohatak.player.core.playback.ResumeMode
 import com.videohatak.player.core.playlist.model.Playlist
 import com.videohatak.player.core.playlist.model.PlaylistItem
+import com.videohatak.player.core.playlist.repository.PlaylistRepository
 import com.videohatak.player.core.trash.model.TrashItem
 import com.videohatak.player.core.vault.model.VaultVideo
 import com.videohatak.player.core.vault.security.VaultAutoLockTimeout
@@ -177,6 +180,8 @@ fun LibraryScreen(
     onVaultRenameVideo: (Long, String) -> Unit,
     onVaultDeleteVideo: (Long) -> Unit,
     onVaultUserInteraction: () -> Unit = {},
+    seekIntervalSeconds: Int = PlaybackPreferencesRepository.DEFAULT_SEEK_INTERVAL_SECONDS,
+    onSelectSeekIntervalSeconds: (Int) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val palette = LocalVideoHatakPalette.current
@@ -579,13 +584,18 @@ fun LibraryScreen(
                                     verticalArrangement = Arrangement.spacedBy(8.dp)
                                 ) {
                                     items(playlists, key = { it.id }) { playlist ->
+                                        val isProtectedFavorites =
+                                            PlaylistRepository.isProtectedFavoritesTitle(playlist.title)
                                         Card(
                                             modifier = Modifier
                                                 .fillMaxWidth()
                                                 .clickable { onSelectPlaylist(playlist) },
                                             shape = RoundedCornerShape(14.dp),
                                             colors = CardDefaults.cardColors(containerColor = palette.surface),
-                                            border = BorderStroke(0.75.dp, palette.border.copy(alpha = 0.65f))
+                                            border = BorderStroke(
+                                                width = if (isProtectedFavorites) 1.25.dp else 0.75.dp,
+                                                color = if (isProtectedFavorites) palette.accent.copy(alpha = 0.75f) else palette.border.copy(alpha = 0.65f)
+                                            )
                                         ) {
                                             Row(
                                                 modifier = Modifier
@@ -593,26 +603,49 @@ fun LibraryScreen(
                                                     .padding(14.dp),
                                                 verticalAlignment = Alignment.CenterVertically
                                             ) {
-                                                Icon(Icons.Default.PlaylistPlay, contentDescription = null, tint = palette.accent)
+                                                Icon(
+                                                    imageVector = if (isProtectedFavorites) Icons.Default.Star else Icons.Default.PlaylistPlay,
+                                                    contentDescription = null,
+                                                    tint = palette.accent
+                                                )
                                                 Spacer(modifier = Modifier.width(14.dp))
                                                 Column(modifier = Modifier.weight(1f)) {
-                                                    Text(
-                                                        text = playlist.title,
-                                                        style = MaterialTheme.typography.titleMedium,
-                                                        fontWeight = FontWeight.Bold,
-                                                        color = palette.onSurface
-                                                    )
+                                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                                        Text(
+                                                            text = playlist.title,
+                                                            style = MaterialTheme.typography.titleMedium,
+                                                            fontWeight = FontWeight.Bold,
+                                                            color = palette.onSurface
+                                                        )
+                                                        if (isProtectedFavorites) {
+                                                            Spacer(modifier = Modifier.width(8.dp))
+                                                            Surface(
+                                                                shape = RoundedCornerShape(6.dp),
+                                                                color = palette.accent.copy(alpha = 0.16f)
+                                                            ) {
+                                                                Text(
+                                                                    text = "أساسية",
+                                                                    style = MaterialTheme.typography.labelSmall,
+                                                                    color = palette.accent,
+                                                                    fontWeight = FontWeight.Bold,
+                                                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                                                )
+                                                            }
+                                                        }
+                                                    }
                                                     Text(
                                                         text = "${playlist.itemCount} فيديو",
                                                         style = MaterialTheme.typography.bodySmall,
                                                         color = palette.onSurfaceMuted
                                                     )
                                                 }
-                                                IconButton(onClick = { playlistToRename = playlist }) {
-                                                    Icon(Icons.Default.Edit, contentDescription = "إعادة تسمية", tint = palette.onSurfaceMuted)
-                                                }
-                                                IconButton(onClick = { onDeletePlaylist(playlist.id) }) {
-                                                    Icon(Icons.Default.Delete, contentDescription = "حذف", tint = MaterialTheme.colorScheme.error)
+                                                if (!isProtectedFavorites) {
+                                                    IconButton(onClick = { playlistToRename = playlist }) {
+                                                        Icon(Icons.Default.Edit, contentDescription = "إعادة تسمية", tint = palette.onSurfaceMuted)
+                                                    }
+                                                    IconButton(onClick = { onDeletePlaylist(playlist.id) }) {
+                                                        Icon(Icons.Default.Delete, contentDescription = "حذف", tint = MaterialTheme.colorScheme.error)
+                                                    }
                                                 }
                                             }
                                         }
@@ -669,7 +702,9 @@ fun LibraryScreen(
                         onOpenVault = { onTabSelected(LibraryTab.VAULT) },
                         onOpenTrashBin = { onTabSelected(LibraryTab.TRASH) },
                         onExportBackup = onExportBackup,
-                        onImportBackup = { showBackupImportConfirmDialog = true }
+                        onImportBackup = { showBackupImportConfirmDialog = true },
+                        seekIntervalSeconds = seekIntervalSeconds,
+                        onSelectSeekIntervalSeconds = onSelectSeekIntervalSeconds
                     )
                 }
 

@@ -11,6 +11,7 @@ import androidx.lifecycle.ViewModelStore
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
+import androidx.media3.common.TrackSelectionParameters
 import androidx.media3.exoplayer.ExoPlayer
 import com.videohatak.player.core.model.VideoItem
 import com.videohatak.player.core.playback.PlaybackMode
@@ -102,6 +103,7 @@ class PlaybackIntegrationTest {
         var shuffleModeEnabled: Boolean = false
         var playWhenReady: Boolean = false
         var playbackSpeed: Float = 1.0f
+        var trackSelectionParameters: TrackSelectionParameters = TrackSelectionParameters.DEFAULT_WITHOUT_CONTEXT
         val listeners = mutableListOf<Player.Listener>()
         val mediaItems = mutableListOf<MediaItem>()
         val seekCalls = mutableListOf<Long>()
@@ -227,6 +229,13 @@ class PlaybackIntegrationTest {
                         currentMediaItemIndex--
                         currentPosition = 0L
                     }
+                    null
+                }
+                "getMediaItemCount" -> mediaItems.size
+                "getCurrentMediaItem" -> mediaItems.getOrNull(currentMediaItemIndex)
+                "getTrackSelectionParameters" -> trackSelectionParameters
+                "setTrackSelectionParameters" -> {
+                    trackSelectionParameters = nonNullArgs[0] as TrackSelectionParameters
                     null
                 }
                 "release" -> {

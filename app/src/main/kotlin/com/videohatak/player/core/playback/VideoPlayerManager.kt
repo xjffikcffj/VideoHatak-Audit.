@@ -21,6 +21,7 @@ import com.videohatak.player.core.vault.datasource.EncryptedVaultDataSource
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -142,10 +143,43 @@ class VideoPlayerManager internal constructor(
     private fun createExoPlayer(): ExoPlayer {
         val nonNullContext = checkNotNull(context) { "Context is required to create a default ExoPlayer instance" }
         val defaultFactory = DefaultDataSource.Factory(nonNullContext)
-        val mediaSourceFactory = DefaultMediaSourceFactory(nonNullContext)
-            .setDataSourceFactory {
-                defaultFactory.createDataSource()
+        val vaultAwareFactory = androidx.media3.datasource.DataSource.Factory {
+            val defaultDs = defaultFactory.createDataSource()
+            val vaultDs = EncryptedVaultDataSource(nonNullContext)
+            object : androidx.media3.datasource.DataSource {
+                private var active: androidx.media3.datasource.DataSource? = null
+
+                override fun addTransferListener(transferListener: androidx.media3.datasource.TransferListener) {
+                    defaultDs.addTransferListener(transferListener)
+                    vaultDs.addTransferListener(transferListener)
+                }
+
+                override fun open(dataSpec: androidx.media3.datasource.DataSpec): Long {
+                    val chosen = if (MediaNotificationPrivacy.isVaultUri(dataSpec.uri)) vaultDs else defaultDs
+                    active = chosen
+                    return chosen.open(dataSpec)
+                }
+
+                override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                    return active?.read(buffer, offset, length) ?: C.RESULT_END_OF_INPUT
+                }
+
+                override fun getUri(): Uri? = active?.uri
+
+                override fun getResponseHeaders(): Map<String, List<String>> {
+                    return active?.responseHeaders ?: emptyMap()
+                }
+
+                override fun close() {
+                    try {
+                        active?.close()
+                    } finally {
+                        active = null
+                    }
+                }
             }
+        }
+        val mediaSourceFactory = DefaultMediaSourceFactory(vaultAwareFactory)
 
         val audioAttributes = AudioAttributes.Builder()
             .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
@@ -166,7 +200,7 @@ class VideoPlayerManager internal constructor(
     private val _uiState = MutableStateFlow(PlayerUiState())
     val uiState: StateFlow<PlayerUiState> = _uiState.asStateFlow()
 
-    private val scope = CoroutineScope(Dispatchers.Main)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var progressJob: Job? = null
 
     internal val playerListener = object : Player.Listener {
@@ -232,7 +266,21 @@ class VideoPlayerManager internal constructor(
                     _uiState.value.playbackMode == PlaybackMode.STOP_AFTER_CURRENT
                 ) {
                     exoPlayer.pause()
-                    _uiState.update { it.copy(isPlaying = false) }
+                    val stoppedUri = mediaItem.localConfiguration?.uri
+                    val stoppedTitle = internalTitlesByMediaKey[mediaItem.mediaId]
+                        ?: internalTitlesByMediaKey[stoppedUri?.toString().orEmpty()]
+                        ?: mediaItem.mediaMetadata.title?.toString()
+                        ?: _uiState.value.title
+                    _uiState.update {
+                        it.copy(
+                            isPlaying = false,
+                            mediaUri = stoppedUri ?: it.mediaUri,
+                            title = stoppedTitle,
+                            currentPositionMs = 0L,
+                            hasNextMediaItem = exoPlayer.hasNextMediaItem(),
+                            hasPreviousMediaItem = exoPlayer.hasPreviousMediaItem()
+                        )
+                    }
                     return
                 }
 
@@ -324,6 +372,7 @@ class VideoPlayerManager internal constructor(
         exoPlayer.stop()
         exoPlayer.clearMediaItems()
         lastReportedPositionMs = startPositionMs
+        setAudioOnlyMode(false)
         _uiState.update {
             it.copy(
                 mediaUri = uri,
@@ -331,6 +380,9 @@ class VideoPlayerManager internal constructor(
                 currentPositionMs = startPositionMs,
                 durationMs = 0L,
                 isTemporarySpeedActive = false,
+                isPipActive = false,
+                isControlsVisible = true,
+                isAudioOnlyMode = false,
                 hasNextMediaItem = false,
                 hasPreviousMediaItem = false
             )
@@ -374,6 +426,9 @@ class VideoPlayerManager internal constructor(
         exoPlayer.setPlaybackSpeed(_uiState.value.playbackSpeed)
         exoPlayer.prepare()
         exoPlayer.playWhenReady = true
+        if (context != null && customExoPlayer == null) {
+            VideoPlaybackService.startServiceForPlayback(context)
+        }
     }
 
     fun playPlaylist(
@@ -428,6 +483,7 @@ class VideoPlayerManager internal constructor(
 
         lastReportedPositionMs = startPositionMs
 
+        setAudioOnlyMode(false)
         _uiState.update {
             it.copy(
                 mediaUri = startVideo.contentUri,
@@ -435,7 +491,10 @@ class VideoPlayerManager internal constructor(
                 currentPositionMs = startPositionMs,
                 durationMs = startVideo.durationMs,
                 repeatMode = repeatMode,
-                isTemporarySpeedActive = false
+                isTemporarySpeedActive = false,
+                isPipActive = false,
+                isControlsVisible = true,
+                isAudioOnlyMode = false
             )
         }
 
@@ -449,6 +508,9 @@ class VideoPlayerManager internal constructor(
         exoPlayer.setPlaybackSpeed(_uiState.value.playbackSpeed)
         exoPlayer.prepare()
         exoPlayer.playWhenReady = true
+        if (context != null && customExoPlayer == null) {
+            VideoPlaybackService.startServiceForPlayback(context)
+        }
     }
 
     fun setPlaybackMode(mode: PlaybackMode) {
@@ -541,6 +603,26 @@ class VideoPlayerManager internal constructor(
         updateActiveSubtitles(clamped)
     }
 
+    fun setSeekIntervalSeconds(seconds: Int) {
+        val valid = PlaybackPreferencesRepository.sanitizeSeekIntervalSeconds(seconds)
+        _uiState.update { it.copy(seekIntervalSeconds = valid) }
+    }
+
+    fun seekForward(): Long {
+        val state = _uiState.value
+        val maxDur = if (state.durationMs > 0L) state.durationMs else Long.MAX_VALUE
+        val target = (state.currentPositionMs + state.seekIntervalMs).coerceAtMost(maxDur)
+        seekTo(target)
+        return target
+    }
+
+    fun seekBackward(): Long {
+        val state = _uiState.value
+        val target = (state.currentPositionMs - state.seekIntervalMs).coerceAtLeast(0L)
+        seekTo(target)
+        return target
+    }
+
     fun setPlaybackSpeed(speed: Float) {
         val clamped = clampPlaybackSpeed(speed)
         exoPlayer.setPlaybackSpeed(clamped)
@@ -580,13 +662,40 @@ class VideoPlayerManager internal constructor(
         _uiState.update { it.copy(isPipActive = active) }
     }
 
+    fun setAudioOnlyMode(enabled: Boolean) {
+        runCatching {
+            val currentParams = exoPlayer.trackSelectionParameters
+            exoPlayer.trackSelectionParameters = currentParams
+                .buildUpon()
+                .setTrackTypeDisabled(C.TRACK_TYPE_VIDEO, enabled)
+                .build()
+        }
+        _uiState.update { it.copy(isAudioOnlyMode = enabled) }
+    }
+
+    fun toggleAudioOnlyMode(): Boolean {
+        val next = !_uiState.value.isAudioOnlyMode
+        setAudioOnlyMode(next)
+        return next
+    }
+
+    fun updateActiveTitle(videoId: Long, contentUri: Uri, newTitle: String) {
+        val trimmed = newTitle.trim()
+        if (trimmed.isBlank()) return
+        internalTitlesByMediaKey[videoId.toString()] = trimmed
+        internalTitlesByMediaKey[contentUri.toString()] = trimmed
+        _uiState.update { state ->
+            if (state.mediaUri == contentUri) state.copy(title = trimmed) else state
+        }
+    }
+
     fun setPrimarySubtitleTrack(track: SubtitleTrack?) {
-        _uiState.update { it.copy(primaryTrack = track) }
+        _uiState.update { it.copy(primaryTrack = track, areSubtitlesVisible = true) }
         updateActiveSubtitles(exoPlayer.currentPosition)
     }
 
     fun setSecondarySubtitleTrack(track: SubtitleTrack?) {
-        _uiState.update { it.copy(secondaryTrack = track) }
+        _uiState.update { it.copy(secondaryTrack = track, areSubtitlesVisible = true) }
         updateActiveSubtitles(exoPlayer.currentPosition)
     }
 
@@ -597,15 +706,71 @@ class VideoPlayerManager internal constructor(
         }
     }
 
+    fun setSubtitlesVisible(visible: Boolean) {
+        _uiState.update { it.copy(areSubtitlesVisible = visible) }
+        updateActiveSubtitles(exoPlayer.currentPosition)
+    }
+
+    fun setPrimarySubtitleOffsetMs(offsetMs: Long) {
+        _uiState.update { it.copy(primarySubtitleOffsetMs = offsetMs.coerceIn(-30_000L, 30_000L)) }
+        updateActiveSubtitles(exoPlayer.currentPosition)
+    }
+
+    fun setSecondarySubtitleOffsetMs(offsetMs: Long) {
+        _uiState.update { it.copy(secondarySubtitleOffsetMs = offsetMs.coerceIn(-30_000L, 30_000L)) }
+        updateActiveSubtitles(exoPlayer.currentPosition)
+    }
+
+    fun updateSubtitleTrackCues(trackId: String, updatedCues: List<SubtitleCue>) {
+        _uiState.update { state ->
+            val updatedAvailable = state.availableSubtitleTracks.map { t ->
+                if (t.id == trackId) t.copy(cues = updatedCues) else t
+            }
+            val updatedPrimary = state.primaryTrack?.let {
+                if (it.id == trackId) it.copy(cues = updatedCues) else it
+            }
+            val updatedSecondary = state.secondaryTrack?.let {
+                if (it.id == trackId) it.copy(cues = updatedCues) else it
+            }
+            state.copy(
+                availableSubtitleTracks = updatedAvailable,
+                primaryTrack = updatedPrimary,
+                secondaryTrack = updatedSecondary
+            )
+        }
+        updateActiveSubtitles(exoPlayer.currentPosition)
+    }
+
+    fun removeSubtitleTrack(trackId: String) {
+        _uiState.update { state ->
+            state.copy(
+                availableSubtitleTracks = state.availableSubtitleTracks.filterNot { it.id == trackId },
+                primaryTrack = state.primaryTrack?.takeIf { it.id != trackId },
+                secondaryTrack = state.secondaryTrack?.takeIf { it.id != trackId }
+            )
+        }
+        updateActiveSubtitles(exoPlayer.currentPosition)
+    }
+
     fun syncWithCurrentPlayer() {
         val isPlaying = exoPlayer.isPlaying
         val pos = exoPlayer.currentPosition.coerceAtLeast(0L)
         val dur = exoPlayer.duration.coerceAtLeast(0L)
+        val activeMediaItem = runCatching { exoPlayer.currentMediaItem }.getOrNull()
+        val activeUri = activeMediaItem?.localConfiguration?.uri
+        val activeTitle = activeMediaItem?.let { item ->
+            val uriKey = activeUri?.toString().orEmpty()
+            internalTitlesByMediaKey[item.mediaId]
+                ?: internalTitlesByMediaKey[uriKey]
+                ?: item.mediaMetadata.title?.toString()
+        }
         _uiState.update {
             it.copy(
                 isPlaying = isPlaying,
                 currentPositionMs = pos,
                 durationMs = dur,
+                mediaUri = it.mediaUri ?: activeUri,
+                title = it.title.ifBlank { activeTitle ?: "" },
                 hasNextMediaItem = exoPlayer.hasNextMediaItem(),
                 hasPreviousMediaItem = exoPlayer.hasPreviousMediaItem()
             )
@@ -616,6 +781,7 @@ class VideoPlayerManager internal constructor(
         saveCurrentExoPlayerPositionDirectly()
         restorationCoordinator.onPlaybackStopped()
         internalTitlesByMediaKey.clear()
+        setAudioOnlyMode(false)
         exoPlayer.stop()
         exoPlayer.clearMediaItems()
         stopProgressPolling()
@@ -626,6 +792,9 @@ class VideoPlayerManager internal constructor(
                 mediaUri = null,
                 title = "",
                 isTemporarySpeedActive = false,
+                isPipActive = false,
+                isAudioOnlyMode = false,
+                isControlsVisible = true,
                 hasNextMediaItem = false,
                 hasPreviousMediaItem = false
             )
@@ -667,12 +836,24 @@ class VideoPlayerManager internal constructor(
 
     private fun updateActiveSubtitles(currentMs: Long) {
         val state = _uiState.value
+        if (!state.areSubtitlesVisible) {
+            _uiState.update {
+                it.copy(
+                    activePrimaryCues = emptyList(),
+                    activeSecondaryCues = emptyList()
+                )
+            }
+            return
+        }
+        val primaryLookupMs = currentMs - state.primarySubtitleOffsetMs
+        val secondaryLookupMs = currentMs - state.secondarySubtitleOffsetMs
+
         val primaryCues = state.primaryTrack?.cues?.filter {
-            currentMs in it.startTimeMs..it.endTimeMs
+            primaryLookupMs in it.startTimeMs..it.endTimeMs
         } ?: emptyList()
 
         val secondaryCues = state.secondaryTrack?.cues?.filter {
-            currentMs in it.startTimeMs..it.endTimeMs
+            secondaryLookupMs in it.startTimeMs..it.endTimeMs
         } ?: emptyList()
 
         _uiState.update {

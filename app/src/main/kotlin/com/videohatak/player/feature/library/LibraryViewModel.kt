@@ -171,6 +171,10 @@ class LibraryViewModel(
 
     fun moveToTrash(video: VideoItem) {
         viewModelScope.launch {
+            if (video.bucketId == "secure_vault" || video.contentUri.scheme.equals("vault", ignoreCase = true)) {
+                _events.tryEmit(LibraryUiEvent.ShowMessage("لا يمكن نقل مقاطع الخزنة الخاصة إلى سلة المحذوفات"))
+                return@launch
+            }
             if (video.contentUri.toString() in trashedUrisFlow.value) {
                 _events.tryEmit(LibraryUiEvent.ShowMessage("\"${video.safeTitle}\" موجود بالفعل في سلة المحذوفات"))
                 return@launch

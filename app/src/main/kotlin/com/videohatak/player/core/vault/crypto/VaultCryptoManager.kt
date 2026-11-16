@@ -452,11 +452,20 @@ class VaultCryptoManager internal constructor(
             it.readFully(fileSalt)
 
             val wrappedDekSize = it.readInt()
+            if (wrappedDekSize !in 16..4096) {
+                throw IOException("Corrupted vault wrapped DEK size: $wrappedDekSize")
+            }
             val wrappedDek = ByteArray(wrappedDekSize)
             it.readFully(wrappedDek)
 
             val chunkSize = it.readInt()
+            if (chunkSize !in 1024..(16 * 1024 * 1024)) {
+                throw IOException("Corrupted vault chunk size: $chunkSize")
+            }
             val plaintextSize = it.readLong()
+            if (plaintextSize < 0L) {
+                throw IOException("Corrupted vault plaintext size: $plaintextSize")
+            }
             val headerSize = it.filePointer.toInt()
 
             return EncryptedFileHeader(
@@ -467,6 +476,13 @@ class VaultCryptoManager internal constructor(
                 headerSize = headerSize
             )
         }
+    }
+
+    private fun validateEncryptedChunkSize(encSize: Int, chunkSize: Int): Int {
+        if (encSize <= 0 || encSize > chunkSize + 1024) {
+            throw IOException("Corrupted encrypted chunk size: $encSize")
+        }
+        return encSize
     }
 
     fun readDecryptedRange(
@@ -484,9 +500,12 @@ class VaultCryptoManager internal constructor(
         if (requestedOffset >= plaintextSize || plaintextSize == 0L) {
             return -1
         }
+        if (chunkSize <= 0) {
+            throw IOException("Invalid chunk size: $chunkSize")
+        }
 
         val headerAad = buildHeaderAad(MAGIC_HEADER, fileSalt, chunkSize, plaintextSize)
-        val dek = unwrapDataKey(wrappedDek, headerAad)
+        val dek = unwrapDataKeyWithFallback(wrappedDek, headerAad)
         val bytesToRead = minOf(requestedLength.toLong(), plaintextSize - requestedOffset).toInt()
 
         val startChunk = (requestedOffset / chunkSize).toInt()
@@ -495,63 +514,78 @@ class VaultCryptoManager internal constructor(
         var totalCopied = 0
         var currentOffsetInRead = requestedOffset
 
-        val raf = RandomAccessFile(encryptedFile, "r")
-        raf.use {
-            // Seek to chunk positions
-            val fullChunkEncryptedTotal = 4L + chunkSize + 16L
-            val startChunkOffset = headerSize.toLong() + startChunk.toLong() * fullChunkEncryptedTotal
+        try {
+            val raf = RandomAccessFile(encryptedFile, "r")
+            raf.use {
+                val fullChunkEncryptedTotal = 4L + chunkSize + 16L
+                val startChunkOffset = headerSize.toLong() + startChunk.toLong() * fullChunkEncryptedTotal
+                var positionedViaFastSeek = false
 
-            if (startChunkOffset + 4 <= raf.length()) {
-                it.seek(startChunkOffset)
-            } else {
-                it.seek(headerSize.toLong())
-                var currentChunk = 0
-                while (currentChunk < startChunk) {
-                    val encSize = it.readInt()
-                    it.skipBytes(encSize)
-                    currentChunk++
-                }
-            }
-
-            var currentChunk = startChunk
-            while (currentChunk <= endChunk && totalCopied < bytesToRead) {
-                val encSize = it.readInt()
-                val encBytes = ByteArray(encSize)
-                it.readFully(encBytes)
-
-                val nonce = deriveChunkNonce(fileSalt, currentChunk)
-                val chunkAad = buildChunkAad(fileSalt, currentChunk)
-                val cipher = Cipher.getInstance(TRANSFORMATION)
-                cipher.init(Cipher.DECRYPT_MODE, dek, GCMParameterSpec(GCM_TAG_LENGTH_BITS, nonce))
-                cipher.updateAAD(chunkAad)
-
-                val plainChunk = try {
-                    cipher.doFinal(encBytes)
-                } catch (e: AEADBadTagException) {
-                    // Try fallback without chunk AAD for legacy chunks
-                    try {
-                        val fallbackCipher = Cipher.getInstance(TRANSFORMATION)
-                        fallbackCipher.init(Cipher.DECRYPT_MODE, dek, GCMParameterSpec(GCM_TAG_LENGTH_BITS, nonce))
-                        fallbackCipher.doFinal(encBytes)
-                    } catch (_: Exception) {
-                        throw e
+                if (startChunkOffset >= headerSize.toLong() && startChunkOffset + 4 <= raf.length()) {
+                    it.seek(startChunkOffset)
+                    val probeSize = it.readInt()
+                    if (probeSize in 1..(chunkSize + 1024) && it.filePointer + probeSize <= raf.length()) {
+                        it.seek(startChunkOffset)
+                        positionedViaFastSeek = true
                     }
                 }
 
-                try {
-                    val chunkStartOffset = currentChunk.toLong() * chunkSize
-                    val offsetInChunk = (currentOffsetInRead - chunkStartOffset).toInt()
-                    val availableInChunk = plainChunk.size - offsetInChunk
-                    val needToCopy = minOf(availableInChunk, bytesToRead - totalCopied)
+                if (!positionedViaFastSeek) {
+                    it.seek(headerSize.toLong())
+                    var currentChunk = 0
+                    while (currentChunk < startChunk) {
+                        val encSize = validateEncryptedChunkSize(it.readInt(), chunkSize)
+                        val skipped = it.skipBytes(encSize)
+                        if (skipped != encSize) {
+                            throw IOException("Unexpected EOF while skipping encrypted chunk $currentChunk")
+                        }
+                        currentChunk++
+                    }
+                }
 
-                    System.arraycopy(plainChunk, offsetInChunk, outBuffer, outBufferOffset + totalCopied, needToCopy)
-                    totalCopied += needToCopy
-                    currentOffsetInRead += needToCopy
-                    currentChunk++
-                } finally {
-                    zeroByteArray(plainChunk)
+                var currentChunk = startChunk
+                while (currentChunk <= endChunk && totalCopied < bytesToRead) {
+                    val encSize = validateEncryptedChunkSize(it.readInt(), chunkSize)
+                    val encBytes = ByteArray(encSize)
+                    it.readFully(encBytes)
+
+                    val nonce = deriveChunkNonce(fileSalt, currentChunk)
+                    val chunkAad = buildChunkAad(fileSalt, currentChunk)
+                    val cipher = Cipher.getInstance(TRANSFORMATION)
+                    cipher.init(Cipher.DECRYPT_MODE, dek, GCMParameterSpec(GCM_TAG_LENGTH_BITS, nonce))
+                    cipher.updateAAD(chunkAad)
+
+                    val plainChunk = try {
+                        cipher.doFinal(encBytes)
+                    } catch (e: AEADBadTagException) {
+                        // Try fallback without chunk AAD for legacy chunks
+                        try {
+                            val fallbackCipher = Cipher.getInstance(TRANSFORMATION)
+                            fallbackCipher.init(Cipher.DECRYPT_MODE, dek, GCMParameterSpec(GCM_TAG_LENGTH_BITS, nonce))
+                            fallbackCipher.doFinal(encBytes)
+                        } catch (_: Exception) {
+                            throw e
+                        }
+                    }
+
+                    try {
+                        val chunkStartOffset = currentChunk.toLong() * chunkSize
+                        val offsetInChunk = (currentOffsetInRead - chunkStartOffset).toInt()
+                        val availableInChunk = plainChunk.size - offsetInChunk
+                        val needToCopy = minOf(availableInChunk, bytesToRead - totalCopied)
+
+                        System.arraycopy(plainChunk, offsetInChunk, outBuffer, outBufferOffset + totalCopied, needToCopy)
+                        totalCopied += needToCopy
+                        currentOffsetInRead += needToCopy
+                        currentChunk++
+                    } finally {
+                        zeroByteArray(plainChunk)
+                    }
                 }
             }
+        } finally {
+            runCatching { zeroByteArray(dek.encoded) }
+            runCatching { dek.destroy() }
         }
 
         return totalCopied

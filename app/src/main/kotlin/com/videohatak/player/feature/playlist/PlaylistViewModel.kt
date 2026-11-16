@@ -35,6 +35,12 @@ class PlaylistViewModel(
     private val _playbackState = MutableStateFlow(PlaylistPlaybackState())
     val playbackState: StateFlow<PlaylistPlaybackState> = _playbackState.asStateFlow()
 
+    private val _favoriteVideoIds = MutableStateFlow<Set<Long>>(emptySet())
+    val favoriteVideoIds: StateFlow<Set<Long>> = _favoriteVideoIds.asStateFlow()
+
+    private val _favoriteVideoUris = MutableStateFlow<Set<String>>(emptySet())
+    val favoriteVideoUris: StateFlow<Set<String>> = _favoriteVideoUris.asStateFlow()
+
     init {
         refresh()
     }
@@ -42,9 +48,33 @@ class PlaylistViewModel(
     fun refresh() {
         viewModelScope.launch {
             repository.refresh()
+            refreshFavoritesState()
             _selectedPlaylistWithItems.value?.first?.id?.let { pId ->
                 loadPlaylistWithItems(pId)
             }
+        }
+    }
+
+    private suspend fun refreshFavoritesState() {
+        val (ids, uris) = repository.getFavoriteVideoKeys()
+        _favoriteVideoIds.value = ids
+        _favoriteVideoUris.value = uris
+    }
+
+    fun isFavorite(video: VideoItem): Boolean {
+        return video.id in _favoriteVideoIds.value || video.contentUri.toString() in _favoriteVideoUris.value
+    }
+
+    fun toggleFavorite(video: VideoItem, onResult: ((Boolean) -> Unit)? = null) {
+        viewModelScope.launch {
+            val isNowFavorite = repository.toggleFavorite(video)
+            refreshFavoritesState()
+            _selectedPlaylistWithItems.value?.first?.let { selected ->
+                if (PlaylistRepository.isProtectedFavoritesTitle(selected.title)) {
+                    loadPlaylistWithItems(selected.id)
+                }
+            }
+            onResult?.invoke(isNowFavorite)
         }
     }
 
@@ -70,19 +100,40 @@ class PlaylistViewModel(
         }
     }
 
-    fun renamePlaylist(id: Long, newName: String) {
+    fun createPlaylistAndAddVideo(name: String, video: VideoItem, onComplete: (() -> Unit)? = null) {
         viewModelScope.launch {
-            repository.renamePlaylist(id, newName)
-            if (_selectedPlaylistWithItems.value?.first?.id == id) {
+            val newId = repository.createPlaylist(name)
+            if (newId > 0L) {
+                repository.addVideoToPlaylists(video, listOf(newId))
+                refreshFavoritesState()
+                loadPlaylistWithItems(newId)
+            }
+            onComplete?.invoke()
+        }
+    }
+
+    fun renamePlaylist(id: Long, newName: String) {
+        val current = playlists.value.firstOrNull { it.id == id }
+        if (current != null && PlaylistRepository.isProtectedFavoritesTitle(current.title)) {
+            return
+        }
+        viewModelScope.launch {
+            val updated = repository.renamePlaylist(id, newName)
+            if (updated && _selectedPlaylistWithItems.value?.first?.id == id) {
                 loadPlaylistWithItems(id)
             }
         }
     }
 
     fun deletePlaylist(id: Long) {
+        val current = playlists.value.firstOrNull { it.id == id }
+        if (current != null && PlaylistRepository.isProtectedFavoritesTitle(current.title)) {
+            return
+        }
         viewModelScope.launch {
-            repository.deletePlaylist(id)
-            if (_selectedPlaylistWithItems.value?.first?.id == id) {
+            val deleted = repository.deletePlaylist(id)
+            refreshFavoritesState()
+            if (deleted && _selectedPlaylistWithItems.value?.first?.id == id) {
                 _selectedPlaylistWithItems.value = null
             }
         }
@@ -91,6 +142,7 @@ class PlaylistViewModel(
     fun addVideoToPlaylists(video: VideoItem, playlistIds: List<Long>) {
         viewModelScope.launch {
             repository.addVideoToPlaylists(video, playlistIds)
+            refreshFavoritesState()
             _selectedPlaylistWithItems.value?.first?.id?.let {
                 if (it in playlistIds) loadPlaylistWithItems(it)
             }
@@ -100,6 +152,7 @@ class PlaylistViewModel(
     fun removeItemFromPlaylist(itemId: Long, playlistId: Long) {
         viewModelScope.launch {
             repository.removeVideoFromPlaylist(itemId, playlistId)
+            refreshFavoritesState()
             loadPlaylistWithItems(playlistId)
         }
     }

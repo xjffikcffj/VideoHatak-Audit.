@@ -28,17 +28,35 @@ interface PlaybackPreferencesRepository {
     val resumeMode: Flow<ResumeMode>
         get() = flowOf(ResumeMode.RESUME)
 
+    val seekIntervalSeconds: Flow<Int>
+        get() = flowOf(DEFAULT_SEEK_INTERVAL_SECONDS)
+
     suspend fun setPlaybackSpeed(speed: Float)
     suspend fun setResizeMode(mode: Int)
     suspend fun setRepeatMode(mode: String)
     suspend fun setPlaybackMode(mode: PlaybackMode) {}
     suspend fun setResumeMode(mode: ResumeMode) {}
+    suspend fun setSeekIntervalSeconds(seconds: Int) {}
     suspend fun saveVideoPosition(videoUri: String, positionMs: Long, durationMs: Long)
     suspend fun getSavedVideoPosition(videoUri: String, durationMs: Long = 0L, legacyVideoId: Long? = null): Long
     suspend fun exportSavedPositions(): Map<String, Long> = emptyMap()
     suspend fun restoreSavedPositions(positions: Map<String, Long>) {}
     suspend fun replaceSavedPositions(positions: Map<String, Long>) {
         restoreSavedPositions(positions)
+    }
+
+    companion object {
+        const val DEFAULT_SEEK_INTERVAL_SECONDS = 10
+        val SUPPORTED_SEEK_INTERVALS_SECONDS = listOf(5, 10, 15)
+
+        fun sanitizeSeekIntervalSeconds(seconds: Int): Int {
+            return if (seconds in SUPPORTED_SEEK_INTERVALS_SECONDS) {
+                seconds
+            } else {
+                SUPPORTED_SEEK_INTERVALS_SECONDS.minByOrNull { kotlin.math.abs(it - seconds) }
+                    ?: DEFAULT_SEEK_INTERVAL_SECONDS
+            }
+        }
     }
 }
 
@@ -53,6 +71,7 @@ class PlaybackPreferencesRepositoryImpl(
     private val repeatModeKey = stringPreferencesKey("repeat_mode")
     private val playbackModeKey = stringPreferencesKey("playback_mode_v2")
     private val resumeModeKey = stringPreferencesKey("resume_mode_v1")
+    private val seekIntervalKey = intPreferencesKey("seek_interval_seconds")
 
     private fun positionKey(uri: String): Preferences.Key<Long> {
         val digest = MessageDigest.getInstance("SHA-256").digest(uri.toByteArray(Charsets.UTF_8))
@@ -80,6 +99,12 @@ class PlaybackPreferencesRepositoryImpl(
     override val resumeMode: Flow<ResumeMode> = dataStore.data.map { prefs ->
         val raw = prefs[resumeModeKey]
         ResumeMode.entries.firstOrNull { it.name == raw } ?: ResumeMode.RESUME
+    }
+
+    override val seekIntervalSeconds: Flow<Int> = dataStore.data.map { prefs ->
+        PlaybackPreferencesRepository.sanitizeSeekIntervalSeconds(
+            prefs[seekIntervalKey] ?: PlaybackPreferencesRepository.DEFAULT_SEEK_INTERVAL_SECONDS
+        )
     }
 
     override suspend fun setPlaybackSpeed(speed: Float) {
@@ -110,6 +135,13 @@ class PlaybackPreferencesRepositoryImpl(
     override suspend fun setResumeMode(mode: ResumeMode) {
         dataStore.edit { prefs ->
             prefs[resumeModeKey] = mode.name
+        }
+    }
+
+    override suspend fun setSeekIntervalSeconds(seconds: Int) {
+        val valid = PlaybackPreferencesRepository.sanitizeSeekIntervalSeconds(seconds)
+        dataStore.edit { prefs ->
+            prefs[seekIntervalKey] = valid
         }
     }
 

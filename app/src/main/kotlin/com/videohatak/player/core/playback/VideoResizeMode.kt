@@ -53,5 +53,44 @@ enum class VideoResizeMode(
         fun fromCode(code: Int): VideoResizeMode {
             return entries.firstOrNull { it.storageCode == code } ?: FIT
         }
+
+        /**
+         * Computes pixel dimensions constrained to both viewport width and height so neither portrait
+         * nor landscape aspect ratios ever overflow and push controls off-screen.
+         * Returns null when the PlayerView should occupy the full viewport (`fillMaxSize`).
+         */
+        fun computeFittedVideoSize(
+            viewportWidthPx: Int,
+            viewportHeightPx: Int,
+            resizeMode: VideoResizeMode,
+            videoWidth: Int = 0,
+            videoHeight: Int = 0
+        ): Pair<Int, Int>? {
+            if (viewportWidthPx <= 0 || viewportHeightPx <= 0) return null
+            val targetRatio = when (resizeMode) {
+                RATIO_16_9 -> 16f / 9f
+                RATIO_4_3 -> 4f / 3f
+                ORIGINAL_SIZE -> {
+                    if (videoWidth <= 0 || videoHeight <= 0) return null
+                    val scale = minOf(
+                        viewportWidthPx.toFloat() / videoWidth.toFloat(),
+                        viewportHeightPx.toFloat() / videoHeight.toFloat(),
+                        1f
+                    )
+                    return ((videoWidth * scale).toInt().coerceAtLeast(1)) to
+                        ((videoHeight * scale).toInt().coerceAtLeast(1))
+                }
+                else -> return null
+            }
+
+            val viewportRatio = viewportWidthPx.toFloat() / viewportHeightPx.toFloat()
+            return if (viewportRatio > targetRatio) {
+                val width = (viewportHeightPx * targetRatio).toInt().coerceIn(1, viewportWidthPx)
+                width to viewportHeightPx
+            } else {
+                val height = (viewportWidthPx / targetRatio).toInt().coerceIn(1, viewportHeightPx)
+                viewportWidthPx to height
+            }
+        }
     }
 }

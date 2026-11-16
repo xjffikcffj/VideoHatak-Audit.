@@ -2,12 +2,14 @@ package com.videohatak.player
 
 import android.app.Application
 import android.net.Uri
+import android.view.KeyEvent
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.datastore.preferences.core.Preferences
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.ViewModelStore
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import com.videohatak.player.core.designsystem.theme.AppThemeId
@@ -24,6 +26,11 @@ import com.videohatak.player.core.playback.PlaybackPreferencesRepositoryImpl
 import com.videohatak.player.core.playback.ResumeMode
 import com.videohatak.player.core.playback.VideoPlayerManager
 import com.videohatak.player.core.playback.VideoResizeMode
+import com.videohatak.player.core.playback.VolumeComboShortcutDetector
+import com.videohatak.player.core.playback.service.MediaNotificationArtworkLoader
+import com.videohatak.player.core.playlist.db.VideoHatakDatabaseHelper
+import com.videohatak.player.core.playlist.repository.PlaylistRepository
+import com.videohatak.player.core.playlist.repository.PlaylistRepositoryImpl
 import com.videohatak.player.feature.player.PlayerViewModel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -485,5 +492,199 @@ class NewFeaturesVerificationTest {
         }
         assertEquals(VideoResizeMode.entries.toList(), visited)
         assertEquals(VideoResizeMode.FIT, mode.next())
+    }
+
+    @Test
+    fun pipAndControlsVisibility_resetsCleanlyOnExitAndNewPlayback() {
+        val fakePlayer = PlaybackIntegrationTest.FakeExoPlayer()
+        val manager = VideoPlayerManager.createForTesting(fakePlayer.exoPlayer)
+
+        manager.setControlsVisible(false)
+        manager.setPipActive(true)
+        assertFalse(manager.uiState.value.isControlsVisible)
+        assertTrue(manager.uiState.value.isPipActive)
+
+        // Exiting PiP and restoring controls
+        manager.setPipActive(false)
+        manager.setControlsVisible(true)
+        assertFalse(manager.uiState.value.isPipActive)
+        assertTrue(manager.uiState.value.isControlsVisible)
+
+        // Starting new media must also clear stale PiP / hidden controls state
+        manager.setControlsVisible(false)
+        manager.setPipActive(true)
+        manager.playMedia(Uri.parse("content://media/external/video/media/901"), "فيديو اختباري")
+        assertFalse(manager.uiState.value.isPipActive)
+        assertTrue(manager.uiState.value.isControlsVisible)
+
+        // Stopping playback clears PiP and restores default controls visibility
+        manager.setControlsVisible(false)
+        manager.setPipActive(true)
+        manager.stopPlayback()
+        assertFalse(manager.uiState.value.isPipActive)
+        assertTrue(manager.uiState.value.isControlsVisible)
+    }
+
+    @Test
+    fun videoResizeMode_computeFittedVideoSize_neverOverflowsPortraitOrLandscape() {
+        // Landscape phone (2400x1080) with 4:3 target must constrain height=1080 and width=1440 (never overflow height)
+        val landscape43 = VideoResizeMode.computeFittedVideoSize(
+            viewportWidthPx = 2400,
+            viewportHeightPx = 1080,
+            resizeMode = VideoResizeMode.RATIO_4_3
+        )
+        assertNotNull(landscape43)
+        assertTrue(landscape43!!.first <= 2400)
+        assertEquals(1080, landscape43.second)
+
+        // Portrait phone (1080x2400) with 16:9 target must constrain width=1080 and height=607
+        val portrait169 = VideoResizeMode.computeFittedVideoSize(
+            viewportWidthPx = 1080,
+            viewportHeightPx = 2400,
+            resizeMode = VideoResizeMode.RATIO_16_9
+        )
+        assertNotNull(portrait169)
+        assertEquals(1080, portrait169!!.first)
+        assertTrue(portrait169.second in 600..615)
+
+        // FIT/FILL/ZOOM delegate full viewport bounds cleanly
+        assertNull(VideoResizeMode.computeFittedVideoSize(1080, 2400, VideoResizeMode.FIT))
+        assertNull(VideoResizeMode.computeFittedVideoSize(2400, 1080, VideoResizeMode.FILL))
+    }
+
+    @Test
+    fun audioOnlyMode_disablesVideoTrackPreservingPlaybackAndResetsOnStop() {
+        val fakePlayer = PlaybackIntegrationTest.FakeExoPlayer()
+        val manager = VideoPlayerManager.createForTesting(fakePlayer.exoPlayer).also { activePlayerManagers.add(it) }
+
+        val uri = Uri.parse("content://media/external/video/media/audio_only_test")
+        manager.playMedia(uri, "حفل موسيقي")
+        assertFalse(manager.uiState.value.isAudioOnlyMode)
+        assertFalse(fakePlayer.trackSelectionParameters.disabledTrackTypes.contains(C.TRACK_TYPE_VIDEO))
+
+        val enabled = manager.toggleAudioOnlyMode()
+        assertTrue(enabled)
+        assertTrue(manager.uiState.value.isAudioOnlyMode)
+        assertTrue(fakePlayer.trackSelectionParameters.disabledTrackTypes.contains(C.TRACK_TYPE_VIDEO))
+
+        manager.stopPlayback()
+        assertFalse(manager.uiState.value.isAudioOnlyMode)
+        assertFalse(fakePlayer.trackSelectionParameters.disabledTrackTypes.contains(C.TRACK_TYPE_VIDEO))
+    }
+
+    @Test
+    fun volumeComboShortcutDetector_triggersOnceOnSimultaneousPress_andAllowsSingleKeyVolume() {
+        var triggerCount = 0
+        val detector = VolumeComboShortcutDetector { triggerCount++ }
+
+        // 1. Single Volume Up press + release must pass through (false) and never trigger shortcut
+        assertFalse(detector.onKeyEvent(KeyEvent.KEYCODE_VOLUME_UP, KeyEvent.ACTION_DOWN, 0, isShortcutActive = true))
+        assertFalse(detector.onKeyEvent(KeyEvent.KEYCODE_VOLUME_UP, KeyEvent.ACTION_UP, 0, isShortcutActive = true))
+        assertEquals(0, triggerCount)
+
+        // 2. Single Volume Down press + release must pass through (false)
+        assertFalse(detector.onKeyEvent(KeyEvent.KEYCODE_VOLUME_DOWN, KeyEvent.ACTION_DOWN, 0, isShortcutActive = true))
+        assertFalse(detector.onKeyEvent(KeyEvent.KEYCODE_VOLUME_DOWN, KeyEvent.ACTION_UP, 0, isShortcutActive = true))
+        assertEquals(0, triggerCount)
+
+        // 3. Simultaneous press triggers exactly once per hold even with repeat events
+        assertFalse(detector.onKeyEvent(KeyEvent.KEYCODE_VOLUME_UP, KeyEvent.ACTION_DOWN, 0, isShortcutActive = true))
+        assertTrue(detector.onKeyEvent(KeyEvent.KEYCODE_VOLUME_DOWN, KeyEvent.ACTION_DOWN, 0, isShortcutActive = true))
+        assertTrue(detector.onKeyEvent(KeyEvent.KEYCODE_VOLUME_DOWN, KeyEvent.ACTION_DOWN, 1, isShortcutActive = true))
+        assertTrue(detector.onKeyEvent(KeyEvent.KEYCODE_VOLUME_UP, KeyEvent.ACTION_DOWN, 2, isShortcutActive = true))
+        assertEquals(1, triggerCount)
+
+        // Combo releases consumed cleanly, resetting state for next intentional combo
+        assertTrue(detector.onKeyEvent(KeyEvent.KEYCODE_VOLUME_DOWN, KeyEvent.ACTION_UP, 0, isShortcutActive = true))
+        assertTrue(detector.onKeyEvent(KeyEvent.KEYCODE_VOLUME_UP, KeyEvent.ACTION_UP, 0, isShortcutActive = true))
+
+        // 4. Subsequent single volume press after reset still works normally
+        assertFalse(detector.onKeyEvent(KeyEvent.KEYCODE_VOLUME_UP, KeyEvent.ACTION_DOWN, 0, isShortcutActive = true))
+        assertFalse(detector.onKeyEvent(KeyEvent.KEYCODE_VOLUME_UP, KeyEvent.ACTION_UP, 0, isShortcutActive = true))
+        assertEquals(1, triggerCount)
+    }
+
+    @Test
+    fun favoritesRepository_lazilyCreatesFavoritesPlaylistAndTogglesCleanly() = runBlocking {
+        val dbHelper = VideoHatakDatabaseHelper(testApp())
+        dbHelper.replaceAllPlaylistsAndItems(emptyList())
+        val repo = PlaylistRepositoryImpl(testApp(), dbHelper)
+
+        val video = VideoItem(
+            id = 808L,
+            contentUri = Uri.parse("content://media/external/video/media/808"),
+            title = "مقطع مفضل",
+            displayName = "fav_808.mp4",
+            durationMs = 90_000L,
+            sizeBytes = 5_000_000L,
+            dateAddedSec = 1700000000L
+        )
+
+        // Empty DB stays empty before first favorite toggle
+        assertTrue(dbHelper.getPlaylists().isEmpty())
+        assertFalse(repo.isFavorite(video))
+
+        // First toggle creates "المفضلة" and adds video
+        assertTrue(repo.toggleFavorite(video))
+        assertTrue(repo.isFavorite(video))
+        val playlistsAfterAdd = dbHelper.getPlaylists()
+        assertEquals(1, playlistsAfterAdd.size)
+        assertEquals(PlaylistRepository.FAVORITES_PLAYLIST_TITLE, playlistsAfterAdd.first().title)
+
+        // Second toggle removes video cleanly
+        assertFalse(repo.toggleFavorite(video))
+        assertFalse(repo.isFavorite(video))
+        dbHelper.close()
+    }
+
+    @Test
+    fun mediaNotificationArtworkLoader_masksVaultAndReturnsValidFallbackBitmap() = runBlocking {
+        MediaNotificationArtworkLoader.clearCacheForTesting()
+        val vaultBitmap = MediaNotificationArtworkLoader.loadOrFallbackArtwork(
+            context = testApp(),
+            uri = Uri.parse("vault://secret_video_1"),
+            isVaultPrivate = true
+        )
+        assertNotNull(vaultBitmap)
+        assertFalse(vaultBitmap.isRecycled)
+        assertNull(MediaNotificationArtworkLoader.getCachedArtwork("vault://secret_video_1"))
+
+        val programmaticFallback = MediaNotificationArtworkLoader.createProgrammaticFallbackBitmap(96)
+        assertEquals(96, programmaticFallback.width)
+        assertEquals(96, programmaticFallback.height)
+    }
+
+    @Test
+    fun playerViewModel_syncVideoFromPlayerManager_recoversActiveVideoMetadata() = runBlocking {
+        val scope = createScope()
+        val dataStore = createDataStore(scope)
+        val repo = PlaybackPreferencesRepositoryImpl(dataStore)
+        val posManager = PlaybackPositionManager(repo, scope).also { activeManagers.add(it) }
+        val fakePlayer = PlaybackIntegrationTest.FakeExoPlayer().apply {
+            duration = 75_000L
+            currentPosition = 12_000L
+            isPlaying = true
+        }
+        val playerManager = VideoPlayerManager.createForTesting(fakePlayer.exoPlayer).also { activePlayerManagers.add(it) }
+        val targetUri = Uri.parse("content://media/external/video/media/950")
+        playerManager.playMedia(targetUri, "فيديو يعمل بالخلفية")
+
+        // Create a fresh ViewModel representing Activity recreation while background playback continues
+        val (_, restoredVm) = createManagedViewModel {
+            PlayerViewModel(
+                application = testApp(),
+                playerManager = playerManager,
+                playbackPreferences = repo,
+                positionManager = posManager,
+                subtitlePreferences = null,
+                thumbnailManager = null
+            )
+        }
+        assertNull(restoredVm.currentVideo)
+
+        val recovered = restoredVm.syncVideoFromPlayerManager()
+        assertNotNull(recovered)
+        assertEquals(targetUri, recovered?.contentUri)
+        assertEquals("فيديو يعمل بالخلفية", recovered?.safeTitle)
     }
 }

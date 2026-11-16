@@ -20,6 +20,10 @@ android {
         versionName = "1.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        ndk {
+            abiFilters.addAll(setOf("arm64-v8a", "armeabi-v7a", "x86_64"))
+        }
     }
 
     buildTypes {
@@ -92,6 +96,14 @@ dependencies {
     implementation(libs.androidx.media3.common)
     implementation(libs.androidx.media3.session)
     implementation(libs.androidx.biometric)
+
+    // Offline On-Device Speech Recognition (Vosk) & Translation (Google ML Kit)
+    implementation(libs.google.mlkit.translate)
+    implementation(libs.google.mlkit.language.id)
+    implementation("com.alphacephei:vosk-android:0.3.75") {
+        exclude(group = "net.java.dev.jna", module = "jna")
+    }
+    implementation("net.java.dev.jna:jna:5.16.0@aar")
 
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)

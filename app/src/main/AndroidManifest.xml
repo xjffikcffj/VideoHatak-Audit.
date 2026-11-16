@@ -26,6 +26,9 @@
     <!-- Biometric authentication permission for Secure Vault -->
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
 
+    <!-- Network permission for optional user-configured HTTPS Subtitle Translation Proxy -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
     <application
         android:name=".VideoHatakApp"
         android:allowBackup="false"

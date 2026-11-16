@@ -20,12 +20,38 @@ import com.videohatak.player.core.playback.VideoResizeMode
 import com.videohatak.player.core.playlist.model.PlaylistRepeatMode
 import com.videohatak.player.core.playlist.model.toVideoItem
 import com.videohatak.player.core.playlist.repository.PlaylistRepositoryImpl
+import com.videohatak.player.core.subtitle.model.SubtitleCue
+import com.videohatak.player.core.subtitle.model.SubtitleFormat
 import com.videohatak.player.core.subtitle.model.SubtitleStyleConfig
 import com.videohatak.player.core.subtitle.model.SubtitleTrack
+import com.videohatak.player.core.subtitle.parser.SubtitleParseResult
 import com.videohatak.player.core.subtitle.parser.SubtitleParser
+import com.videohatak.player.core.subtitle.repository.LocalSubtitleStore
 import com.videohatak.player.core.subtitle.repository.SubtitlePreferencesRepository
+import com.videohatak.player.core.subtitle.speech.VideoAudioPcmDecoder
+import com.videohatak.player.core.subtitle.speech.VoskRecognitionException
+import com.videohatak.player.core.subtitle.speech.VoskSpeechToSubtitleEngine
+import com.videohatak.player.core.subtitle.translation.AudioTrackExtractor
+import com.videohatak.player.core.subtitle.translation.BackendProxyConfig
+import com.videohatak.player.core.subtitle.translation.ContextAwareDialogueTranslator
+import com.videohatak.player.core.subtitle.translation.LanguageModelResourceState
+import com.videohatak.player.core.subtitle.translation.MlKitOfflineSubtitleTranslator
+import com.videohatak.player.core.subtitle.translation.OfflineModelManager
+import com.videohatak.player.core.subtitle.translation.OfflineTranslationException
+import com.videohatak.player.core.subtitle.translation.ProxySubtitleTranslationProvider
+import com.videohatak.player.core.subtitle.translation.SubtitleSourceMode
+import com.videohatak.player.core.subtitle.translation.SubtitleTranslationLanguage
+import com.videohatak.player.core.subtitle.translation.SubtitleTranslationProvider
+import com.videohatak.player.core.subtitle.translation.TranslatedCuePair
+import com.videohatak.player.core.subtitle.translation.TranslationEngineMode
+import com.videohatak.player.core.subtitle.translation.TranslationGlossaryEntry
+import com.videohatak.player.core.subtitle.translation.TranslationJobStatus
+import com.videohatak.player.core.subtitle.translation.TranslationPairReadiness
+import com.videohatak.player.core.subtitle.translation.TranslationProxyException
 import com.videohatak.player.core.thumbnail.manager.ThumbnailPreviewManager
 import com.videohatak.player.core.thumbnail.model.ThumbnailPreviewState
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -41,7 +67,9 @@ class PlayerViewModel(
     private val playbackPreferences: PlaybackPreferencesRepository,
     val positionManager: PlaybackPositionManager = PlaybackPositionManager.getInstance(application),
     private val subtitlePreferences: SubtitlePreferencesRepository? = null,
-    private val thumbnailManager: ThumbnailPreviewManager? = null
+    private val thumbnailManager: ThumbnailPreviewManager? = null,
+    subtitleStore: LocalSubtitleStore? = null,
+    offlineModelManager: OfflineModelManager? = null
 ) : AndroidViewModel(application) {
 
     private val safeSubtitlePreferences: SubtitlePreferencesRepository? =
@@ -50,11 +78,45 @@ class PlayerViewModel(
     private val safeThumbnailManager: ThumbnailPreviewManager? =
         thumbnailManager ?: try { ThumbnailPreviewManager(application) } catch (_: Throwable) { null }
 
+    private val safeSubtitleStore: LocalSubtitleStore? =
+        subtitleStore ?: try { LocalSubtitleStore(application) } catch (_: Throwable) { null }
+
+    private val safeOfflineModelManager: OfflineModelManager? =
+        offlineModelManager ?: try { OfflineModelManager.getInstance(application) } catch (_: Throwable) { null }
+
     var currentVideo: VideoItem? = null
         private set
 
     private val playlistRepository by lazy { PlaylistRepositoryImpl(getApplication()) }
     private var playlistVideos: List<VideoItem> = emptyList()
+    private var translationJob: Job? = null
+
+    private val proxyPrefs = try {
+        application.getSharedPreferences("videohatak_translation_proxy", Context.MODE_PRIVATE)
+    } catch (_: Throwable) {
+        null
+    }
+
+    private val _translationProxyUrl = MutableStateFlow(
+        proxyPrefs?.getString("proxy_base_url", "") ?: ""
+    )
+    val translationProxyUrl: StateFlow<String> = _translationProxyUrl.asStateFlow()
+
+    private val _translationEngineMode = MutableStateFlow(TranslationEngineMode.OFFLINE_ON_DEVICE)
+    val translationEngineMode: StateFlow<TranslationEngineMode> = _translationEngineMode.asStateFlow()
+
+    val offlineModelStates: StateFlow<Map<SubtitleTranslationLanguage, LanguageModelResourceState>> =
+        safeOfflineModelManager?.languageStates ?: MutableStateFlow(emptyMap())
+
+    private val _detectedVideoAudioLanguage = MutableStateFlow<SubtitleTranslationLanguage?>(null)
+    val detectedVideoAudioLanguage: StateFlow<SubtitleTranslationLanguage?> =
+        _detectedVideoAudioLanguage.asStateFlow()
+
+    private val _subtitleFeedbackMessage = MutableStateFlow<String?>(null)
+    val subtitleFeedbackMessage: StateFlow<String?> = _subtitleFeedbackMessage.asStateFlow()
+
+    private val _translationStatus = MutableStateFlow<TranslationJobStatus>(TranslationJobStatus.Idle)
+    val translationStatus: StateFlow<TranslationJobStatus> = _translationStatus.asStateFlow()
 
     private val _pendingResumePrompt = MutableStateFlow<ResumePromptState?>(null)
     val pendingResumePrompt: StateFlow<ResumePromptState?> = _pendingResumePrompt.asStateFlow()
@@ -64,6 +126,13 @@ class PlayerViewModel(
 
     val resumeMode: StateFlow<ResumeMode> = playbackPreferences.resumeMode
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), ResumeMode.RESUME)
+
+    val seekIntervalSeconds: StateFlow<Int> = playbackPreferences.seekIntervalSeconds
+        .stateIn(
+            viewModelScope,
+            SharingStarted.WhileSubscribed(5000),
+            PlaybackPreferencesRepository.DEFAULT_SEEK_INTERVAL_SECONDS
+        )
 
     companion object {
         private const val TAG = "PlayerViewModel"
@@ -90,7 +159,9 @@ class PlayerViewModel(
 
     init {
         playerManager.onMediaTransition = { mediaId ->
-            val matching = playlistVideos.find { it.id.toString() == mediaId }
+            val matching = playlistVideos.find {
+                it.id.toString() == mediaId || it.contentUri.toString() == mediaId
+            }
             if (matching != null) {
                 currentVideo = matching
                 safeThumbnailManager?.setVideoUri(matching.contentUri)
@@ -130,6 +201,11 @@ class PlayerViewModel(
         viewModelScope.launch {
             playbackPreferences.resizeMode.collect { savedMode ->
                 playerManager.setResizeMode(VideoResizeMode.fromCode(savedMode).storageCode)
+            }
+        }
+        viewModelScope.launch {
+            playbackPreferences.seekIntervalSeconds.collect { seconds ->
+                playerManager.setSeekIntervalSeconds(seconds)
             }
         }
     }
@@ -225,6 +301,7 @@ class PlayerViewModel(
         playerManager.playMedia(uri, title, startPositionMs = 0L)
         val targetGen = playerManager.getCurrentPlaybackGeneration()
         viewModelScope.launch {
+            loadSavedSubtitlesForVideo(targetUri)
             handlePositionRestorationForMode(
                 videoTitle = title,
                 targetUri = targetUri,
@@ -267,6 +344,7 @@ class PlayerViewModel(
 
         val targetGen = playerManager.getCurrentPlaybackGeneration()
         viewModelScope.launch {
+            loadSavedSubtitlesForVideo(targetUri)
             handlePositionRestorationForMode(
                 videoTitle = video.safeTitle,
                 targetUri = targetUri,
@@ -294,19 +372,22 @@ class PlayerViewModel(
             safeThumbnailManager?.setVideoUri(startVideo.contentUri)
 
             val targetUri = startVideo.contentUri.toString()
-            if (shuffle) {
-                setPlaybackMode(PlaybackMode.SHUFFLE_ALL)
+            val activeMode = playerManager.uiState.value.playbackMode
+            val effectiveRepeatMode = if (shuffle && activeMode.repeatModeEquivalent == PlaylistRepeatMode.OFF) {
+                PlaylistRepeatMode.ALL
+            } else {
+                activeMode.repeatModeEquivalent
             }
-            val effectiveMode = if (shuffle) PlaybackMode.SHUFFLE_ALL else playerManager.uiState.value.playbackMode
             playerManager.playPlaylist(
                 items = videoItems,
                 startIndex = startIndex,
-                shuffle = effectiveMode.shuffleEnabled,
-                repeatMode = effectiveMode.repeatModeEquivalent,
+                shuffle = shuffle,
+                repeatMode = effectiveRepeatMode,
                 startPositionMs = 0L
             )
             val targetGen = playerManager.getCurrentPlaybackGeneration()
 
+            loadSavedSubtitlesForVideo(targetUri)
             handlePositionRestorationForMode(
                 videoTitle = startVideo.safeTitle,
                 targetUri = targetUri,
@@ -400,6 +481,30 @@ class PlayerViewModel(
         }
     }
 
+    fun setSeekIntervalSeconds(seconds: Int) {
+        val valid = PlaybackPreferencesRepository.sanitizeSeekIntervalSeconds(seconds)
+        playerManager.setSeekIntervalSeconds(valid)
+        viewModelScope.launch {
+            playbackPreferences.setSeekIntervalSeconds(valid)
+        }
+    }
+
+    fun seekForward(): Long {
+        val target = playerManager.seekForward()
+        val uri = playerManager.uiState.value.mediaUri?.toString() ?: currentVideo?.contentUri?.toString()
+        val durationMs = playerManager.uiState.value.durationMs.takeIf { it > 0L } ?: (currentVideo?.durationMs ?: 0L)
+        if (!uri.isNullOrBlank()) positionManager.enqueueSave(uri, target, durationMs)
+        return target
+    }
+
+    fun seekBackward(): Long {
+        val target = playerManager.seekBackward()
+        val uri = playerManager.uiState.value.mediaUri?.toString() ?: currentVideo?.contentUri?.toString()
+        val durationMs = playerManager.uiState.value.durationMs.takeIf { it > 0L } ?: (currentVideo?.durationMs ?: 0L)
+        if (!uri.isNullOrBlank()) positionManager.enqueueSave(uri, target, durationMs)
+        return target
+    }
+
     fun setPlaybackSpeed(speed: Float) {
         val clamped = VideoPlayerManager.clampPlaybackSpeed(speed)
         playerManager.setPlaybackSpeed(clamped)
@@ -430,6 +535,36 @@ class PlayerViewModel(
     fun setControlsVisible(visible: Boolean) = playerManager.setControlsVisible(visible)
     fun toggleLock() = playerManager.toggleLock()
     fun setPipActive(active: Boolean) = playerManager.setPipActive(active)
+    fun setAudioOnlyMode(enabled: Boolean) = playerManager.setAudioOnlyMode(enabled)
+    fun toggleAudioOnlyMode(): Boolean = playerManager.toggleAudioOnlyMode()
+
+    fun updateActiveVideo(updated: VideoItem) {
+        if (currentVideo?.id == updated.id || currentVideo?.contentUri == updated.contentUri) {
+            currentVideo = updated
+            playerManager.updateActiveTitle(updated.id, updated.contentUri, updated.safeTitle)
+        }
+    }
+
+    fun syncVideoFromPlayerManager(): VideoItem? {
+        currentVideo?.let { return it }
+        playerManager.syncWithCurrentPlayer()
+        val state = playerManager.uiState.value
+        val uri = state.mediaUri ?: return null
+        val restored = VideoItem(
+            id = uri.hashCode().toLong(),
+            contentUri = uri,
+            title = state.title.ifBlank { "تشغيل حالي" },
+            displayName = state.title.ifBlank { "تشغيل حالي" },
+            durationMs = state.durationMs,
+            sizeBytes = 0L,
+            bucketId = if (uri.scheme.equals("vault", ignoreCase = true)) "secure_vault" else "restored",
+            dateAddedSec = 0L,
+            width = state.videoWidth,
+            height = state.videoHeight
+        )
+        currentVideo = restored
+        return restored
+    }
 
     fun onScrubStart(positionMs: Long, fraction: Float) {
         safeThumbnailManager?.onScrubStart(positionMs, fraction)
@@ -446,22 +581,569 @@ class PlayerViewModel(
 
     fun setPrimarySubtitleTrack(track: SubtitleTrack?) = playerManager.setPrimarySubtitleTrack(track)
     fun setSecondarySubtitleTrack(track: SubtitleTrack?) = playerManager.setSecondarySubtitleTrack(track)
+    fun setSubtitlesVisible(visible: Boolean) = playerManager.setSubtitlesVisible(visible)
+
+    fun adjustPrimarySubtitleOffsetMs(deltaMs: Long) {
+        val current = playerManager.uiState.value.primarySubtitleOffsetMs
+        playerManager.setPrimarySubtitleOffsetMs(current + deltaMs)
+    }
+
+    fun resetPrimarySubtitleOffset() = playerManager.setPrimarySubtitleOffsetMs(0L)
+
+    fun adjustSecondarySubtitleOffsetMs(deltaMs: Long) {
+        val current = playerManager.uiState.value.secondarySubtitleOffsetMs
+        playerManager.setSecondarySubtitleOffsetMs(current + deltaMs)
+    }
+
+    fun resetSecondarySubtitleOffset() = playerManager.setSecondarySubtitleOffsetMs(0L)
+
+    fun clearSubtitleFeedback() {
+        _subtitleFeedbackMessage.value = null
+    }
+
+    private suspend fun loadSavedSubtitlesForVideo(videoUri: String) {
+        val store = safeSubtitleStore ?: return
+        val savedTracks = runCatching { store.loadTracksForVideo(videoUri) }.getOrDefault(emptyList())
+        if (savedTracks.isNotEmpty()) {
+            savedTracks.forEach { track ->
+                playerManager.addSubtitleTrack(track)
+            }
+            if (playerManager.uiState.value.primaryTrack == null) {
+                playerManager.setPrimarySubtitleTrack(savedTracks.first())
+            }
+        }
+    }
 
     fun importSubtitle(context: Context, uri: Uri, name: String) {
         viewModelScope.launch {
-            val cues = SubtitleParser.parse(context, uri)
-            val track = SubtitleTrack(
-                id = UUID.randomUUID().toString(),
-                name = name,
-                uri = uri,
-                cues = cues,
-                isExternal = true
-            )
-            playerManager.addSubtitleTrack(track)
-            if (playerManager.uiState.value.primaryTrack == null) {
-                playerManager.setPrimarySubtitleTrack(track)
-            } else if (playerManager.uiState.value.secondaryTrack == null) {
-                playerManager.setSecondarySubtitleTrack(track)
+            when (val result = SubtitleParser.parseSafely(context, uri, fallbackName = name)) {
+                is SubtitleParseResult.Error -> {
+                    _subtitleFeedbackMessage.value = result.message
+                }
+                is SubtitleParseResult.Success -> {
+                    val activeVideoUri = playerManager.uiState.value.mediaUri?.toString()
+                        ?: currentVideo?.contentUri?.toString().orEmpty()
+                    val cleanName = result.resolvedFileName.ifBlank { name }
+
+                    val track = if (activeVideoUri.isNotBlank() && safeSubtitleStore != null) {
+                        runCatching {
+                            safeSubtitleStore.saveTrackForVideo(
+                                videoUri = activeVideoUri,
+                                trackName = cleanName,
+                                cues = result.cues,
+                                format = result.format
+                            )
+                        }.getOrElse {
+                            SubtitleTrack(
+                                id = UUID.randomUUID().toString(),
+                                name = cleanName,
+                                uri = uri,
+                                cues = result.cues,
+                                isExternal = true
+                            )
+                        }
+                    } else {
+                        SubtitleTrack(
+                            id = UUID.randomUUID().toString(),
+                            name = cleanName,
+                            uri = uri,
+                            cues = result.cues,
+                            isExternal = true
+                        )
+                    }
+
+                    playerManager.addSubtitleTrack(track)
+                    if (playerManager.uiState.value.primaryTrack == null) {
+                        playerManager.setPrimarySubtitleTrack(track)
+                    } else if (playerManager.uiState.value.secondaryTrack == null) {
+                        playerManager.setSecondarySubtitleTrack(track)
+                    }
+                    _subtitleFeedbackMessage.value =
+                        "تم تحميل \"${track.name}\" (${result.cues.size} جملة • ${result.detectedEncoding})"
+                }
+            }
+        }
+    }
+
+    fun updateSubtitleCueText(trackId: String, cueIndex: Int, newText: String) {
+        val currentTrack = playerManager.uiState.value.availableSubtitleTracks.firstOrNull { it.id == trackId }
+            ?: return
+        val updatedCues = currentTrack.cues.mapIndexed { idx, cue ->
+            if (idx == cueIndex) cue.copy(text = newText.trim()) else cue
+        }
+        playerManager.updateSubtitleTrackCues(trackId, updatedCues)
+        val activeVideoUri = playerManager.uiState.value.mediaUri?.toString()
+            ?: currentVideo?.contentUri?.toString().orEmpty()
+        if (activeVideoUri.isNotBlank()) {
+            viewModelScope.launch {
+                safeSubtitleStore?.updateTrackCues(activeVideoUri, trackId, updatedCues)
+            }
+        }
+    }
+
+    fun removeSubtitleTrack(trackId: String) {
+        playerManager.removeSubtitleTrack(trackId)
+        val activeVideoUri = playerManager.uiState.value.mediaUri?.toString()
+            ?: currentVideo?.contentUri?.toString().orEmpty()
+        if (activeVideoUri.isNotBlank()) {
+            viewModelScope.launch {
+                safeSubtitleStore?.removeTrackForVideo(activeVideoUri, trackId)
+            }
+        }
+    }
+
+    fun exportTrackAsText(track: SubtitleTrack, format: SubtitleFormat): String {
+        return SubtitleParser.export(track.cues, format)
+    }
+
+    fun setTranslationProxyUrl(url: String) {
+        val cleaned = url.trim()
+        _translationProxyUrl.value = cleaned
+        proxyPrefs?.edit()?.putString("proxy_base_url", cleaned)?.apply()
+    }
+
+    fun setTranslationEngineMode(mode: TranslationEngineMode) {
+        _translationEngineMode.value = mode
+    }
+
+    fun refreshOfflineModelStates() {
+        viewModelScope.launch {
+            safeOfflineModelManager?.refreshAllStates()
+        }
+    }
+
+    fun inspectVideoAudioLanguage(context: Context, videoUri: Uri) {
+        viewModelScope.launch {
+            val detected = runCatching {
+                VideoAudioPcmDecoder.inspectAudioTrack(context, videoUri).detectedTrackLanguage
+            }.getOrNull()
+            _detectedVideoAudioLanguage.value = detected
+        }
+    }
+
+    fun computeOfflinePairReadiness(
+        sourceMode: SubtitleSourceMode,
+        sourceLanguage: SubtitleTranslationLanguage,
+        targetLanguage: SubtitleTranslationLanguage
+    ): TranslationPairReadiness? {
+        return safeOfflineModelManager?.computePairReadiness(sourceMode, sourceLanguage, targetLanguage)
+    }
+
+    fun downloadSpeechModel(language: SubtitleTranslationLanguage) {
+        val manager = safeOfflineModelManager ?: return
+        manager.startSpeechModelDownload(language)
+    }
+
+    fun cancelSpeechModelDownload(language: SubtitleTranslationLanguage) {
+        safeOfflineModelManager?.cancelSpeechModelDownload(language)
+    }
+
+    fun deleteSpeechModel(language: SubtitleTranslationLanguage) {
+        val manager = safeOfflineModelManager ?: return
+        viewModelScope.launch {
+            val result = manager.deleteSpeechModel(language)
+            _subtitleFeedbackMessage.value = result.message
+        }
+    }
+
+    fun downloadTranslationModel(language: SubtitleTranslationLanguage) {
+        val manager = safeOfflineModelManager ?: return
+        manager.startTranslationModelDownload(language)
+    }
+
+    fun deleteTranslationModel(language: SubtitleTranslationLanguage) {
+        val manager = safeOfflineModelManager ?: return
+        viewModelScope.launch {
+            val result = manager.deleteTranslationModel(language)
+            _subtitleFeedbackMessage.value = result.message
+        }
+    }
+
+    fun downloadRequiredModelsForPair(
+        sourceMode: SubtitleSourceMode,
+        sourceLanguage: SubtitleTranslationLanguage,
+        targetLanguage: SubtitleTranslationLanguage
+    ) {
+        val manager = safeOfflineModelManager ?: return
+        viewModelScope.launch {
+            manager.refreshAllStates()
+            val readiness = manager.computePairReadiness(sourceMode, sourceLanguage, targetLanguage)
+            if (readiness.isSpeechRequired && readiness.speechLanguage != null && !readiness.isSpeechReady) {
+                manager.startSpeechModelDownload(readiness.speechLanguage)
+            }
+            readiness.missingMlKitLanguages.forEach { lang ->
+                manager.startTranslationModelDownload(lang)
+            }
+        }
+    }
+
+    fun clearTranslationStatus() {
+        _translationStatus.value = TranslationJobStatus.Idle
+    }
+
+    fun cancelSmartSubtitleTranslation() {
+        translationJob?.cancel()
+        translationJob = null
+        val currentPairs = (_translationStatus.value as? TranslationJobStatus.Completed)?.pairs ?: emptyList()
+        _translationStatus.value = TranslationJobStatus.Cancelled(currentPairs)
+    }
+
+    fun updateTranslatedDraftCue(positionIndex: Int, newTranslatedText: String) {
+        val completed = _translationStatus.value as? TranslationJobStatus.Completed ?: return
+        val updated = completed.pairs.mapIndexed { idx, pair ->
+            if (idx == positionIndex) pair.copy(translatedText = newTranslatedText) else pair
+        }
+        _translationStatus.value = completed.copy(pairs = updated)
+    }
+
+    fun saveAndAttachTranslatedSubtitles(
+        trackTitle: String,
+        targetLanguage: SubtitleTranslationLanguage,
+        format: SubtitleFormat = SubtitleFormat.SRT,
+        assignAsSecondary: Boolean = false
+    ) {
+        val completed = _translationStatus.value as? TranslationJobStatus.Completed ?: return
+        val cues = completed.pairs.map { it.toTranslatedCue() }
+        if (cues.isEmpty()) return
+
+        viewModelScope.launch {
+            val activeVideoUri = playerManager.uiState.value.mediaUri?.toString()
+                ?: currentVideo?.contentUri?.toString().orEmpty()
+            val savedTrack = if (activeVideoUri.isNotBlank() && safeSubtitleStore != null) {
+                safeSubtitleStore.saveTrackForVideo(
+                    videoUri = activeVideoUri,
+                    trackName = trackTitle,
+                    language = targetLanguage.code,
+                    cues = cues,
+                    format = format
+                )
+            } else {
+                SubtitleTrack(
+                    id = UUID.randomUUID().toString(),
+                    name = trackTitle,
+                    uri = Uri.EMPTY,
+                    language = targetLanguage.code,
+                    cues = cues,
+                    isExternal = true
+                )
+            }
+            playerManager.addSubtitleTrack(savedTrack)
+            if (assignAsSecondary) {
+                playerManager.setSecondarySubtitleTrack(savedTrack)
+            } else {
+                playerManager.setPrimarySubtitleTrack(savedTrack)
+            }
+            _subtitleFeedbackMessage.value = "تم حفظ وتطبيق الترجمة الذكية: ${savedTrack.name}"
+        }
+    }
+
+    fun startSmartSubtitleTranslation(
+        context: Context,
+        videoUri: Uri,
+        sourceMode: SubtitleSourceMode,
+        sourceLanguage: SubtitleTranslationLanguage,
+        targetLanguage: SubtitleTranslationLanguage,
+        sourceTrack: SubtitleTrack?,
+        glossaryRawText: String = "",
+        customProvider: SubtitleTranslationProvider? = null
+    ) {
+        translationJob?.cancel()
+        val glossary = glossaryRawText.lines()
+            .mapNotNull { line ->
+                val parts = line.split("=", ":")
+                if (parts.size >= 2) {
+                    val src = parts[0].trim()
+                    val dst = parts.drop(1).joinToString("=").trim()
+                    if (src.isNotBlank() && dst.isNotBlank()) TranslationGlossaryEntry(src, dst) else null
+                } else null
+            }
+
+        val useCloudProxy = customProvider != null ||
+            _translationEngineMode.value == TranslationEngineMode.CLOUD_PROXY
+
+        translationJob = viewModelScope.launch {
+            try {
+                if (useCloudProxy) {
+                    val provider = customProvider ?: ProxySubtitleTranslationProvider {
+                        BackendProxyConfig(baseUrl = _translationProxyUrl.value)
+                    }
+                    runCloudProxyTranslation(
+                        context = context,
+                        videoUri = videoUri,
+                        sourceMode = sourceMode,
+                        sourceLanguage = sourceLanguage,
+                        targetLanguage = targetLanguage,
+                        sourceTrack = sourceTrack,
+                        glossary = glossary,
+                        provider = provider
+                    )
+                } else {
+                    val modelManager = safeOfflineModelManager
+                        ?: OfflineModelManager.getInstance(context.applicationContext)
+                    runOfflineOnDeviceTranslation(
+                        context = context,
+                        videoUri = videoUri,
+                        sourceMode = sourceMode,
+                        sourceLanguage = sourceLanguage,
+                        targetLanguage = targetLanguage,
+                        sourceTrack = sourceTrack,
+                        glossary = glossary,
+                        modelManager = modelManager
+                    )
+                }
+            } catch (_: CancellationException) {
+                _translationStatus.value = TranslationJobStatus.Cancelled()
+            } catch (proxyEx: TranslationProxyException) {
+                _translationStatus.value = TranslationJobStatus.Error(
+                    message = proxyEx.message ?: "تعذر إتمام الترجمة عبر الخادم",
+                    retryAfterSeconds = proxyEx.retryAfterSeconds
+                )
+            } catch (offlineEx: OfflineTranslationException) {
+                _translationStatus.value = TranslationJobStatus.Error(
+                    message = offlineEx.message ?: "تعذر إتمام الترجمة المحلية دون إنترنت"
+                )
+            } catch (voskEx: VoskRecognitionException) {
+                _translationStatus.value = TranslationJobStatus.Error(
+                    message = voskEx.message ?: "تعذر إتمام التفريغ الصوتي المحلي"
+                )
+            } catch (e: Exception) {
+                _translationStatus.value = TranslationJobStatus.Error(
+                    message = e.localizedMessage ?: "حدث خطأ غير متوقع أثناء الترجمة"
+                )
+            }
+        }
+    }
+
+    private suspend fun runOfflineOnDeviceTranslation(
+        context: Context,
+        videoUri: Uri,
+        sourceMode: SubtitleSourceMode,
+        sourceLanguage: SubtitleTranslationLanguage,
+        targetLanguage: SubtitleTranslationLanguage,
+        sourceTrack: SubtitleTrack?,
+        glossary: List<TranslationGlossaryEntry>,
+        modelManager: OfflineModelManager
+    ) {
+        val translator = MlKitOfflineSubtitleTranslator(modelManager)
+        modelManager.refreshAllStates()
+
+        when (sourceMode) {
+            SubtitleSourceMode.EXISTING_SUBTITLE -> {
+                val cues = sourceTrack?.cues ?: playerManager.uiState.value.primaryTrack?.cues.orEmpty()
+                if (cues.isEmpty()) {
+                    _translationStatus.value = TranslationJobStatus.Error(
+                        "يرجى استيراد أو تحديد مسار ترجمة أولًا للترجمة النصية، أو اختيار خيار التفريغ الصوتي المحلي."
+                    )
+                    return
+                }
+                _translationStatus.value = TranslationJobStatus.Running(
+                    progress = 0.05f,
+                    completedBatches = 0,
+                    totalBatches = cues.size,
+                    phaseLabel = "جاري تجهيز الترجمة المحلية دون إنترنت (${cues.size} جملة)..."
+                )
+                val execResult = translator.translateCuesOffline(
+                    cues = cues,
+                    sourceLanguage = sourceLanguage,
+                    targetLanguage = targetLanguage,
+                    glossary = glossary,
+                    downloadMissingModels = true
+                ) { done, total, label ->
+                    val fraction = if (total > 0) (done.toFloat() / total.toFloat()).coerceIn(0.05f, 1f) else 1f
+                    _translationStatus.value = TranslationJobStatus.Running(
+                        progress = fraction,
+                        completedBatches = done,
+                        totalBatches = total,
+                        phaseLabel = label
+                    )
+                }
+                val engineNote = if (execResult.usedTranslationEngine) {
+                    "عبر ML Kit محليًا (${execResult.resolvedSourceLanguage.arabicName} ← ${targetLanguage.arabicName}) دون إنترنت."
+                } else {
+                    "لغة المصدر مطابقة للهدف (${targetLanguage.arabicName})."
+                }
+                _translationStatus.value = TranslationJobStatus.Completed(
+                    pairs = execResult.pairs,
+                    targetLanguage = targetLanguage,
+                    summaryMessage = "تمت معالجة ${execResult.pairs.size} جملة $engineNote"
+                )
+            }
+
+            SubtitleSourceMode.VIDEO_AUDIO_EXTRACTION -> {
+                val resolvedAudioLang = if (sourceLanguage != SubtitleTranslationLanguage.AUTO) {
+                    sourceLanguage
+                } else {
+                    _translationStatus.value = TranslationJobStatus.Running(
+                        progress = 0.03f,
+                        completedBatches = 0,
+                        totalBatches = 100,
+                        phaseLabel = "جاري فحص بيانات المسار الصوتي لاكتشاف لغة الفيديو..."
+                    )
+                    val meta = VideoAudioPcmDecoder.inspectAudioTrack(context, videoUri)
+                    _detectedVideoAudioLanguage.value = meta.detectedTrackLanguage
+                    meta.detectedTrackLanguage
+                }
+
+                if (resolvedAudioLang == null || !resolvedAudioLang.supportsVoskSpeech) {
+                    _translationStatus.value = TranslationJobStatus.Error(
+                        "لم يتم تضمين وسم لغة مدعومة في مسار صوت هذا الفيديو. يرجى اختيار «لغة الفيديو الأصلية» يدويًا ثم بدء العملية."
+                    )
+                    return
+                }
+
+                // Automatically download Vosk speech model if user has not downloaded it yet
+                if (modelManager.getVerifiedSpeechModelDirectory(resolvedAudioLang) == null) {
+                    _translationStatus.value = TranslationJobStatus.Running(
+                        progress = 0.06f,
+                        completedBatches = 0,
+                        totalBatches = 100,
+                        phaseLabel = "جاري تنزيل نموذج التفريغ الصوتي لـ ${resolvedAudioLang.arabicName} داخل ذاكرة التطبيق..."
+                    )
+                    val dlRes = modelManager.downloadSpeechModelBlocking(resolvedAudioLang)
+                    if (!dlRes.success) {
+                        _translationStatus.value = TranslationJobStatus.Error(dlRes.message)
+                        return
+                    }
+                }
+
+                val voskEngine = VoskSpeechToSubtitleEngine(modelManager)
+                val transcribedCues = voskEngine.transcribeVideoAudioToCues(
+                    context = context,
+                    videoUri = videoUri,
+                    sourceLanguage = resolvedAudioLang
+                ) { fraction, label ->
+                    val scaled = (0.08f + fraction * 0.52f).coerceIn(0.08f, 0.60f)
+                    _translationStatus.value = TranslationJobStatus.Running(
+                        progress = scaled,
+                        completedBatches = (scaled * 100).toInt(),
+                        totalBatches = 100,
+                        phaseLabel = label
+                    )
+                }
+
+                _translationStatus.value = TranslationJobStatus.Running(
+                    progress = 0.62f,
+                    completedBatches = 62,
+                    totalBatches = 100,
+                    phaseLabel = "تم تفريغ ${transcribedCues.size} جملة. جاري تجهيز الترجمة إلى ${targetLanguage.arabicName}..."
+                )
+
+                val execResult = translator.translateCuesOffline(
+                    cues = transcribedCues,
+                    sourceLanguage = resolvedAudioLang,
+                    targetLanguage = targetLanguage,
+                    glossary = glossary,
+                    downloadMissingModels = true
+                ) { done, total, label ->
+                    val subFrac = if (total > 0) done.toFloat() / total.toFloat() else 1f
+                    val scaled = (0.62f + subFrac * 0.38f).coerceIn(0.62f, 1f)
+                    _translationStatus.value = TranslationJobStatus.Running(
+                        progress = scaled,
+                        completedBatches = (scaled * 100).toInt(),
+                        totalBatches = 100,
+                        phaseLabel = label
+                    )
+                }
+
+                val modeSummary = if (execResult.usedTranslationEngine) {
+                    "تم تفريغ الكلام (${resolvedAudioLang.arabicName} عبر Vosk) وترجمة ${execResult.pairs.size} جملة إلى ${targetLanguage.arabicName} محليًا عبر ML Kit دون إنترنت."
+                } else {
+                    "تم تفريغ ${execResult.pairs.size} جملة باللغة ${targetLanguage.arabicName} محليًا عبر Vosk دون إنترنت."
+                }
+                _translationStatus.value = TranslationJobStatus.Completed(
+                    pairs = execResult.pairs,
+                    targetLanguage = targetLanguage,
+                    summaryMessage = modeSummary
+                )
+            }
+        }
+    }
+
+    private suspend fun runCloudProxyTranslation(
+        context: Context,
+        videoUri: Uri,
+        sourceMode: SubtitleSourceMode,
+        sourceLanguage: SubtitleTranslationLanguage,
+        targetLanguage: SubtitleTranslationLanguage,
+        sourceTrack: SubtitleTrack?,
+        glossary: List<TranslationGlossaryEntry>,
+        provider: SubtitleTranslationProvider
+    ) {
+        when (sourceMode) {
+            SubtitleSourceMode.EXISTING_SUBTITLE -> {
+                val cues = sourceTrack?.cues ?: playerManager.uiState.value.primaryTrack?.cues.orEmpty()
+                if (cues.isEmpty()) {
+                    _translationStatus.value = TranslationJobStatus.Error(
+                        "يرجى استيراد أو تحديد مسار ترجمة أولًا للترجمة النصية، أو اختيار خيار استخراج صوت الفيديو."
+                    )
+                    return
+                }
+                val totalBatches = ((cues.size - 1) / ContextAwareDialogueTranslator.DEFAULT_BATCH_SIZE) + 1
+                _translationStatus.value = TranslationJobStatus.Running(
+                    progress = 0.05f,
+                    completedBatches = 0,
+                    totalBatches = totalBatches,
+                    phaseLabel = "تجهيز الحوارات والسياق (${cues.size} جملة)..."
+                )
+                val translatedPairs = ContextAwareDialogueTranslator.translateAllCues(
+                    cues = cues,
+                    sourceLanguage = sourceLanguage,
+                    targetLanguage = targetLanguage,
+                    provider = provider,
+                    glossary = glossary,
+                    onProgress = { completed, total, _ ->
+                        val fraction = if (total > 0) completed.toFloat() / total.toFloat() else 1f
+                        _translationStatus.value = TranslationJobStatus.Running(
+                            progress = fraction,
+                            completedBatches = completed,
+                            totalBatches = total,
+                            phaseLabel = "ترجمة الدفعة $completed من $total..."
+                        )
+                    }
+                )
+                _translationStatus.value = TranslationJobStatus.Completed(
+                    pairs = translatedPairs,
+                    targetLanguage = targetLanguage,
+                    summaryMessage = "تمت ترجمة ${translatedPairs.size} جملة إلى ${targetLanguage.arabicName} بنجاح."
+                )
+            }
+
+            SubtitleSourceMode.VIDEO_AUDIO_EXTRACTION -> {
+                _translationStatus.value = TranslationJobStatus.Running(
+                    progress = 0.15f,
+                    completedBatches = 0,
+                    totalBatches = 3,
+                    phaseLabel = "جاري استخراج مسار الصوت محليًا من الفيديو..."
+                )
+                val extractedAudio = AudioTrackExtractor.extractAudioWithMetadataToTempM4a(context, videoUri)
+                val tempAudio = extractedAudio.file
+                try {
+                    _translationStatus.value = TranslationJobStatus.Running(
+                        progress = 0.55f,
+                        completedBatches = 1,
+                        totalBatches = 3,
+                        phaseLabel = "جاري النسخ النصي وترجمة الحوارات عبر الخادم الآمن..."
+                    )
+                    val pairs = provider.transcribeAndTranslateAudio(
+                        audioFile = tempAudio,
+                        sourceLanguage = sourceLanguage,
+                        targetLanguage = targetLanguage
+                    ).map {
+                        it.copy(translatedText = ContextAwareDialogueTranslator.formatSubtitleLines(it.translatedText))
+                    }
+                    val capNotice = if (extractedAudio.wasTruncatedAtSizeCap) {
+                        "\nملاحظة: تم الاكتفاء بأول 18 ميجابايت من مسار الصوت نظرًا لحد الرفع السحابي."
+                    } else {
+                        ""
+                    }
+                    _translationStatus.value = TranslationJobStatus.Completed(
+                        pairs = pairs,
+                        targetLanguage = targetLanguage,
+                        summaryMessage = "تم توليد وترجمة ${pairs.size} جملة من الصوت إلى ${targetLanguage.arabicName}.$capNotice"
+                    )
+                } finally {
+                    tempAudio.delete()
+                }
             }
         }
     }

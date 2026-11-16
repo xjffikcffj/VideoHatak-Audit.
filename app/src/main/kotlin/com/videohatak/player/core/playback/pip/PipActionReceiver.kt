@@ -18,12 +18,10 @@ class PipActionReceiver : BroadcastReceiver() {
                 manager.togglePlayPause()
             }
             PipHelper.ACTION_PIP_FORWARD -> {
-                val current = manager.exoPlayer.currentPosition
-                manager.seekTo(current + 10_000L)
+                manager.seekForward()
             }
             PipHelper.ACTION_PIP_REPLAY -> {
-                val current = manager.exoPlayer.currentPosition
-                manager.seekTo((current - 10_000L).coerceAtLeast(0L))
+                manager.seekBackward()
             }
         }
     }

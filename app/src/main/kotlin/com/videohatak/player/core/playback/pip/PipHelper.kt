@@ -41,7 +41,8 @@ class PipHelper(private val context: Context) {
             activity: Activity,
             videoWidth: Int = 1920,
             videoHeight: Int = 1080,
-            isPlaying: Boolean = true
+            isPlaying: Boolean = true,
+            seekIntervalSeconds: Int = 10
         ): Boolean {
             if (!isPipSupported(activity) || activity.isFinishing ||
                 (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1 && activity.isDestroyed)
@@ -54,7 +55,7 @@ class PipHelper(private val context: Context) {
                     val ratio = getValidAspectRatio(videoWidth, videoHeight)
                     val params = PictureInPictureParams.Builder()
                         .setAspectRatio(ratio)
-                        .setActions(buildActions(activity, isPlaying))
+                        .setActions(buildActions(activity, isPlaying, seekIntervalSeconds))
                         .build()
                     activity.enterPictureInPictureMode(params)
                 } else {
@@ -65,20 +66,24 @@ class PipHelper(private val context: Context) {
             }
         }
 
-        fun buildActions(context: Context, isPlaying: Boolean): List<RemoteAction> {
+        fun buildActions(
+            context: Context,
+            isPlaying: Boolean,
+            seekIntervalSeconds: Int = 10
+        ): List<RemoteAction> {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return emptyList()
 
             val actions = mutableListOf<RemoteAction>()
 
-            // Replay 10s
+            // Replay Xs
             val replayIntent = Intent(context, PipActionReceiver::class.java).apply {
                 action = ACTION_PIP_REPLAY
             }
             actions.add(
                 RemoteAction(
                     Icon.createWithResource(context, android.R.drawable.ic_media_rew),
-                    "ترجيع 10ث",
-                    "ترجيع 10 ثوان",
+                    "ترجيع ${seekIntervalSeconds}ث",
+                    "ترجيع $seekIntervalSeconds ثوان",
                     PendingIntent.getBroadcast(
                         context,
                         101,
@@ -107,15 +112,15 @@ class PipHelper(private val context: Context) {
                 )
             )
 
-            // Forward 10s
+            // Forward Xs
             val forwardIntent = Intent(context, PipActionReceiver::class.java).apply {
                 action = ACTION_PIP_FORWARD
             }
             actions.add(
                 RemoteAction(
                     Icon.createWithResource(context, android.R.drawable.ic_media_ff),
-                    "تقديم 10ث",
-                    "تقديم 10 ثوان",
+                    "تقديم ${seekIntervalSeconds}ث",
+                    "تقديم $seekIntervalSeconds ثوان",
                     PendingIntent.getBroadcast(
                         context,
                         103,
@@ -131,17 +136,26 @@ class PipHelper(private val context: Context) {
 
     fun isPipSupported(): Boolean = isPipSupported(context)
 
-    fun enterPip(activity: Activity, isPlaying: Boolean, videoAspectRatio: Rational? = null): Boolean {
+    fun enterPip(
+        activity: Activity,
+        isPlaying: Boolean,
+        videoAspectRatio: Rational? = null,
+        seekIntervalSeconds: Int = 10
+    ): Boolean {
         val w = videoAspectRatio?.numerator ?: 16
         val h = videoAspectRatio?.denominator ?: 9
-        return enterPip(activity, w, h, isPlaying)
+        return enterPip(activity, w, h, isPlaying, seekIntervalSeconds)
     }
 
-    fun updatePipActions(activity: Activity, isPlaying: Boolean) {
+    fun updatePipActions(
+        activity: Activity,
+        isPlaying: Boolean,
+        seekIntervalSeconds: Int = 10
+    ) {
         if (!isPipSupported() || Build.VERSION.SDK_INT < Build.VERSION_CODES.O || activity.isFinishing) return
         try {
             val params = PictureInPictureParams.Builder()
-                .setActions(buildActions(context, isPlaying))
+                .setActions(buildActions(context, isPlaying, seekIntervalSeconds))
                 .build()
             activity.setPictureInPictureParams(params)
         } catch (_: Exception) {}

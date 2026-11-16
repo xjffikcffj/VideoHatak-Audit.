@@ -14,6 +14,7 @@ import android.os.Looper
 import android.provider.MediaStore
 import android.view.PixelCopy
 import android.view.SurfaceView
+import android.view.TextureView
 import android.view.WindowManager
 import androidx.media3.ui.PlayerView
 import kotlinx.coroutines.Dispatchers
@@ -71,7 +72,7 @@ object FrameCaptureHelper {
             return FrameCaptureResult.Error("التقاط اللقطات معطّل للمحتوى المحمي بحقوق النشر (DRM)")
         }
 
-        val capturedBitmap = captureFromSurfaceView(playerView)
+        val capturedBitmap = captureFromVideoSurface(playerView)
             ?: withContext(Dispatchers.IO) {
                 extractFromMediaRetriever(context, videoUri, positionMs)
             }
@@ -160,9 +161,19 @@ object FrameCaptureHelper {
         }
     }
 
-    private suspend fun captureFromSurfaceView(playerView: PlayerView?): Bitmap? {
+    private suspend fun captureFromVideoSurface(playerView: PlayerView?): Bitmap? {
+        val videoView = playerView?.videoSurfaceView ?: return null
+        if (videoView is TextureView) {
+            return withContext(Dispatchers.Main) {
+                if (videoView.isAvailable && videoView.width > 0 && videoView.height > 0) {
+                    runCatching { videoView.bitmap }.getOrNull()
+                } else {
+                    null
+                }
+            }
+        }
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return null
-        val surfaceView = playerView?.videoSurfaceView as? SurfaceView ?: return null
+        val surfaceView = videoView as? SurfaceView ?: return null
         if (!surfaceView.holder.surface.isValid || surfaceView.width <= 0 || surfaceView.height <= 0) {
             return null
         }

@@ -24,6 +24,7 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Shuffle
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
@@ -42,6 +43,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.videohatak.player.core.designsystem.component.VideoHatakTopBar
+import com.videohatak.player.core.designsystem.theme.LocalVideoHatakPalette
 import com.videohatak.player.core.playlist.model.Playlist
 import com.videohatak.player.core.playlist.model.PlaylistItem
 
@@ -54,22 +56,24 @@ fun PlaylistDetailScreen(
     onPlayAll: (List<PlaylistItem>) -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val palette = LocalVideoHatakPalette.current
     val items by viewModel.currentPlaylistItems.collectAsStateWithLifecycle()
     val missingCount = items.count { it.isMissing }
 
     Scaffold(
+        containerColor = palette.background,
         topBar = {
             VideoHatakTopBar(
                 title = playlist.name,
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "رجوع")
+                        Icon(Icons.Default.ArrowBack, contentDescription = "رجوع", tint = palette.accent)
                     }
                 },
                 actions = {
                     if (missingCount > 0) {
                         IconButton(onClick = { viewModel.relinkMissingItems(playlist.id) }) {
-                            Icon(Icons.Default.Refresh, contentDescription = "إعادة ربط العناصر المفقودة")
+                            Icon(Icons.Default.Refresh, contentDescription = "إعادة ربط العناصر المفقودة", tint = palette.accent)
                         }
                     }
                 }
@@ -92,11 +96,15 @@ fun PlaylistDetailScreen(
                 Button(
                     onClick = { if (items.isNotEmpty()) onPlayAll(items) },
                     modifier = Modifier.weight(1f),
-                    shape = RoundedCornerShape(8.dp)
+                    shape = RoundedCornerShape(10.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = palette.accent,
+                        contentColor = MaterialTheme.colorScheme.onPrimary
+                    )
                 ) {
                     Icon(Icons.Default.PlayArrow, contentDescription = null)
                     Spacer(modifier = Modifier.width(8.dp))
-                    Text("تشغيل الكل (${items.size})")
+                    Text("تشغيل الكل (${items.size})", fontWeight = FontWeight.Bold)
                 }
 
                 Spacer(modifier = Modifier.width(8.dp))
@@ -105,7 +113,7 @@ fun PlaylistDetailScreen(
                     Icon(
                         Icons.Default.Shuffle,
                         contentDescription = "تشغيل عشوائي",
-                        tint = MaterialTheme.colorScheme.primary
+                        tint = palette.accent
                     )
                 }
             }
@@ -115,20 +123,20 @@ fun PlaylistDetailScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(horizontal = 16.dp, vertical = 4.dp)
-                        .background(MaterialTheme.colorScheme.errorContainer, RoundedCornerShape(8.dp))
+                        .background(MaterialTheme.colorScheme.error.copy(alpha = 0.14f), RoundedCornerShape(8.dp))
                         .padding(horizontal = 12.dp, vertical = 8.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Icon(
                         Icons.Default.Warning,
                         contentDescription = null,
-                        tint = MaterialTheme.colorScheme.onErrorContainer
+                        tint = MaterialTheme.colorScheme.error
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
                         text = "يوجد $missingCount فيديو مفقود أو تم نقله. اضغط تحديث للمطابقة الذكية.",
                         style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onErrorContainer,
+                        color = MaterialTheme.colorScheme.error,
                         modifier = Modifier.weight(1f)
                     )
                 }
@@ -158,14 +166,15 @@ private fun PlaylistItemRow(
     onDelete: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val palette = LocalVideoHatakPalette.current
     Card(
         modifier = modifier
             .fillMaxWidth()
             .clickable(onClick = onClick, enabled = !item.isMissing),
-        shape = RoundedCornerShape(8.dp),
+        shape = RoundedCornerShape(10.dp),
         colors = CardDefaults.cardColors(
-            containerColor = if (item.isMissing) MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
-            else MaterialTheme.colorScheme.surface
+            containerColor = if (item.isMissing) palette.surfaceElevated.copy(alpha = 0.5f)
+            else palette.surface
         )
     ) {
         Row(
@@ -177,14 +186,14 @@ private fun PlaylistItemRow(
             Box(
                 modifier = Modifier
                     .size(width = 80.dp, height = 50.dp)
-                    .clip(RoundedCornerShape(6.dp))
-                    .background(MaterialTheme.colorScheme.surfaceVariant),
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(palette.surfaceElevated),
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
                     imageVector = if (item.isMissing) Icons.Default.Warning else Icons.Default.PlayArrow,
                     contentDescription = null,
-                    tint = if (item.isMissing) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
+                    tint = if (item.isMissing) MaterialTheme.colorScheme.error else palette.accent
                 )
             }
 
@@ -197,13 +206,13 @@ private fun PlaylistItemRow(
                     fontWeight = FontWeight.SemiBold,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
-                    color = if (item.isMissing) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface
+                    color = if (item.isMissing) MaterialTheme.colorScheme.error else palette.onSurface
                 )
                 Spacer(modifier = Modifier.height(2.dp))
                 Text(
                     text = if (item.isMissing) "الملف مفقود" else formatDuration(item.durationMs),
                     style = MaterialTheme.typography.bodySmall,
-                    color = if (item.isMissing) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
+                    color = if (item.isMissing) MaterialTheme.colorScheme.error else palette.onSurfaceMuted
                 )
             }
 
@@ -211,7 +220,7 @@ private fun PlaylistItemRow(
                 Icon(
                     Icons.Default.Delete,
                     contentDescription = "إزالة من القائمة",
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                    tint = MaterialTheme.colorScheme.error
                 )
             }
         }

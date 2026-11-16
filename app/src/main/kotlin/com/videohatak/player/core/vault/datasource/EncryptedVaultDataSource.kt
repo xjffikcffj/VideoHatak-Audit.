@@ -14,6 +14,7 @@ import com.videohatak.player.core.vault.repository.VaultRepository
 import com.videohatak.player.core.vault.repository.VaultRepositoryImpl
 import java.io.File
 import java.io.FileInputStream
+import java.io.IOException
 import java.io.InputStream
 import java.io.RandomAccessFile
 import javax.crypto.Cipher
@@ -121,11 +122,12 @@ class EncryptedVaultDataSource(
                 }
             }
 
+            val expectedLegacyBytes = vaultVideo.originalSizeBytes.takeIf { it > 0L } ?: vaultVideo.encryptedSizeBytes
             legacyInputStream = decryptedStream
             bytesRemaining = if (dataSpec.length != C.LENGTH_UNSET.toLong()) {
                 dataSpec.length
             } else {
-                (vaultVideo.encryptedSizeBytes - dataSpec.position).coerceAtLeast(0L)
+                (expectedLegacyBytes - dataSpec.position).coerceAtLeast(0L)
             }
         }
 
@@ -204,28 +206,46 @@ class EncryptedVaultDataSource(
         dek: SecretKey,
         targetChunk: Int
     ): ByteArray {
+        if (targetChunk < 0) {
+            throw IOException("Invalid chunk index: $targetChunk")
+        }
+        val maxValidEncSize = header.chunkSize + 1024
         val fullChunkTotalBytes = 4L + header.chunkSize + 16L
         val estimatedOffset = header.headerSize.toLong() + targetChunk.toLong() * fullChunkTotalBytes
 
-        val encBytes: ByteArray = if (estimatedOffset + 4 <= raf.length()) {
+        var encBytes: ByteArray? = null
+        if (estimatedOffset >= header.headerSize.toLong() && estimatedOffset + 4 <= raf.length()) {
             raf.seek(estimatedOffset)
-            val encSize = raf.readInt()
-            val bytes = ByteArray(encSize)
-            raf.readFully(bytes)
-            bytes
-        } else {
+            val probeSize = raf.readInt()
+            if (probeSize in 1..maxValidEncSize && raf.filePointer + probeSize <= raf.length()) {
+                val bytes = ByteArray(probeSize)
+                raf.readFully(bytes)
+                encBytes = bytes
+            }
+        }
+
+        if (encBytes == null) {
             // Sequential seek fallback for non-uniform chunk boundaries
             raf.seek(header.headerSize.toLong())
             var currentIdx = 0
             while (currentIdx < targetChunk) {
                 val size = raf.readInt()
-                raf.skipBytes(size)
+                if (size !in 1..maxValidEncSize) {
+                    throw IOException("Corrupted encrypted chunk size: $size")
+                }
+                val skipped = raf.skipBytes(size)
+                if (skipped != size) {
+                    throw IOException("Unexpected EOF while seeking encrypted chunk $targetChunk")
+                }
                 currentIdx++
             }
             val encSize = raf.readInt()
+            if (encSize !in 1..maxValidEncSize) {
+                throw IOException("Corrupted encrypted chunk size: $encSize")
+            }
             val bytes = ByteArray(encSize)
             raf.readFully(bytes)
-            bytes
+            encBytes = bytes
         }
 
         val nonce = cryptoManager.deriveChunkNonce(header.fileSalt, targetChunk)
@@ -271,8 +291,10 @@ class EncryptedVaultDataSource(
             randomAccessFile?.close()
         } catch (_: Exception) {}
 
-        // Memory hygiene: Zero out cached decrypted bytes
+        // Memory hygiene: Zero out cached decrypted bytes and DEK references
         cachedChunk?.let { java.util.Arrays.fill(it, 0.toByte()) }
+        runCatching { dataEncryptionKey?.encoded?.let { cryptoManager.zeroByteArray(it) } }
+        runCatching { dataEncryptionKey?.destroy() }
 
         legacyInputStream = null
         randomAccessFile = null

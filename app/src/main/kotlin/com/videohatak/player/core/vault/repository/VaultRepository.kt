@@ -3,6 +3,7 @@ package com.videohatak.player.core.vault.repository
 import android.content.Context
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.os.StatFs
 import android.provider.OpenableColumns
 import com.videohatak.player.core.vault.crypto.VaultBase64
 import com.videohatak.player.core.vault.crypto.VaultCryptoManager
@@ -19,6 +20,7 @@ import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
 import java.io.InputStream
+import java.security.MessageDigest
 import java.util.UUID
 
 interface VaultRepository {
@@ -130,13 +132,85 @@ class VaultRepositoryImpl internal constructor(
         _vaultVideos.update { decoded }
     }
 
-    private fun encodeMetadata(displayName: String, internalFileName: String, mimeType: String): String {
+    private fun computeSourceFingerprint(sourceUri: Uri): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest(sourceUri.toString().toByteArray(Charsets.UTF_8))
+        return digest.joinToString("") { "%02x".format(it) }
+    }
+
+    private fun encodeMetadata(
+        displayName: String,
+        internalFileName: String,
+        mimeType: String,
+        sourceFingerprint: String = ""
+    ): String {
         val json = JSONObject().apply {
             put("title", displayName)
             put("file", internalFileName)
             put("mime", mimeType)
+            if (sourceFingerprint.isNotBlank()) {
+                put("src", sourceFingerprint)
+            }
         }
         return cryptoManager.encryptMetadata(json.toString())
+    }
+
+    private fun isDuplicateInVault(
+        sourceFingerprint: String,
+        resolvedName: String,
+        estimatedSize: Long,
+        durationMs: Long
+    ): Boolean {
+        val rows = dbHelper.getAllVideos()
+        for (row in rows) {
+            val encMeta = row.encryptedMetaBase64
+            if (!encMeta.isNullOrBlank()) {
+                try {
+                    val json = JSONObject(cryptoManager.decryptMetadata(encMeta))
+                    val storedSrc = json.optString("src")
+                    if (storedSrc.isNotBlank() && storedSrc == sourceFingerprint) {
+                        return true
+                    }
+                    val storedTitle = json.optString("title")
+                    if (estimatedSize > 0L &&
+                        row.originalSizeBytes == estimatedSize &&
+                        row.durationMs == durationMs &&
+                        storedTitle.equals(resolvedName, ignoreCase = true)
+                    ) {
+                        return true
+                    }
+                } catch (_: Exception) {
+                }
+            }
+        }
+        return false
+    }
+
+    private fun hasEnoughStorageForEncryption(estimatedSize: Long): Boolean {
+        if (estimatedSize <= 0L) return true
+        return try {
+            val stat = StatFs(vaultDir.absolutePath)
+            val available = stat.availableBytes
+            val required = estimatedSize + (estimatedSize / 10L) + (8L * 1024L * 1024L)
+            available >= required
+        } catch (_: Exception) {
+            true
+        }
+    }
+
+    private fun verifyEncryptedOutputIntegrity(destFile: File) {
+        if (!destFile.exists() || destFile.length() <= 0L) {
+            throw IllegalStateException("Encrypted vault file verification failed")
+        }
+        val header = cryptoManager.parseEncryptedFileHeader(destFile)
+        val aad = cryptoManager.buildHeaderAad(
+            VaultCryptoManager.MAGIC_HEADER,
+            header.fileSalt,
+            header.chunkSize,
+            header.plaintextSizeBytes
+        )
+        val dek = cryptoManager.unwrapDataKeyWithFallback(header.encryptedDek, aad)
+        cryptoManager.zeroByteArray(dek.encoded)
     }
 
     private fun decodeVaultRow(row: VaultVideo): VaultVideo? {
@@ -192,8 +266,22 @@ class VaultRepositoryImpl internal constructor(
         val fileName = "$uniqueName.enc"
         val destFile = File(vaultDir, fileName)
         val resolvedName = displayName?.ifBlank { null } ?: queryFileName(sourceUri) ?: "$uniqueName.mp4"
+        val sourceFingerprint = computeSourceFingerprint(sourceUri)
 
         val metadata = probeVideoMetadata(sourceUri)
+        val estimatedSize = try {
+            context.contentResolver.openFileDescriptor(sourceUri, "r")?.use { it.statSize } ?: 0L
+        } catch (_: Exception) { 0L }
+
+        if (isDuplicateInVault(sourceFingerprint, resolvedName, estimatedSize, metadata.durationMs)) {
+            _vaultError.value = "هذا الفيديو مضاف مسبقًا داخل الخزنة المشفرة"
+            return@withContext null
+        }
+
+        if (!hasEnoughStorageForEncryption(estimatedSize)) {
+            _vaultError.value = "المساحة التخزينية غير كافية لتشفير هذا الفيديو بأمان"
+            return@withContext null
+        }
 
         val inputStream: InputStream? = try {
             context.contentResolver.openInputStream(sourceUri)
@@ -201,11 +289,10 @@ class VaultRepositoryImpl internal constructor(
             null
         }
 
-        if (inputStream == null) return@withContext null
-
-        val estimatedSize = try {
-            context.contentResolver.openFileDescriptor(sourceUri, "r")?.use { it.statSize } ?: 0L
-        } catch (_: Exception) { 0L }
+        if (inputStream == null) {
+            _vaultError.value = "تعذر فتح ملف الفيديو للقراءة والتشفير"
+            return@withContext null
+        }
 
         try {
             val encResult = inputStream.use { input ->
@@ -218,11 +305,9 @@ class VaultRepositoryImpl internal constructor(
                 )
             }
 
-            if (!destFile.exists() || destFile.length() <= 0L) {
-                throw IllegalStateException("Encrypted vault file verification failed")
-            }
+            verifyEncryptedOutputIntegrity(destFile)
 
-            val encryptedMeta = encodeMetadata(resolvedName, fileName, metadata.mimeType)
+            val encryptedMeta = encodeMetadata(resolvedName, fileName, metadata.mimeType, sourceFingerprint)
             val ivBase64 = VaultBase64.encodeNoWrap(encResult.encryptedDek)
             val dbRow = VaultVideo(
                 id = 0L,
@@ -243,6 +328,7 @@ class VaultRepositoryImpl internal constructor(
             if (newId <= 0L) {
                 throw IllegalStateException("Failed to persist vault record")
             }
+            _vaultError.value = null
             val savedVideo = dbRow.copy(
                 id = newId,
                 displayName = resolvedName,
@@ -252,9 +338,12 @@ class VaultRepositoryImpl internal constructor(
             recordActivity()
             refresh()
             savedVideo
-        } catch (_: Exception) {
+        } catch (e: Exception) {
             if (destFile.exists()) {
                 destFile.delete()
+            }
+            if (e !is InterruptedException) {
+                _vaultError.value = "فشل تشفير الفيديو إلى الخزنة: بقي الملف الأصلي سليمًا في مكانه"
             }
             null
         }

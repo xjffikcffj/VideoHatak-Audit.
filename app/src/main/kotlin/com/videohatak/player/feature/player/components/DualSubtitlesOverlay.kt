@@ -10,7 +10,9 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.videohatak.player.core.subtitle.model.SubtitleCue
@@ -46,7 +48,8 @@ fun DualSubtitlesOverlay(
                         text = secondaryText,
                         fontSize = secondaryStyle.fontSizeSp.sp,
                         color = secondaryStyle.textColor,
-                        textAlign = TextAlign.Center
+                        textAlign = TextAlign.Center,
+                        style = TextStyle(textDirection = TextDirection.Content)
                     )
                 }
             }
@@ -64,7 +67,8 @@ fun DualSubtitlesOverlay(
                         text = primaryText,
                         fontSize = primaryStyle.fontSizeSp.sp,
                         color = primaryStyle.textColor,
-                        textAlign = TextAlign.Center
+                        textAlign = TextAlign.Center,
+                        style = TextStyle(textDirection = TextDirection.Content)
                     )
                 }
             }

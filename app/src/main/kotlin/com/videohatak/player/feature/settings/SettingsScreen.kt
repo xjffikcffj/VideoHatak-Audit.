@@ -1,5 +1,8 @@
 package com.videohatak.player.feature.settings
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -26,6 +29,9 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.ChevronLeft
 import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.FastForward
 import androidx.compose.material.icons.filled.FileDownload
 import androidx.compose.material.icons.filled.FileUpload
 import androidx.compose.material.icons.filled.LightMode
@@ -37,6 +43,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -45,6 +52,11 @@ import androidx.compose.material3.RadioButtonDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -63,9 +75,48 @@ import com.videohatak.player.core.designsystem.theme.LocalVideoHatakPalette
 import com.videohatak.player.core.designsystem.theme.ThemeMode
 import com.videohatak.player.core.designsystem.theme.paletteForTheme
 import com.videohatak.player.core.playback.PlaybackMode
+import com.videohatak.player.core.playback.PlaybackPreferencesRepository
 import com.videohatak.player.core.playback.ResumeMode
 import kotlin.math.PI
 import kotlin.math.sin
+
+enum class SettingsSectionId {
+    THEMES,
+    THEME_MODE,
+    SEEK_INTERVAL,
+    RESUME_MODE,
+    PLAYBACK_MODE,
+    PRIVACY_VAULT,
+    BACKUP
+}
+
+/**
+ * Pure state holder for Settings accordion sections.
+ * All sections start collapsed (`false`) by default and toggle independently.
+ */
+class SettingsAccordionState(
+    initiallyExpanded: Set<SettingsSectionId> = emptySet()
+) {
+    private val expandedMap = mutableStateMapOf<SettingsSectionId, Boolean>().apply {
+        SettingsSectionId.entries.forEach { id ->
+            this[id] = id in initiallyExpanded
+        }
+    }
+
+    fun isExpanded(section: SettingsSectionId): Boolean = expandedMap[section] == true
+
+    fun toggle(section: SettingsSectionId) {
+        expandedMap[section] = !isExpanded(section)
+    }
+
+    fun setExpanded(section: SettingsSectionId, expanded: Boolean) {
+        expandedMap[section] = expanded
+    }
+
+    fun collapseAll() {
+        SettingsSectionId.entries.forEach { expandedMap[it] = false }
+    }
+}
 
 @Composable
 fun SettingsScreen(
@@ -87,25 +138,27 @@ fun SettingsScreen(
     onOpenTrashBin: () -> Unit = {},
     onExportBackup: () -> Unit = {},
     onImportBackup: () -> Unit = {},
+    seekIntervalSeconds: Int = PlaybackPreferencesRepository.DEFAULT_SEEK_INTERVAL_SECONDS,
+    onSelectSeekIntervalSeconds: (Int) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val palette = LocalVideoHatakPalette.current
+    val accordionState = remember { SettingsAccordionState() }
+
+    val themeModeLabel = when (themeMode) {
+        ThemeMode.SYSTEM -> "تلقائي"
+        ThemeMode.DARK -> "داكن"
+        ThemeMode.LIGHT -> "فاتح"
+    }
 
     LazyColumn(
         modifier = modifier.fillMaxSize(),
         contentPadding = PaddingValues(16.dp),
-        verticalArrangement = Arrangement.spacedBy(18.dp)
+        verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        // Section 1: 8 Luxury Themes Live Preview & Apply Selector
-        item {
-            SettingsSectionHeader(
-                icon = Icons.Default.Palette,
-                title = "المظاهر الفاخرة (8 ثيمات)",
-                subtitle = "اضغط على أي مظهر لمعاينته حيًا ثم اضغط «تطبيق الثيم» لاعتماده"
-            )
-            Spacer(modifier = Modifier.height(10.dp))
-
-            if (isThemePreviewActive) {
+        // Live Theme Preview Banner stays pinned above accordions when previewing
+        if (isThemePreviewActive) {
+            item(key = "theme_preview_banner") {
                 Surface(
                     shape = RoundedCornerShape(14.dp),
                     color = palette.surfaceElevated,
@@ -154,83 +207,123 @@ fun SettingsScreen(
                         }
                     }
                 }
-                Spacer(modifier = Modifier.height(10.dp))
             }
+        }
 
-            val themePairs = AppThemeId.entries.chunked(2)
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                themePairs.forEach { pair ->
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        pair.forEach { themeId ->
-                            ThemePreviewTile(
-                                themeId = themeId,
-                                isSelected = themeId == selectedTheme,
-                                isPreviewing = isThemePreviewActive && themeId == selectedTheme && themeId != persistedTheme,
-                                onClick = { onSelectTheme(themeId) },
-                                modifier = Modifier.weight(1f)
-                            )
-                        }
-                        if (pair.size == 1) {
-                            Spacer(modifier = Modifier.weight(1f))
+        // Section 1: 8 Luxury Themes
+        item(key = SettingsSectionId.THEMES.name) {
+            CollapsibleSettingsAccordionCard(
+                icon = Icons.Default.Palette,
+                title = "المظاهر الفاخرة (8 ثيمات)",
+                subtitle = "اختر المظهر الملكي المناسب وعاينه حيًا",
+                activeSummary = selectedTheme.displayName,
+                expanded = accordionState.isExpanded(SettingsSectionId.THEMES),
+                onToggle = { accordionState.toggle(SettingsSectionId.THEMES) }
+            ) {
+                val themePairs = AppThemeId.entries.chunked(2)
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    themePairs.forEach { pair ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            pair.forEach { themeId ->
+                                ThemePreviewTile(
+                                    themeId = themeId,
+                                    isSelected = themeId == selectedTheme,
+                                    isPreviewing = isThemePreviewActive && themeId == selectedTheme && themeId != persistedTheme,
+                                    onClick = { onSelectTheme(themeId) },
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
+                            if (pair.size == 1) {
+                                Spacer(modifier = Modifier.weight(1f))
+                            }
                         }
                     }
                 }
             }
         }
 
-        // Section 2: Light / Dark Mode Control (moved inside Settings)
-        item {
-            SettingsSectionHeader(
+        // Section 2: Theme Mode (Auto / Dark / Light)
+        item(key = SettingsSectionId.THEME_MODE.name) {
+            CollapsibleSettingsAccordionCard(
                 icon = Icons.Default.DarkMode,
                 title = "سطوع الواجهة",
-                subtitle = "التبديل بين الوضع الليلي والنهاري أو التلقائي"
-            )
-            Spacer(modifier = Modifier.height(8.dp))
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                subtitle = "التبديل بين الوضع الليلي والنهاري أو التلقائي",
+                activeSummary = themeModeLabel,
+                expanded = accordionState.isExpanded(SettingsSectionId.THEME_MODE),
+                onToggle = { accordionState.toggle(SettingsSectionId.THEME_MODE) }
             ) {
-                ThemeModeChip(
-                    label = "تلقائي",
-                    icon = Icons.Default.BrightnessAuto,
-                    selected = themeMode == ThemeMode.SYSTEM,
-                    onClick = { onSelectThemeMode(ThemeMode.SYSTEM) },
-                    modifier = Modifier.weight(1f)
-                )
-                ThemeModeChip(
-                    label = "داكن",
-                    icon = Icons.Default.DarkMode,
-                    selected = themeMode == ThemeMode.DARK,
-                    onClick = { onSelectThemeMode(ThemeMode.DARK) },
-                    modifier = Modifier.weight(1f)
-                )
-                ThemeModeChip(
-                    label = "فاتح",
-                    icon = Icons.Default.LightMode,
-                    selected = themeMode == ThemeMode.LIGHT,
-                    onClick = { onSelectThemeMode(ThemeMode.LIGHT) },
-                    modifier = Modifier.weight(1f)
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    ThemeModeChip(
+                        label = "تلقائي",
+                        icon = Icons.Default.BrightnessAuto,
+                        selected = themeMode == ThemeMode.SYSTEM,
+                        onClick = { onSelectThemeMode(ThemeMode.SYSTEM) },
+                        modifier = Modifier.weight(1f)
+                    )
+                    ThemeModeChip(
+                        label = "داكن",
+                        icon = Icons.Default.DarkMode,
+                        selected = themeMode == ThemeMode.DARK,
+                        onClick = { onSelectThemeMode(ThemeMode.DARK) },
+                        modifier = Modifier.weight(1f)
+                    )
+                    ThemeModeChip(
+                        label = "فاتح",
+                        icon = Icons.Default.LightMode,
+                        selected = themeMode == ThemeMode.LIGHT,
+                        onClick = { onSelectThemeMode(ThemeMode.LIGHT) },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
             }
         }
 
-        // Section 3: 3 Resume Playback Options
-        item {
-            SettingsSectionHeader(
+        // Section 3: Seek Interval (5 / 10 / 15 seconds)
+        item(key = SettingsSectionId.SEEK_INTERVAL.name) {
+            CollapsibleSettingsAccordionCard(
+                icon = Icons.Default.FastForward,
+                title = "مدة التقديم والتأخير",
+                subtitle = "تنطبق على النقر المزدوج وأزرار المشغّل والفقاعة العائمة",
+                activeSummary = "$seekIntervalSeconds ث",
+                expanded = accordionState.isExpanded(SettingsSectionId.SEEK_INTERVAL),
+                onToggle = { accordionState.toggle(SettingsSectionId.SEEK_INTERVAL) }
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    PlaybackPreferencesRepository.SUPPORTED_SEEK_INTERVALS_SECONDS.forEach { seconds ->
+                        val label = when (seconds) {
+                            5 -> "5 ثوانٍ"
+                            10 -> "10 ثوانٍ"
+                            else -> "15 ثانية"
+                        }
+                        SeekIntervalChip(
+                            label = label,
+                            selected = seekIntervalSeconds == seconds,
+                            onClick = { onSelectSeekIntervalSeconds(seconds) },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+            }
+        }
+
+        // Section 4: Resume Mode
+        item(key = SettingsSectionId.RESUME_MODE.name) {
+            CollapsibleSettingsAccordionCard(
                 icon = Icons.Default.Replay,
                 title = "سلوك استئناف التشغيل",
-                subtitle = "حدد كيف يبدأ الفيديو عند فتحه مرة أخرى"
-            )
-            Spacer(modifier = Modifier.height(8.dp))
-
-            Card(
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(containerColor = palette.surface),
-                border = BorderStroke(0.75.dp, palette.border.copy(alpha = 0.7f))
+                subtitle = "حدد كيف يبدأ الفيديو عند فتحه مرة أخرى",
+                activeSummary = resumeMode.titleArabic,
+                expanded = accordionState.isExpanded(SettingsSectionId.RESUME_MODE),
+                onToggle = { accordionState.toggle(SettingsSectionId.RESUME_MODE) }
             ) {
                 Column(modifier = Modifier.fillMaxWidth()) {
                     ResumeMode.entries.forEach { mode ->
@@ -245,19 +338,15 @@ fun SettingsScreen(
             }
         }
 
-        // Section 4: 5 Mutually Exclusive Playback Modes
-        item {
-            SettingsSectionHeader(
+        // Section 5: Playback Mode
+        item(key = SettingsSectionId.PLAYBACK_MODE.name) {
+            CollapsibleSettingsAccordionCard(
                 icon = Icons.Default.PlayCircle,
                 title = "أوضاع التشغيل التلقائي",
-                subtitle = "وضع واحد نشط في كل مرة — يُطبّق على المشغل وقوائم التشغيل"
-            )
-            Spacer(modifier = Modifier.height(8.dp))
-
-            Card(
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(containerColor = palette.surface),
-                border = BorderStroke(0.75.dp, palette.border.copy(alpha = 0.7f))
+                subtitle = "وضع واحد نشط في كل مرة — يُطبّق على المشغل وقوائم التشغيل",
+                activeSummary = playbackMode.titleArabic,
+                expanded = accordionState.isExpanded(SettingsSectionId.PLAYBACK_MODE),
+                onToggle = { accordionState.toggle(SettingsSectionId.PLAYBACK_MODE) }
             ) {
                 Column(modifier = Modifier.fillMaxWidth()) {
                     PlaybackMode.entries.forEach { mode ->
@@ -272,147 +361,136 @@ fun SettingsScreen(
             }
         }
 
-        // Section 5: Discreet Secure Vault Entry
-        item {
-            SettingsSectionHeader(
+        // Section 6: Privacy, Vault & Trash Bin
+        item(key = SettingsSectionId.PRIVACY_VAULT.name) {
+            CollapsibleSettingsAccordionCard(
                 icon = Icons.Default.Lock,
                 title = "الخصوصية والأمان",
-                subtitle = "مساحة معزولة ومشفرة لحفظ مقاطع الفيديو الخاصة"
-            )
-            Spacer(modifier = Modifier.height(8.dp))
-
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(16.dp))
-                    .clickable(onClick = onOpenVault),
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(containerColor = palette.surface),
-                border = BorderStroke(1.dp, palette.border)
+                subtitle = "الخزنة المشفرة AES-256-GCM وسلة المحذوفات",
+                activeSummary = "$vaultVideoCount خزنة • $trashVideoCount سلة",
+                expanded = accordionState.isExpanded(SettingsSectionId.PRIVACY_VAULT),
+                onToggle = { accordionState.toggle(SettingsSectionId.PRIVACY_VAULT) }
             ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(16.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Box(
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Surface(
                         modifier = Modifier
-                            .size(44.dp)
+                            .fillMaxWidth()
                             .clip(RoundedCornerShape(12.dp))
-                            .background(palette.accent.copy(alpha = 0.14f)),
-                        contentAlignment = Alignment.Center
+                            .clickable(onClick = onOpenVault),
+                        shape = RoundedCornerShape(12.dp),
+                        color = palette.surfaceElevated,
+                        border = BorderStroke(0.75.dp, palette.border)
                     ) {
-                        Icon(
-                            imageVector = Icons.Default.Lock,
-                            contentDescription = null,
-                            tint = palette.accent
-                        )
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(40.dp)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(palette.accent.copy(alpha = 0.14f)),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Lock,
+                                    contentDescription = null,
+                                    tint = palette.accent
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "الخزنة الخاصة المشفرة",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = palette.onSurface
+                                )
+                                Text(
+                                    text = "AES-256-GCM • محمية بالبصمة ($vaultVideoCount فيديو)",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = palette.onSurfaceMuted
+                                )
+                            }
+                            Icon(
+                                imageVector = Icons.Default.ChevronLeft,
+                                contentDescription = null,
+                                tint = palette.accent
+                            )
+                        }
                     }
 
-                    Spacer(modifier = Modifier.width(12.dp))
-
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "الخزنة الخاصة المشفرة",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold,
-                            color = palette.onSurface
-                        )
-                        Text(
-                            text = "AES-256-GCM • محمية بالبصمة ($vaultVideoCount فيديو)",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = palette.onSurfaceMuted
-                        )
-                    }
-
-                    Icon(
-                        imageVector = Icons.Default.ChevronLeft,
-                        contentDescription = null,
-                        tint = palette.accent
-                    )
-                }
-            }
-
-            Spacer(modifier = Modifier.height(12.dp))
-
-            // Trash Bin Entry
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(16.dp))
-                    .clickable(onClick = onOpenTrashBin),
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(containerColor = palette.surface),
-                border = BorderStroke(1.dp, palette.border)
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(16.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Box(
+                    Surface(
                         modifier = Modifier
-                            .size(44.dp)
+                            .fillMaxWidth()
                             .clip(RoundedCornerShape(12.dp))
-                            .background(palette.accent.copy(alpha = 0.14f)),
-                        contentAlignment = Alignment.Center
+                            .clickable(onClick = onOpenTrashBin),
+                        shape = RoundedCornerShape(12.dp),
+                        color = palette.surfaceElevated,
+                        border = BorderStroke(0.75.dp, palette.border)
                     ) {
-                        Icon(
-                            imageVector = Icons.Default.DeleteOutline,
-                            contentDescription = null,
-                            tint = palette.accent
-                        )
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(40.dp)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(palette.accent.copy(alpha = 0.14f)),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.DeleteOutline,
+                                    contentDescription = null,
+                                    tint = palette.accent
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "سلة المحذوفات",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = palette.onSurface
+                                )
+                                Text(
+                                    text = if (trashVideoCount == 0) "السلة فارغة" else "$trashVideoCount فيديو في انتظار الاستعادة أو الحذف النهائي",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = palette.onSurfaceMuted
+                                )
+                            }
+                            Icon(
+                                imageVector = Icons.Default.ChevronLeft,
+                                contentDescription = null,
+                                tint = palette.accent
+                            )
+                        }
                     }
-
-                    Spacer(modifier = Modifier.width(12.dp))
-
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "سلة المحذوفات",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold,
-                            color = palette.onSurface
-                        )
-                        Text(
-                            text = if (trashVideoCount == 0) "السلة فارغة" else "$trashVideoCount فيديو في انتظار الاستعادة أو الحذف النهائي",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = palette.onSurfaceMuted
-                        )
-                    }
-
-                    Icon(
-                        imageVector = Icons.Default.ChevronLeft,
-                        contentDescription = null,
-                        tint = palette.accent
-                    )
                 }
             }
         }
 
-        // Section 6: Backup & Restore (JSON + SAF)
-        item {
-            SettingsSectionHeader(
+        // Section 7: Backup & Restore
+        item(key = SettingsSectionId.BACKUP.name) {
+            CollapsibleSettingsAccordionCard(
                 icon = Icons.Default.Backup,
                 title = "النسخ الاحتياطي والاستعادة",
-                subtitle = "تصدير واستيراد الإعدادات والترجمة وقوائم التشغيل بصيغة JSON آمنة"
-            )
-            Spacer(modifier = Modifier.height(8.dp))
-
-            Card(
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(containerColor = palette.surface),
-                border = BorderStroke(0.75.dp, palette.border.copy(alpha = 0.7f))
+                subtitle = "تصدير واستيراد الإعدادات والترجمة وقوائم التشغيل بصيغة JSON آمنة",
+                activeSummary = "JSON + SHA-256",
+                expanded = accordionState.isExpanded(SettingsSectionId.BACKUP),
+                onToggle = { accordionState.toggle(SettingsSectionId.BACKUP) }
             ) {
                 Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(14.dp),
+                    modifier = Modifier.fillMaxWidth(),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     Text(
-                        text = "تشمل النسخة الاحتياطية: المظهر، أوضاع التشغيل والاستئناف، إعدادات الترجمة، مواضع التوقف المحفوظة، قوائم التشغيل ومهلة قفل الخزنة (مع بصمة SHA-256 للتحقق من سلامة الملف من التلف). لا تُصدّر الفيديوهات نفسها ولا سجل سلة المحذوفات ولا رموز PIN أو مفاتيح وملفات الخزنة المشفرة.",
+                        text = "تشمل النسخة الاحتياطية: المظهر، أوضاع التشغيل والاستئناف، مدة التقديم والتأخير، إعدادات الترجمة، مواضع التوقف المحفوظة، قوائم التشغيل ومهلة قفل الخزنة (مع بصمة SHA-256 للتحقق من سلامة الملف من التلف). لا تُصدّر الفيديوهات نفسها ولا سجل سلة المحذوفات ولا رموز PIN أو مفاتيح وملفات الخزنة المشفرة.",
                         style = MaterialTheme.typography.labelSmall,
                         color = palette.onSurfaceMuted
                     )
@@ -448,37 +526,149 @@ fun SettingsScreen(
                     }
                 }
             }
-            Spacer(modifier = Modifier.height(16.dp))
         }
     }
 }
 
 @Composable
-private fun SettingsSectionHeader(
+private fun CollapsibleSettingsAccordionCard(
     icon: ImageVector,
     title: String,
-    subtitle: String
+    subtitle: String,
+    activeSummary: String,
+    expanded: Boolean,
+    onToggle: () -> Unit,
+    content: @Composable () -> Unit
 ) {
     val palette = LocalVideoHatakPalette.current
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Icon(
-            imageVector = icon,
-            contentDescription = null,
-            tint = palette.accent,
-            modifier = Modifier.size(20.dp)
+
+    Card(
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = palette.surface),
+        border = BorderStroke(
+            width = if (expanded) 1.dp else 0.75.dp,
+            color = if (expanded) palette.accent.copy(alpha = 0.75f) else palette.border.copy(alpha = 0.65f)
+        ),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(onClick = onToggle)
+                    .padding(horizontal = 14.dp, vertical = 14.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(36.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(palette.accent.copy(alpha = 0.14f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = icon,
+                        contentDescription = null,
+                        tint = palette.accent,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+
+                Spacer(modifier = Modifier.width(10.dp))
+
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = title,
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = palette.onSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = subtitle,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = palette.onSurfaceMuted,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+
+                Spacer(modifier = Modifier.width(8.dp))
+
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = palette.accent.copy(alpha = 0.14f)
+                ) {
+                    Text(
+                        text = activeSummary,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = palette.accent,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                    )
+                }
+
+                Spacer(modifier = Modifier.width(6.dp))
+
+                Icon(
+                    imageVector = if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                    contentDescription = if (expanded) "طي القسم" else "توسيع القسم",
+                    tint = palette.onSurfaceMuted
+                )
+            }
+
+            AnimatedVisibility(
+                visible = expanded,
+                enter = expandVertically(),
+                exit = shrinkVertically()
+            ) {
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    HorizontalDivider(color = palette.border.copy(alpha = 0.5f))
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(14.dp)
+                    ) {
+                        content()
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SeekIntervalChip(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val palette = LocalVideoHatakPalette.current
+    Surface(
+        modifier = modifier
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick),
+        shape = RoundedCornerShape(12.dp),
+        color = if (selected) palette.accent.copy(alpha = 0.18f) else palette.surfaceElevated,
+        border = BorderStroke(
+            width = if (selected) 1.5.dp else 0.75.dp,
+            color = if (selected) palette.accent else palette.border.copy(alpha = 0.65f)
         )
-        Spacer(modifier = Modifier.width(8.dp))
-        Column {
+    ) {
+        Box(
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 12.dp),
+            contentAlignment = Alignment.Center
+        ) {
             Text(
-                text = title,
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold,
-                color = palette.onSurface
-            )
-            Text(
-                text = subtitle,
-                style = MaterialTheme.typography.labelMedium,
-                color = palette.onSurfaceMuted
+                text = label,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                color = if (selected) palette.accent else palette.onSurface,
+                maxLines = 1
             )
         }
     }
@@ -560,7 +750,6 @@ private fun ThemePreviewTile(
 
             Spacer(modifier = Modifier.height(10.dp))
 
-            // Mini live Wavy SeekBar preview in the theme's signature glow color
             Canvas(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -641,7 +830,7 @@ private fun ThemeModeChip(
             .clip(RoundedCornerShape(12.dp))
             .clickable(onClick = onClick),
         shape = RoundedCornerShape(12.dp),
-        color = if (selected) palette.accent.copy(alpha = 0.16f) else palette.surface,
+        color = if (selected) palette.accent.copy(alpha = 0.16f) else palette.surfaceElevated,
         border = BorderStroke(
             width = if (selected) 1.5.dp else 0.75.dp,
             color = if (selected) palette.accent else palette.border.copy(alpha = 0.6f)
@@ -681,7 +870,7 @@ private fun SettingsRadioOptionRow(
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick)
-            .padding(horizontal = 14.dp, vertical = 10.dp),
+            .padding(horizontal = 8.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         RadioButton(

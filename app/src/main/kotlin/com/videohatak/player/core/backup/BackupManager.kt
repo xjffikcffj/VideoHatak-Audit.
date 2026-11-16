@@ -32,7 +32,8 @@ data class BackupSettingsData(
     val playbackSpeed: Float,
     val resizeMode: Int,
     val playbackMode: PlaybackMode,
-    val resumeMode: ResumeMode
+    val resumeMode: ResumeMode,
+    val seekIntervalSeconds: Int = PlaybackPreferencesRepository.DEFAULT_SEEK_INTERVAL_SECONDS
 )
 
 data class BackupSubtitleData(
@@ -176,6 +177,9 @@ class BackupManager internal constructor(
         val resizeMode = VideoResizeMode.fromCode(playbackRepository.resizeMode.first()).storageCode
         val playbackMode = playbackRepository.playbackMode.first()
         val resumeMode = playbackRepository.resumeMode.first()
+        val seekIntervalSeconds = PlaybackPreferencesRepository.sanitizeSeekIntervalSeconds(
+            playbackRepository.seekIntervalSeconds.first()
+        )
 
         val primarySub = subtitleRepository.primaryStyle.first()
         val secondarySub = subtitleRepository.secondaryStyle.first()
@@ -212,7 +216,8 @@ class BackupManager internal constructor(
                 playbackSpeed = playbackSpeed,
                 resizeMode = resizeMode,
                 playbackMode = playbackMode,
-                resumeMode = resumeMode
+                resumeMode = resumeMode,
+                seekIntervalSeconds = seekIntervalSeconds
             ),
             subtitles = BackupSubtitleData(
                 primaryFontSizeSp = primarySub.fontSizeSp,
@@ -267,6 +272,9 @@ class BackupManager internal constructor(
             playbackRepository.setResizeMode(VideoResizeMode.fromCode(payload.settings.resizeMode).storageCode)
             playbackRepository.setPlaybackMode(payload.settings.playbackMode)
             playbackRepository.setResumeMode(payload.settings.resumeMode)
+            playbackRepository.setSeekIntervalSeconds(
+                PlaybackPreferencesRepository.sanitizeSeekIntervalSeconds(payload.settings.seekIntervalSeconds)
+            )
             playbackRepository.replaceSavedPositions(payload.resumePositions)
 
             subtitleRepository.updatePrimaryFontSize(payload.subtitles.primaryFontSizeSp.coerceIn(12f, 36f))
@@ -281,6 +289,7 @@ class BackupManager internal constructor(
                 playbackRepository.setResizeMode(previousSnapshot.settings.resizeMode)
                 playbackRepository.setPlaybackMode(previousSnapshot.settings.playbackMode)
                 playbackRepository.setResumeMode(previousSnapshot.settings.resumeMode)
+                playbackRepository.setSeekIntervalSeconds(previousSnapshot.settings.seekIntervalSeconds)
                 playbackRepository.replaceSavedPositions(previousSnapshot.resumePositions)
                 subtitleRepository.updatePrimaryFontSize(previousSnapshot.subtitles.primaryFontSizeSp)
                 subtitleRepository.updateSecondaryFontSize(previousSnapshot.subtitles.secondaryFontSizeSp)
@@ -293,8 +302,8 @@ class BackupManager internal constructor(
     }
 
     companion object {
-        const val SCHEMA_VERSION = 2
-        val SUPPORTED_SCHEMA_VERSIONS = setOf(1, 2)
+        const val SCHEMA_VERSION = 3
+        val SUPPORTED_SCHEMA_VERSIONS = setOf(1, 2, 3)
 
         internal fun createForTesting(
             themeRepository: ThemePreferencesRepository,
@@ -393,6 +402,11 @@ class BackupManager internal constructor(
             val resumeMode = ResumeMode.entries.firstOrNull { it.name == resumeModeName }
                 ?: return BackupParseResult.Error("وضع استئناف غير معروف")
 
+            val rawSeekInterval = (settingsMap["seekIntervalSeconds"] as? Number)?.toInt()
+            val seekIntervalSeconds = PlaybackPreferencesRepository.sanitizeSeekIntervalSeconds(
+                rawSeekInterval ?: PlaybackPreferencesRepository.DEFAULT_SEEK_INTERVAL_SECONDS
+            )
+
             val primarySubSize = (subtitlesMap["primaryFontSizeSp"] as? Number)?.toFloat()?.coerceIn(12f, 36f)
                 ?: 18f
             val secondarySubSize = (subtitlesMap["secondaryFontSizeSp"] as? Number)?.toFloat()?.coerceIn(10f, 32f)
@@ -454,7 +468,8 @@ class BackupManager internal constructor(
                     playbackSpeed = rawSpeed,
                     resizeMode = rawResize,
                     playbackMode = playbackMode,
-                    resumeMode = resumeMode
+                    resumeMode = resumeMode,
+                    seekIntervalSeconds = rawSeekInterval ?: PlaybackPreferencesRepository.DEFAULT_SEEK_INTERVAL_SECONDS
                 ),
                 subtitles = BackupSubtitleData(
                     primaryFontSizeSp = (subtitlesMap["primaryFontSizeSp"] as? Number)?.toFloat() ?: 18f,
@@ -478,7 +493,8 @@ class BackupManager internal constructor(
                 candidate.copy(
                     settings = candidate.settings.copy(
                         playbackSpeed = playbackSpeed,
-                        resizeMode = resizeMode
+                        resizeMode = resizeMode,
+                        seekIntervalSeconds = seekIntervalSeconds
                     ),
                     subtitles = BackupSubtitleData(
                         primaryFontSizeSp = primarySubSize,
@@ -499,6 +515,9 @@ class BackupManager internal constructor(
                 append("\"resizeMode\":").append(payload.settings.resizeMode).append(",")
                 append("\"playbackMode\":").append(quoteJson(payload.settings.playbackMode.name)).append(",")
                 append("\"resumeMode\":").append(quoteJson(payload.settings.resumeMode.name))
+                if (payload.schemaVersion >= 3 || payload.settings.seekIntervalSeconds != PlaybackPreferencesRepository.DEFAULT_SEEK_INTERVAL_SECONDS) {
+                    append(",\"seekIntervalSeconds\":").append(payload.settings.seekIntervalSeconds)
+                }
                 append("},")
                 append("\"subtitles\":{")
                 append("\"primaryFontSizeSp\":").append(payload.subtitles.primaryFontSizeSp).append(",")

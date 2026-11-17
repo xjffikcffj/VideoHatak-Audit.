@@ -59,6 +59,7 @@ class VaultRepositoryImpl internal constructor(
     companion object {
         private const val MASKED_DISPLAY_NAME = "مقطع خاص مشفر"
         private const val MASKED_MIME_TYPE = "application/octet-stream"
+        private const val DECODE_ERROR_MESSAGE = "تعذر فك تشفير بيانات أحد المقاطع المحفوظة في الخزنة"
 
         @Volatile
         private var instance: VaultRepositoryImpl? = null
@@ -143,11 +144,15 @@ class VaultRepositoryImpl internal constructor(
         val decoded = rawList.mapNotNull { row ->
             val result = decodeVaultRow(row)
             if (result == null && firstDecodeError == null) {
-                firstDecodeError = "تعذر فك تشفير بيانات أحد المقاطع المحفوظة في الخزنة"
+                firstDecodeError = DECODE_ERROR_MESSAGE
             }
             result
         }
-        _vaultError.value = firstDecodeError
+        if (firstDecodeError != null) {
+            _vaultError.value = firstDecodeError
+        } else if (_vaultError.value == DECODE_ERROR_MESSAGE) {
+            _vaultError.value = null
+        }
         _vaultVideos.update { decoded }
     }
 
@@ -546,7 +551,12 @@ class VaultRepositoryImpl internal constructor(
     }
 
     override suspend fun deleteVaultVideo(id: Long): Boolean = withContext(Dispatchers.IO) {
-        runCatching { beforeDeleteHook?.invoke(id) }
+        try {
+            beforeDeleteHook?.invoke(id)
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            throw ce
+        } catch (_: Throwable) {
+        }
         repoMutex.withLock {
             if (!_isUnlocked.value) return@withContext false
             val raw = dbHelper.getVideoById(id) ?: return@withContext false

@@ -333,7 +333,12 @@ class VaultViewModel(
     fun deleteVideo(videoId: Long) {
         viewModelScope.launch {
             _actionError.value = null
-            runCatching { beforeDeleteVideoHook?.invoke(videoId) }
+            try {
+                beforeDeleteVideoHook?.invoke(videoId)
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                throw ce
+            } catch (_: Throwable) {
+            }
             val deleted = repository.deleteVaultVideo(videoId)
             if (!deleted && repository.vaultError.value.isNullOrBlank()) {
                 _actionError.value = "تعذر حذف الفيديو من الخزنة"

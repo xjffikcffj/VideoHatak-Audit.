@@ -796,7 +796,7 @@ class AuditBatchTwoVerificationTest {
         assertEquals(1, repo.lastPreservedOrphanCount)
 
         // Test VaultViewModel beforeDeleteVideo hook + rename error surfacing cleanly without ViewModel collector lag
-        val hookedIds = mutableListOf<Long>()
+        val hookedIds = CopyOnWriteArrayList<Long>()
         val scope = createScope()
         val secPrefs = VaultSecurityPreferences(createDataStore(scope, "sc8_vs_"))
         val vm = createManagedViewModel {
@@ -817,8 +817,136 @@ class AuditBatchTwoVerificationTest {
         drainAsync { vm.vaultError.value == null }
 
         vm.deleteVideo(rowId)
-        drainAsync { hookedIds.contains(rowId) && db.getVideoById(rowId) == null }
-        assertEquals(listOf(rowId), hookedIds)
+        drainAsync {
+            hookedIds.contains(rowId) &&
+                db.getVideoById(rowId) == null &&
+                !File(vaultDir, activeEncName).exists() &&
+                vaultDir.listFiles().orEmpty().none { it.name.endsWith(".pending_delete") } &&
+                repo.vaultVideos.first().isEmpty()
+        }
+        assertEquals(listOf(rowId), hookedIds.toList())
+        assertTrue(vm.vaultVideos.first().isEmpty())
+        assertTrue("Orphan file must remain intact after deleting active record", orphanEncFile.exists())
+        assertNull(vm.vaultError.value)
+    }
+
+    @Test
+    fun scenario8b_vaultConcurrentRefreshPreservesRenameErrorAndDeleteExecutesInOrder() = runBlocking {
+        val context: Context = testApp()
+        val vaultDir = File(context.filesDir, "vault_encrypted")
+        vaultDir.deleteRecursively()
+        vaultDir.mkdirs()
+
+        val operationLog = CopyOnWriteArrayList<String>()
+        val delegateDb = FakeVaultDbStore()
+        val refreshDispatchedDuringFailedUpdate = CompletableDeferred<Unit>()
+        lateinit var repo: VaultRepositoryImpl
+        val scope = createScope()
+
+        val racingDb = object : VaultDatabaseStore {
+            override fun insertVideo(video: VaultVideo): Long = delegateDb.insertVideo(video)
+
+            override fun updateEncryptedMetadata(
+                id: Long,
+                maskedDisplayName: String,
+                internalPath: String,
+                maskedMimeType: String,
+                encryptedMetaBase64: String
+            ): Int {
+                val updated = delegateDb.updateEncryptedMetadata(
+                    id,
+                    maskedDisplayName,
+                    internalPath,
+                    maskedMimeType,
+                    encryptedMetaBase64
+                )
+                if (updated == 0 && !refreshDispatchedDuringFailedUpdate.isCompleted) {
+                    // Queue a concurrent refresh while renameVideo still holds repoMutex so refreshLocked()
+                    // executes immediately after renameVideo fails and sets _vaultError.
+                    scope.launch {
+                        repo.refresh()
+                        refreshDispatchedDuringFailedUpdate.complete(Unit)
+                    }
+                }
+                return updated
+            }
+
+            override fun getAllVideos(): List<VaultVideo> = delegateDb.getAllVideos()
+            override fun getVideoById(id: Long): VaultVideo? = delegateDb.getVideoById(id)
+
+            override fun deleteVideo(id: Long): Int {
+                operationLog.add("db.deleteVideo:$id")
+                return delegateDb.deleteVideo(id)
+            }
+        }
+
+        val crypto = VaultCryptoManager(keyStoreProvider = "TEST_PROVIDER")
+        repo = VaultRepositoryImpl(context, crypto, racingDb)
+        repo.setUnlocked(true)
+
+        val encName = "vault_race_1.enc"
+        val encFile = File(vaultDir, encName).apply { writeBytes(byteArrayOf(10, 20, 30)) }
+        val orphanFile = File(vaultDir, "vault_orphan_keep.enc").apply { writeBytes(byteArrayOf(7, 8, 9)) }
+        val encMeta = crypto.encryptMetadata("""{"title":"فيديو السباق","file":"$encName","mime":"video/mp4"}""")
+        val rowId = racingDb.insertVideo(
+            VaultVideo(
+                id = 0L,
+                displayName = "مقطع خاص مشفر",
+                originalSizeBytes = 3L,
+                encryptedSizeBytes = 3L,
+                durationMs = 5_000L,
+                mimeType = "application/octet-stream",
+                width = 1280,
+                height = 720,
+                relativeEncryptedPath = encName,
+                createdAtEpochMs = 200L,
+                ivBase64 = "aXY=",
+                encryptedMetaBase64 = encMeta
+            )
+        )
+
+        var hookSawActiveRecord = false
+        var hookSawEncryptedFile = false
+        val secPrefs = VaultSecurityPreferences(createDataStore(scope, "sc8b_vs_"))
+        val vm = createManagedViewModel {
+            VaultViewModel(
+                repository = repo,
+                biometricHelper = VaultBiometricHelper(testApp()),
+                securityPreferences = secPrefs,
+                beforeDeleteVideo = { id ->
+                    hookSawActiveRecord = racingDb.getVideoById(id) != null
+                    hookSawEncryptedFile = encFile.exists()
+                    operationLog.add("hook:$id")
+                }
+            )
+        }
+
+        // Fail DB rename update while concurrent refresh runs right afterward
+        delegateDb.failNextUpdate = true
+        vm.renameVideo(rowId, "عنوان لن يُحفظ")
+        drainAsync { refreshDispatchedDuringFailedUpdate.isCompleted && vm.vaultError.value != null }
+        assertTrue(
+            "Concurrent refreshLocked() must NOT wipe renameVideo DB failure error",
+            vm.vaultError.value!!.contains("فشل")
+        )
+
+        vm.clearError()
+        drainAsync { vm.vaultError.value == null }
+
+        vm.deleteVideo(rowId)
+        drainAsync {
+            operationLog.contains("db.deleteVideo:$rowId") &&
+                racingDb.getVideoById(rowId) == null &&
+                !encFile.exists() &&
+                vaultDir.listFiles().orEmpty().none { it.name.endsWith(".pending_delete") } &&
+                repo.vaultVideos.first().isEmpty()
+        }
+
+        assertTrue("Record must still exist when beforeDelete hook runs", hookSawActiveRecord)
+        assertTrue("Encrypted file must still exist when beforeDelete hook runs", hookSawEncryptedFile)
+        assertEquals(listOf("hook:$rowId", "db.deleteVideo:$rowId"), operationLog.toList())
+        assertTrue(vm.vaultVideos.first().isEmpty())
+        assertTrue("Unreferenced orphan file must stay preserved", orphanFile.exists())
     }
 
     // -------------------------------------------------------------------------

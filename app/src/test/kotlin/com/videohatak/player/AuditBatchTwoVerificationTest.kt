@@ -77,6 +77,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -391,21 +392,126 @@ class AuditBatchTwoVerificationTest {
             PlayerViewModel(testApp(), playerManager, realRepo, posManager, null, null)
         }
 
+        // Immediately switch to SHUFFLE_ALL and launch folder playback BEFORE initial DataStore load completes
         vm.setPlaybackMode(PlaybackMode.SHUFFLE_ALL)
-        drainAsync { playerManager.uiState.value.playbackMode == PlaybackMode.SHUFFLE_ALL }
         fakePlayer.callOrder.clear()
 
         val videos = sampleVideos(4, "folder")
         vm.playVideoInContext(videos[1], videos)
+
+        // Allow initial DataStore load + persistence write to fully complete
+        testDispatcher.scheduler.advanceUntilIdle()
+        drainAsync {
+            realRepo.playbackMode.first() == PlaybackMode.SHUFFLE_ALL &&
+                vm.playbackMode.first() == PlaybackMode.SHUFFLE_ALL
+        }
         testDispatcher.scheduler.advanceUntilIdle()
 
         val setItemsIdx = fakePlayer.callOrder.indexOf("setMediaItems")
         val setShuffleOrderIdx = fakePlayer.callOrder.indexOf("setShuffleOrder")
         assertTrue("setMediaItems must be called", setItemsIdx >= 0)
         assertTrue("setShuffleOrder must be called after setMediaItems", setShuffleOrderIdx > setItemsIdx)
-        assertTrue(fakePlayer.shuffleModeEnabled)
+        assertTrue("Shuffle must remain enabled after initial DataStore load finishes", fakePlayer.shuffleModeEnabled)
+        assertEquals(PlaybackMode.SHUFFLE_ALL, playerManager.uiState.value.playbackMode)
+        assertEquals(Player.REPEAT_MODE_ALL, fakePlayer.repeatMode)
         assertEquals(4, fakePlayer.lastShuffleOrderLength)
         assertEquals(videos[1].id, vm.currentVideo?.id)
+    }
+
+    @Test
+    fun scenario1b_lateStalePlaybackModeEmissionCannotOverrideNewerUserSelection() = runBlocking {
+        val scope = createScope()
+        val realRepo = PlaybackPreferencesRepositoryImpl(createDataStore(scope, "sc1b_"))
+        val posManager = PlaybackPositionManager(realRepo, scope).also { activeManagers.add(it) }
+        val fakePlayer = RecordingExoPlayer()
+        val playerManager = VideoPlayerManager.createForTesting(fakePlayer.exoPlayer).also { activePlayerManagers.add(it) }
+
+        val initialLoadGate = CompletableDeferred<Unit>()
+        val continueAfterStaleGate = CompletableDeferred<Unit>()
+        val staleEmissionSent = AtomicBoolean(false)
+        val backingModeFlow = MutableStateFlow(PlaybackMode.PLAY_ALL_IN_ORDER)
+
+        val delayedRepo = object : PlaybackPreferencesRepository by realRepo {
+            override val playbackMode: Flow<PlaybackMode> = flow {
+                initialLoadGate.await()
+                staleEmissionSent.set(true)
+                // Simulate a stale initial preference arriving late after user already selected SHUFFLE_ALL
+                emit(PlaybackMode.PLAY_ALL_IN_ORDER)
+                continueAfterStaleGate.await()
+                backingModeFlow.collect { emit(it) }
+            }
+
+            override suspend fun setPlaybackMode(mode: PlaybackMode) {
+                backingModeFlow.value = mode
+                realRepo.setPlaybackMode(mode)
+            }
+        }
+
+        val vm = createManagedViewModel {
+            PlayerViewModel(testApp(), playerManager, delayedRepo, posManager, null, null)
+        }
+        // Start init collectors so playbackMode collector suspends at initialLoadGate
+        testDispatcher.scheduler.runCurrent()
+
+        // User selects SHUFFLE_ALL and persists it BEFORE initial DataStore load delivers its stale value
+        vm.setPlaybackMode(PlaybackMode.SHUFFLE_ALL)
+        testDispatcher.scheduler.runCurrent()
+        drainAsync { realRepo.playbackMode.first() == PlaybackMode.SHUFFLE_ALL }
+
+        assertEquals(PlaybackMode.SHUFFLE_ALL, playerManager.uiState.value.playbackMode)
+        assertTrue(fakePlayer.shuffleModeEnabled)
+
+        // Now deliver the late stale PLAY_ALL_IN_ORDER emission
+        initialLoadGate.complete(Unit)
+        testDispatcher.scheduler.runCurrent()
+
+        assertTrue(staleEmissionSent.get())
+        assertEquals(
+            "Late stale initial emission must NOT overwrite newer SHUFFLE_ALL user choice",
+            PlaybackMode.SHUFFLE_ALL,
+            playerManager.uiState.value.playbackMode
+        )
+        assertTrue("ExoPlayer shuffleModeEnabled must remain true", fakePlayer.shuffleModeEnabled)
+        assertEquals(Player.REPEAT_MODE_ALL, fakePlayer.repeatMode)
+
+        // Playing folder videos right now must still build queue with SHUFFLE_ALL
+        fakePlayer.callOrder.clear()
+        val videos = sampleVideos(3, "late_stale")
+        vm.playVideoInContext(videos[0], videos)
+        testDispatcher.scheduler.runCurrent()
+        assertTrue(fakePlayer.shuffleModeEnabled)
+        val setItemsIdx = fakePlayer.callOrder.indexOf("setMediaItems")
+        val setShuffleOrderIdx = fakePlayer.callOrder.indexOf("setShuffleOrder")
+        assertTrue(setItemsIdx >= 0 && setShuffleOrderIdx > setItemsIdx)
+
+        // Allow flow to catch up to SHUFFLE_ALL, then verify external updates still apply normally
+        continueAfterStaleGate.complete(Unit)
+        testDispatcher.scheduler.advanceUntilIdle()
+        assertEquals(PlaybackMode.SHUFFLE_ALL, playerManager.uiState.value.playbackMode)
+
+        backingModeFlow.value = PlaybackMode.REPEAT_PLAYLIST
+        testDispatcher.scheduler.advanceUntilIdle()
+        assertEquals(PlaybackMode.REPEAT_PLAYLIST, playerManager.uiState.value.playbackMode)
+        assertFalse(fakePlayer.shuffleModeEnabled)
+        assertEquals(Player.REPEAT_MODE_ALL, fakePlayer.repeatMode)
+
+        // Rapid consecutive user changes must persist the final mode across an app restart
+        vm.setPlaybackMode(PlaybackMode.REPEAT_ONE)
+        vm.setPlaybackMode(PlaybackMode.SHUFFLE_ALL)
+        testDispatcher.scheduler.advanceUntilIdle()
+        drainAsync { realRepo.playbackMode.first() == PlaybackMode.SHUFFLE_ALL }
+
+        val restartedFakePlayer = RecordingExoPlayer()
+        val restartedManager = VideoPlayerManager.createForTesting(restartedFakePlayer.exoPlayer).also {
+            activePlayerManagers.add(it)
+        }
+        val restartedVm = createManagedViewModel {
+            PlayerViewModel(testApp(), restartedManager, realRepo, posManager, null, null)
+        }
+        drainAsync { restartedManager.uiState.value.playbackMode == PlaybackMode.SHUFFLE_ALL }
+        assertEquals(PlaybackMode.SHUFFLE_ALL, restartedVm.uiState.value.playbackMode)
+        assertTrue(restartedFakePlayer.shuffleModeEnabled)
+        assertEquals(Player.REPEAT_MODE_ALL, restartedFakePlayer.repeatMode)
     }
 
     @Test

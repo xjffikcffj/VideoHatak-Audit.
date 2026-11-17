@@ -61,6 +61,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.util.UUID
 
 class PlayerViewModel(
@@ -141,6 +143,18 @@ class PlayerViewModel(
     private val _pendingResumePrompt = MutableStateFlow<ResumePromptState?>(null)
     val pendingResumePrompt: StateFlow<ResumePromptState?> = _pendingResumePrompt.asStateFlow()
 
+    private val playbackModeLock = Any()
+    private val playbackModeWriteMutex = Mutex()
+    private var playbackModeSelectionVersion: Long = 0L
+    private var pendingPlaybackModeTarget: PlaybackMode? = null
+    private var playbackModeWritePendingCount: Int = 0
+    private var lastObservedPrefsPlaybackMode: PlaybackMode? = null
+
+    private fun currentAuthoritativePlaybackMode(): PlaybackMode =
+        synchronized(playbackModeLock) {
+            pendingPlaybackModeTarget ?: playerManager.uiState.value.playbackMode
+        }
+
     val playbackMode: StateFlow<PlaybackMode> = playbackPreferences.playbackMode
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), PlaybackMode.PLAY_ALL_IN_ORDER)
 
@@ -202,8 +216,26 @@ class PlayerViewModel(
             positionManager.enqueueSave(uri, pos, dur)
         }
         viewModelScope.launch {
-            playbackPreferences.playbackMode.collect { mode ->
-                playerManager.setPlaybackMode(mode)
+            playbackPreferences.playbackMode.collect { modeFromPrefs ->
+                val shouldApplyToPlayer = synchronized(playbackModeLock) {
+                    lastObservedPrefsPlaybackMode = modeFromPrefs
+                    val pendingTarget = pendingPlaybackModeTarget
+                    when {
+                        playbackModeWritePendingCount > 0 -> false
+                        pendingTarget != null -> {
+                            if (modeFromPrefs == pendingTarget) {
+                                pendingPlaybackModeTarget = null
+                                playerManager.uiState.value.playbackMode != modeFromPrefs
+                            } else {
+                                false
+                            }
+                        }
+                        else -> true
+                    }
+                }
+                if (shouldApplyToPlayer) {
+                    playerManager.setPlaybackMode(modeFromPrefs)
+                }
             }
         }
         viewModelScope.launch {
@@ -330,7 +362,7 @@ class PlayerViewModel(
             val validContext = contextVideos.filter { it.bucketId != "secure_vault" }
             val startIndex = validContext.indexOfFirst { it.id == video.id }.coerceAtLeast(0)
             playlistVideos = validContext
-            val activeMode = playerManager.uiState.value.playbackMode
+            val activeMode = currentAuthoritativePlaybackMode()
             playerManager.playPlaylist(
                 items = validContext,
                 startIndex = startIndex,
@@ -359,7 +391,7 @@ class PlayerViewModel(
     fun playPlaylist(
         playlistId: Long,
         startVideoId: Long?,
-        shuffle: Boolean = playerManager.uiState.value.playbackMode.shuffleEnabled,
+        shuffle: Boolean = currentAuthoritativePlaybackMode().shuffleEnabled,
         onPlaylistStarted: ((VideoItem) -> Unit)? = null
     ) {
         viewModelScope.launch {
@@ -370,7 +402,7 @@ class PlayerViewModel(
                 val videoItems = rawItems.map { it.toVideoItem() }
                 playlistVideos = videoItems
 
-                val activeMode = playerManager.uiState.value.playbackMode
+                val activeMode = currentAuthoritativePlaybackMode()
                 val effectiveShuffle = shuffle || activeMode.shuffleEnabled
                 val effectiveMode = if (shuffle && !activeMode.shuffleEnabled) {
                     PlaybackMode.SHUFFLE_ALL.also { setPlaybackMode(it) }
@@ -422,9 +454,35 @@ class PlayerViewModel(
     }
 
     fun setPlaybackMode(mode: PlaybackMode) {
+        val writeVersion: Long
+        synchronized(playbackModeLock) {
+            playbackModeSelectionVersion += 1L
+            writeVersion = playbackModeSelectionVersion
+            pendingPlaybackModeTarget = mode
+            playbackModeWritePendingCount += 1
+        }
         playerManager.setPlaybackMode(mode)
         viewModelScope.launch {
-            playbackPreferences.setPlaybackMode(mode)
+            try {
+                playbackModeWriteMutex.withLock {
+                    val shouldPersist = synchronized(playbackModeLock) {
+                        writeVersion == playbackModeSelectionVersion
+                    }
+                    if (shouldPersist) {
+                        playbackPreferences.setPlaybackMode(mode)
+                    }
+                }
+            } finally {
+                synchronized(playbackModeLock) {
+                    playbackModeWritePendingCount = (playbackModeWritePendingCount - 1).coerceAtLeast(0)
+                    if (playbackModeWritePendingCount == 0 &&
+                        writeVersion == playbackModeSelectionVersion &&
+                        lastObservedPrefsPlaybackMode == mode
+                    ) {
+                        pendingPlaybackModeTarget = null
+                    }
+                }
+            }
         }
     }
 
@@ -436,7 +494,7 @@ class PlayerViewModel(
     }
 
     fun cycleRepeatMode() {
-        val currentMode = playerManager.uiState.value.playbackMode
+        val currentMode = currentAuthoritativePlaybackMode()
         val nextPlaybackMode = when (currentMode) {
             PlaybackMode.PLAY_ALL_IN_ORDER -> PlaybackMode.REPEAT_PLAYLIST
             PlaybackMode.REPEAT_PLAYLIST -> PlaybackMode.REPEAT_ONE

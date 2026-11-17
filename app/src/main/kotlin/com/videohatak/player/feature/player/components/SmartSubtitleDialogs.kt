@@ -303,9 +303,17 @@ fun SmartSubtitleTranslationDialog(
         sourceMode: SubtitleSourceMode,
         sourceLanguage: SubtitleTranslationLanguage,
         targetLanguage: SubtitleTranslationLanguage
-    ) -> Unit = { _, _, _ -> }
+    ) -> Unit = { _, _, _ -> },
+    isVaultVideo: Boolean = false
 ) {
     val palette = LocalVideoHatakPalette.current
+    val effectiveEngineMode = if (isVaultVideo) TranslationEngineMode.OFFLINE_ON_DEVICE else engineMode
+
+    LaunchedEffect(isVaultVideo, engineMode) {
+        if (isVaultVideo && engineMode != TranslationEngineMode.OFFLINE_ON_DEVICE) {
+            onEngineModeChange(TranslationEngineMode.OFFLINE_ON_DEVICE)
+        }
+    }
 
     var sourceMode by remember {
         mutableStateOf(
@@ -347,7 +355,7 @@ fun SmartSubtitleTranslationDialog(
     val selectedTargetState = offlineModelStates[targetLanguage]
         ?: LanguageModelResourceState(language = targetLanguage)
 
-    val needsSpeechModel = engineMode == TranslationEngineMode.OFFLINE_ON_DEVICE &&
+    val needsSpeechModel = effectiveEngineMode == TranslationEngineMode.OFFLINE_ON_DEVICE &&
         sourceMode == SubtitleSourceMode.VIDEO_AUDIO_EXTRACTION
     val speechMissing = needsSpeechModel &&
         (selectedSpeechState == null || selectedSpeechState.speechStatus != OfflineModelDownloadStatus.READY)
@@ -424,7 +432,7 @@ fun SmartSubtitleTranslationDialog(
         textContentColor = palette.onSurface,
         icon = {
             Icon(
-                imageVector = if (engineMode == TranslationEngineMode.OFFLINE_ON_DEVICE) {
+                imageVector = if (effectiveEngineMode == TranslationEngineMode.OFFLINE_ON_DEVICE) {
                     Icons.Default.CloudOff
                 } else {
                     Icons.Default.AutoAwesome
@@ -435,7 +443,7 @@ fun SmartSubtitleTranslationDialog(
         },
         title = {
             Text(
-                text = if (engineMode == TranslationEngineMode.OFFLINE_ON_DEVICE) {
+                text = if (effectiveEngineMode == TranslationEngineMode.OFFLINE_ON_DEVICE) {
                     "الترجمة الذكية المحلية (دون إنترنت)"
                 } else {
                     "الترجمة الذكية عبر الخادم الوسيط"
@@ -456,34 +464,51 @@ fun SmartSubtitleTranslationDialog(
                     color = palette.onSurfaceMuted
                 )
 
-                // Engine Mode Selector (Offline On-Device vs Optional Cloud Proxy)
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    TranslationEngineMode.entries.forEach { mode ->
-                        val selected = engineMode == mode
-                        Surface(
-                            shape = RoundedCornerShape(10.dp),
-                            color = if (selected) palette.accent.copy(alpha = 0.18f) else palette.surfaceElevated,
-                            border = BorderStroke(1.dp, if (selected) palette.accent else palette.border),
-                            modifier = Modifier
-                                .weight(1f)
-                                .clickable { onEngineModeChange(mode) }
-                        ) {
-                            Text(
-                                text = if (mode == TranslationEngineMode.OFFLINE_ON_DEVICE) {
-                                    "محلي دون إنترنت"
-                                } else {
-                                    "خادم وسيط (اختياري)"
-                                },
-                                style = MaterialTheme.typography.labelMedium,
-                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
-                                color = if (selected) palette.accent else palette.onSurface,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)
-                            )
+                // Engine Mode Selector (Offline On-Device vs Optional Cloud Proxy; Vault strictly offline)
+                if (isVaultVideo) {
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = palette.accent.copy(alpha = 0.14f),
+                        border = BorderStroke(1.dp, palette.accent),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = "حماية الخزنة الخاصة: يعمل المحرك المحلي دون إنترنت فقط، ويُمنع إرسال نصوص أو صوت هذا المقطع لأي خادم خارجي.",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = palette.accent,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)
+                        )
+                    }
+                } else {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        TranslationEngineMode.entries.forEach { mode ->
+                            val selected = effectiveEngineMode == mode
+                            Surface(
+                                shape = RoundedCornerShape(10.dp),
+                                color = if (selected) palette.accent.copy(alpha = 0.18f) else palette.surfaceElevated,
+                                border = BorderStroke(1.dp, if (selected) palette.accent else palette.border),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clickable { onEngineModeChange(mode) }
+                            ) {
+                                Text(
+                                    text = if (mode == TranslationEngineMode.OFFLINE_ON_DEVICE) {
+                                        "محلي دون إنترنت"
+                                    } else {
+                                        "خادم وسيط (اختياري)"
+                                    },
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                                    color = if (selected) palette.accent else palette.onSurface,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)
+                                )
+                            }
                         }
                     }
                 }
@@ -814,7 +839,7 @@ fun SmartSubtitleTranslationDialog(
                 }
 
                 // Independent Text Translation Model Card (ML Kit)
-                if (engineMode == TranslationEngineMode.OFFLINE_ON_DEVICE) {
+                if (effectiveEngineMode == TranslationEngineMode.OFFLINE_ON_DEVICE) {
                     Surface(
                         shape = RoundedCornerShape(10.dp),
                         color = palette.surfaceElevated,
@@ -1016,7 +1041,7 @@ fun SmartSubtitleTranslationDialog(
                     ),
                     modifier = Modifier.fillMaxWidth()
                 )
-                if (engineMode == TranslationEngineMode.OFFLINE_ON_DEVICE) {
+                if (effectiveEngineMode == TranslationEngineMode.OFFLINE_ON_DEVICE) {
                     Text(
                         text = "تنبيه: يترجم المحرك المحلي كل جملة منفردة عبر ML Kit (مع حماية المصطلحات وفواصل المتحدثين) وقد تمر غير الإنجليزية عبر الإنجليزية وسيطًا.",
                         style = MaterialTheme.typography.labelSmall,
@@ -1025,7 +1050,7 @@ fun SmartSubtitleTranslationDialog(
                 }
 
                 // Optional Cloud Proxy Configuration (kept separate from Offline mode)
-                if (engineMode == TranslationEngineMode.CLOUD_PROXY) {
+                if (!isVaultVideo && effectiveEngineMode == TranslationEngineMode.CLOUD_PROXY) {
                     Surface(
                         shape = RoundedCornerShape(10.dp),
                         color = palette.surfaceElevated,
@@ -1147,7 +1172,7 @@ fun SmartSubtitleTranslationDialog(
                                 )
                                 Button(
                                     onClick = {
-                                        if (engineMode == TranslationEngineMode.OFFLINE_ON_DEVICE &&
+                                        if (effectiveEngineMode == TranslationEngineMode.OFFLINE_ON_DEVICE &&
                                             ((speechMissing && effectiveSourceForReadiness != SubtitleTranslationLanguage.AUTO) ||
                                                 missingMlKitCount.isNotEmpty())
                                         ) {
@@ -1281,7 +1306,7 @@ fun SmartSubtitleTranslationDialog(
             if (translationStatus !is TranslationJobStatus.Running) {
                 Button(
                     onClick = {
-                        if (engineMode == TranslationEngineMode.OFFLINE_ON_DEVICE &&
+                        if (effectiveEngineMode == TranslationEngineMode.OFFLINE_ON_DEVICE &&
                             ((speechMissing && effectiveSourceForReadiness != SubtitleTranslationLanguage.AUTO) ||
                                 missingMlKitCount.isNotEmpty())
                         ) {
@@ -1304,7 +1329,7 @@ fun SmartSubtitleTranslationDialog(
                     Icon(Icons.Default.Translate, contentDescription = null, modifier = Modifier.size(16.dp))
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = if (engineMode == TranslationEngineMode.OFFLINE_ON_DEVICE) {
+                        text = if (effectiveEngineMode == TranslationEngineMode.OFFLINE_ON_DEVICE) {
                             "بدء المعالجة المحلية"
                         } else {
                             "بدء الترجمة السحابية"

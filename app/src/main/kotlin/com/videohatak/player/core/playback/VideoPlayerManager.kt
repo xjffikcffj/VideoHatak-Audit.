@@ -357,11 +357,13 @@ class VideoPlayerManager internal constructor(
         }
 
         override fun onVideoSizeChanged(videoSize: VideoSize) {
-            _uiState.update {
-                it.copy(
-                    videoWidth = videoSize.width.coerceAtLeast(0),
-                    videoHeight = videoSize.height.coerceAtLeast(0)
-                )
+            if (videoSize.width > 0 && videoSize.height > 0) {
+                _uiState.update {
+                    it.copy(
+                        videoWidth = videoSize.width,
+                        videoHeight = videoSize.height
+                    )
+                }
             }
         }
     }
@@ -385,6 +387,8 @@ class VideoPlayerManager internal constructor(
                 title = title,
                 currentPositionMs = startPositionMs,
                 durationMs = 0L,
+                videoWidth = 0,
+                videoHeight = 0,
                 isTemporarySpeedActive = false,
                 isPipActive = false,
                 isControlsVisible = true,
@@ -489,6 +493,8 @@ class VideoPlayerManager internal constructor(
                 title = startVideo.safeTitle,
                 currentPositionMs = startPositionMs,
                 durationMs = startVideo.durationMs,
+                videoWidth = startVideo.width.coerceAtLeast(0),
+                videoHeight = startVideo.height.coerceAtLeast(0),
                 repeatMode = repeatMode,
                 isTemporarySpeedActive = false,
                 isPipActive = false,
@@ -834,6 +840,8 @@ class VideoPlayerManager internal constructor(
                 currentPositionMs = 0L,
                 mediaUri = null,
                 title = "",
+                videoWidth = 0,
+                videoHeight = 0,
                 isTemporarySpeedActive = false,
                 isPipActive = false,
                 isAudioOnlyMode = false,

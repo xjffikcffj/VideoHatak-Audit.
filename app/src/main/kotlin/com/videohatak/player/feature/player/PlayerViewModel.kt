@@ -17,6 +17,7 @@ import com.videohatak.player.core.playback.ResumeMode
 import com.videohatak.player.core.playback.ResumePromptState
 import com.videohatak.player.core.playback.VideoPlayerManager
 import com.videohatak.player.core.playback.VideoResizeMode
+import com.videohatak.player.core.playback.service.MediaNotificationPrivacy
 import com.videohatak.player.core.playlist.model.PlaylistRepeatMode
 import com.videohatak.player.core.playlist.model.toVideoItem
 import com.videohatak.player.core.playlist.repository.PlaylistRepositoryImpl
@@ -271,25 +272,6 @@ class PlayerViewModel(
                 )
                 playerManager.applyRestoredPosition(targetUri, targetGeneration, savedPos)
             }
-            ResumeMode.ASK_EVERY_TIME -> {
-                val savedPos = playbackPreferences.getSavedVideoPosition(
-                    targetUri,
-                    durationMs,
-                    legacyVideoId = legacyVideoId
-                )
-                if (savedPos > 0L) {
-                    playerManager.pause()
-                    _pendingResumePrompt.value = ResumePromptState(
-                        videoTitle = videoTitle,
-                        targetUri = targetUri,
-                        savedPositionMs = savedPos,
-                        durationMs = durationMs,
-                        targetGeneration = targetGenSafe(targetGeneration)
-                    )
-                } else {
-                    _pendingResumePrompt.value = null
-                }
-            }
         }
     }
 
@@ -506,6 +488,7 @@ class PlayerViewModel(
 
     override fun onCleared() {
         saveCurrentPosition()
+        safeThumbnailManager?.release()
         super.onCleared()
     }
 
@@ -913,8 +896,17 @@ class PlayerViewModel(
                 } else null
             }
 
+        val isVaultMedia = MediaNotificationPrivacy.isVaultUri(videoUri) ||
+            (currentVideo?.let { MediaNotificationPrivacy.isVaultVideo(it) } == true)
         val useCloudProxy = customProvider != null ||
             _translationEngineMode.value == TranslationEngineMode.CLOUD_PROXY
+
+        if (isVaultMedia && useCloudProxy) {
+            _translationStatus.value = TranslationJobStatus.Error(
+                "تم حظر الخادم الوسيط السحابي لمقاطع الخزنة الخاصة لحماية خصوصيتك. استخدم الترجمة المحلية دون إنترنت فقط."
+            )
+            return
+        }
 
         translationJob = viewModelScope.launch {
             try {
@@ -1137,6 +1129,13 @@ class PlayerViewModel(
         glossary: List<TranslationGlossaryEntry>,
         provider: SubtitleTranslationProvider
     ) {
+        if (MediaNotificationPrivacy.isVaultUri(videoUri) ||
+            (currentVideo?.let { MediaNotificationPrivacy.isVaultVideo(it) } == true)
+        ) {
+            throw TranslationProxyException(
+                "ممنوع إرسال نصوص أو صوت مقاطع الخزنة الخاصة إلى أي خادم خارجي."
+            )
+        }
         when (sourceMode) {
             SubtitleSourceMode.EXISTING_SUBTITLE -> {
                 val cues = sourceTrack?.cues ?: playerManager.uiState.value.primaryTrack?.cues.orEmpty()

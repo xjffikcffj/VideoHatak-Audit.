@@ -137,7 +137,6 @@ fun PlayerScreen(
     val thumbnailState by viewModel.thumbnailPreviewState.collectAsStateWithLifecycle()
     val primaryStyle by viewModel.primarySubtitleStyle.collectAsStateWithLifecycle()
     val secondaryStyle by viewModel.secondarySubtitleStyle.collectAsStateWithLifecycle()
-    val pendingResumePrompt by viewModel.pendingResumePrompt.collectAsStateWithLifecycle()
 
     val subtitleFeedback by viewModel.subtitleFeedbackMessage.collectAsStateWithLifecycle()
     val translationStatus by viewModel.translationStatus.collectAsStateWithLifecycle()
@@ -863,54 +862,6 @@ fun PlayerScreen(
             }
         }
 
-        // 3rd Resume Mode: ASK_EVERY_TIME Dialog
-        val resumePrompt = pendingResumePrompt
-        if (resumePrompt != null) {
-            AlertDialog(
-                onDismissRequest = { viewModel.dismissResumePrompt() },
-                containerColor = palette.surface,
-                titleContentColor = palette.onSurface,
-                textContentColor = palette.onSurface,
-                title = {
-                    Text("استئناف التشغيل؟", fontWeight = FontWeight.Bold)
-                },
-                text = {
-                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text(
-                            text = resumePrompt.videoTitle,
-                            style = MaterialTheme.typography.bodyMedium,
-                            fontWeight = FontWeight.SemiBold,
-                            color = palette.accent
-                        )
-                        Text(
-                            text = "توقفت سابقًا عند ${formatTimeMs(resumePrompt.savedPositionMs)}. هل تريد الاستئناف من نفس الموضع أم البدء من البداية؟",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = palette.onSurfaceMuted
-                        )
-                    }
-                },
-                confirmButton = {
-                    Button(
-                        onClick = { viewModel.resolveResumePrompt(resumeFromSaved = true) },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = palette.accent,
-                            contentColor = MaterialTheme.colorScheme.onPrimary
-                        )
-                    ) {
-                        Text("استئناف (${formatTimeMs(resumePrompt.savedPositionMs)})", fontWeight = FontWeight.Bold)
-                    }
-                },
-                dismissButton = {
-                    OutlinedButton(
-                        onClick = { viewModel.resolveResumePrompt(resumeFromSaved = false) },
-                        border = BorderStroke(1.dp, palette.border)
-                    ) {
-                        Text("البدء من البداية")
-                    }
-                }
-            )
-        }
-
         if (isSubtitlesDialogVisible) {
             SubtitleManagerDialog(
                 availableTracks = uiState.availableSubtitleTracks,
@@ -1029,7 +980,8 @@ fun PlayerScreen(
                 onDownloadTranslationModel = viewModel::downloadTranslationModel,
                 onCancelTranslationDownload = viewModel::cancelTranslationModelDownload,
                 onDeleteTranslationModel = viewModel::deleteTranslationModel,
-                onDownloadRequiredPair = viewModel::downloadRequiredModelsForPair
+                onDownloadRequiredPair = viewModel::downloadRequiredModelsForPair,
+                isVaultVideo = isVaultVideo
             )
         }
 

@@ -98,7 +98,10 @@ class PlaybackPreferencesRepositoryImpl(
 
     override val resumeMode: Flow<ResumeMode> = dataStore.data.map { prefs ->
         val raw = prefs[resumeModeKey]
-        ResumeMode.entries.firstOrNull { it.name == raw } ?: ResumeMode.RESUME
+        when (raw) {
+            "ASK_EVERY_TIME" -> ResumeMode.RESUME
+            else -> ResumeMode.entries.firstOrNull { it.name == raw } ?: ResumeMode.RESUME
+        }
     }
 
     override val seekIntervalSeconds: Flow<Int> = dataStore.data.map { prefs ->

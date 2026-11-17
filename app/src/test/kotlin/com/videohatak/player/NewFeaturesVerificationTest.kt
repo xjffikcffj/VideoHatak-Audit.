@@ -6,6 +6,8 @@ import android.view.KeyEvent
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.ViewModelStore
@@ -70,7 +72,7 @@ import kotlin.math.abs
  * Unit & integration verification tests for:
  * 1. All 8 approved themes and palette uniqueness + ThemeViewModel switching.
  * 2. All 5 mutually exclusive PlaybackMode presets & STOP_AFTER_CURRENT enforcement.
- * 3. All 3 ResumeMode presets (RESUME, START_FROM_BEGINNING, ASK_EVERY_TIME) with real DataStore.
+ * 3. Two-mode ResumeMode contract (RESUME, START_FROM_BEGINNING) and legacy ASK_EVERY_TIME migration with real DataStore.
  * 4. Temporary 2.0x speed hold without overwriting user's persisted playback speed.
  * 5. Permission state modeling (including permanent denial state).
  */
@@ -267,7 +269,7 @@ class NewFeaturesVerificationTest {
     }
 
     @Test
-    fun resumeModes_startFromBeginningAndAskEveryTimeBehaveCorrectly() = runBlocking {
+    fun resumeModes_startFromBeginningAndLegacyAskEveryTimeMigrationBehaveCorrectly() = runBlocking {
         val scope = createScope()
         val dataStore = createDataStore(scope)
         val repo = PlaybackPreferencesRepositoryImpl(dataStore)
@@ -339,29 +341,27 @@ class NewFeaturesVerificationTest {
         assertEquals(0L, fakePlayer.currentPosition)
         assertEquals(45_000L, repo.getSavedVideoPosition(uri.toString(), 120_000L))
 
-        // 3. ASK_EVERY_TIME opens prompt, pauses playback, and leaves user in control
-        repo.setResumeMode(ResumeMode.ASK_EVERY_TIME)
+        // 3. Only RESUME and START_FROM_BEGINNING exist; legacy ASK_EVERY_TIME in DataStore migrates to RESUME
+        assertEquals(2, ResumeMode.entries.size)
+        assertEquals(listOf(ResumeMode.RESUME, ResumeMode.START_FROM_BEGINNING), ResumeMode.entries.toList())
+        dataStore.edit { prefs ->
+            prefs[stringPreferencesKey("resume_mode_v1")] = "ASK_EVERY_TIME"
+        }
         drainMainAndIo {
-            repo.resumeMode.first() == ResumeMode.ASK_EVERY_TIME &&
-                vm.uiState.value.resumeMode == ResumeMode.ASK_EVERY_TIME
+            repo.resumeMode.first() == ResumeMode.RESUME &&
+                vm.uiState.value.resumeMode == ResumeMode.RESUME
         }
         fakePlayer.playbackState = Player.STATE_IDLE
-        fakePlayer.isPlaying = true
         vm.playVideo(video)
-        drainMainAndIo { vm.pendingResumePrompt.value != null }
-        assertFalse("ASK_EVERY_TIME must pause player while waiting for user choice", fakePlayer.isPlaying)
+        drainMainAndIo {
+            playerManager.restorationCoordinator.pendingUri == uri.toString() ||
+                playerManager.restorationCoordinator.isRestorationApplied
+        }
         fakePlayer.triggerPlaybackStateChanged(Player.STATE_READY)
         testDispatcher.scheduler.advanceUntilIdle()
 
-        val prompt = vm.pendingResumePrompt.value
-        assertNotNull("ASK_EVERY_TIME must emit pendingResumePrompt when savedPos > 0", prompt)
-        assertEquals(45_000L, prompt?.savedPositionMs)
-
-        vm.resolveResumePrompt(resumeFromSaved = true)
-        testDispatcher.scheduler.advanceUntilIdle()
         assertNull(vm.pendingResumePrompt.value)
         assertEquals(45_000L, fakePlayer.currentPosition)
-        assertTrue(fakePlayer.isPlaying)
     }
 
     @Test

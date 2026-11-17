@@ -58,6 +58,7 @@ import com.videohatak.player.core.playback.PlaybackPreferencesRepositoryImpl
 import com.videohatak.player.core.playback.VolumeComboShortcutDetector
 import com.videohatak.player.core.playback.pip.PipHelper
 import com.videohatak.player.core.playback.playbackDataStore
+import com.videohatak.player.core.playback.service.MediaNotificationPrivacy
 import com.videohatak.player.core.playback.service.VideoPlaybackService
 import com.videohatak.player.core.playlist.model.toVideoItem
 import com.videohatak.player.core.playlist.repository.PlaylistRepositoryImpl
@@ -245,12 +246,20 @@ class MainActivity : FragmentActivity() {
                 playerUiState.seekIntervalSeconds,
                 playerUiState.videoWidth,
                 playerUiState.videoHeight,
+                currentPlayerVideo?.width,
+                currentPlayerVideo?.height,
                 activeVideoForPlayback?.width,
                 activeVideoForPlayback?.height
             ) {
                 if (isInPip && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    val w = playerUiState.videoWidth.takeIf { it > 0 } ?: activeVideoForPlayback?.width ?: 16
-                    val h = playerUiState.videoHeight.takeIf { it > 0 } ?: activeVideoForPlayback?.height ?: 9
+                    val w = playerUiState.videoWidth.takeIf { it > 0 }
+                        ?: currentPlayerVideo?.width?.takeIf { it > 0 }
+                        ?: activeVideoForPlayback?.width?.takeIf { it > 0 }
+                        ?: 16
+                    val h = playerUiState.videoHeight.takeIf { it > 0 }
+                        ?: currentPlayerVideo?.height?.takeIf { it > 0 }
+                        ?: activeVideoForPlayback?.height?.takeIf { it > 0 }
+                        ?: 9
                     PipHelper(this@MainActivity).updatePipActions(
                         activity = this@MainActivity,
                         isPlaying = playerUiState.isPlaying,
@@ -329,7 +338,10 @@ class MainActivity : FragmentActivity() {
                 }
             }
 
-            val isVaultActive = currentTab == LibraryTab.VAULT || activeVideoForPlayback?.bucketId == "secure_vault"
+            val isVaultActive = currentTab == LibraryTab.VAULT ||
+                (activeVideoForPlayback?.let { MediaNotificationPrivacy.isVaultVideo(it) } == true) ||
+                (currentPlayerVideo?.let { MediaNotificationPrivacy.isVaultVideo(it) } == true) ||
+                MediaNotificationPrivacy.isVaultUri(playerUiState.mediaUri)
             DisposableEffect(isVaultActive) {
                 if (isVaultActive) {
                     window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
@@ -343,10 +355,9 @@ class MainActivity : FragmentActivity() {
 
             LaunchedEffect(vaultIsUnlocked) {
                 if (!vaultIsUnlocked) {
-                    val activeIsVault = activeVideoForPlayback?.bucketId == "secure_vault" ||
-                        activeVideoForPlayback?.contentUri?.scheme == "vault"
-                    val playerIsVault = playerViewModel.currentVideo?.bucketId == "secure_vault" ||
-                        playerViewModel.currentVideo?.contentUri?.scheme == "vault"
+                    val activeIsVault = activeVideoForPlayback?.let { MediaNotificationPrivacy.isVaultVideo(it) } == true
+                    val playerIsVault = playerViewModel.currentVideo?.let { MediaNotificationPrivacy.isVaultVideo(it) } == true ||
+                        MediaNotificationPrivacy.isVaultUri(playerViewModel.uiState.value.mediaUri)
                     if (activeIsVault || playerIsVault) {
                         activeVideoForPlayback = null
                         playerViewModel.stopPlaybackCompletely()
@@ -476,11 +487,10 @@ class MainActivity : FragmentActivity() {
                                 )
                             },
                             onRenameVideo = { targetVideo, newName ->
-                                if (targetVideo.bucketId == "secure_vault") {
+                                if (MediaNotificationPrivacy.isVaultVideo(targetVideo)) {
                                     val matchingVault = vaultVideos.firstOrNull { it.id == targetVideo.id }
-                                    if (matchingVault != null) {
-                                        vaultViewModel.renameVideo(matchingVault, newName)
-                                    }
+                                    val targetVaultId = matchingVault?.id ?: targetVideo.id
+                                    vaultViewModel.renameVideo(targetVaultId, newName)
                                 } else {
                                     libraryViewModel.renameVideo(targetVideo, newName)
                                 }
@@ -524,24 +534,32 @@ class MainActivity : FragmentActivity() {
                             },
                             bottomBar = {
                                 val backgroundVideo = currentPlayerVideo ?: playerUiState.mediaUri?.let { uri ->
+                                    val isVaultBgUri = MediaNotificationPrivacy.isVaultUri(uri)
                                     VideoItem(
                                         id = uri.hashCode().toLong(),
                                         contentUri = uri,
-                                        title = playerUiState.title.ifBlank { "تشغيل حالي" },
-                                        displayName = playerUiState.title.ifBlank { "تشغيل حالي" },
+                                        title = if (isVaultBgUri) MediaNotificationPrivacy.VAULT_MASKED_TITLE else playerUiState.title.ifBlank { "تشغيل حالي" },
+                                        displayName = if (isVaultBgUri) MediaNotificationPrivacy.VAULT_MASKED_TITLE else playerUiState.title.ifBlank { "تشغيل حالي" },
                                         durationMs = playerUiState.durationMs,
                                         sizeBytes = 0L,
-                                        bucketId = if (uri.scheme.equals("vault", ignoreCase = true)) "secure_vault" else "restored",
+                                        bucketId = if (isVaultBgUri) "secure_vault" else "restored",
                                         dateAddedSec = 0L,
                                         width = playerUiState.videoWidth,
                                         height = playerUiState.videoHeight
                                     )
                                 }
-                                if (backgroundVideo != null && (playerUiState.isPlaying || playerUiState.currentPositionMs > 0)) {
+                                val isBgVault = backgroundVideo?.let { MediaNotificationPrivacy.isVaultVideo(it) } == true
+                                if (backgroundVideo != null &&
+                                    (!isBgVault || vaultIsUnlocked) &&
+                                    (playerUiState.isPlaying || playerUiState.currentPositionMs > 0)
+                                ) {
                                     MiniPlayerBar(
                                         video = backgroundVideo,
                                         uiState = playerUiState,
                                         onExpand = {
+                                            if (isBgVault) {
+                                                vaultViewModel.recordUserActivity()
+                                            }
                                             playerViewModel.setPipActive(false)
                                             playerViewModel.setControlsVisible(true)
                                             activeVideoForPlayback = backgroundVideo
@@ -764,14 +782,26 @@ class MainActivity : FragmentActivity() {
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
         val video = activeVideoState
-        val isAudioOnly = playerViewModel.uiState.value.isAudioOnlyMode
-        if (video != null && video.bucketId != "secure_vault" && !isAudioOnly && playerViewModel.playerManager.exoPlayer.isPlaying) {
+        val liveUiState = playerViewModel.uiState.value
+        val isVaultPlayback = (video?.let { MediaNotificationPrivacy.isVaultVideo(it) } == true) ||
+            (playerViewModel.currentVideo?.let { MediaNotificationPrivacy.isVaultVideo(it) } == true) ||
+            MediaNotificationPrivacy.isVaultUri(liveUiState.mediaUri)
+        val isAudioOnly = liveUiState.isAudioOnlyMode
+        if (video != null && !isVaultPlayback && !isAudioOnly && playerViewModel.playerManager.exoPlayer.isPlaying) {
+            val resolvedWidth = liveUiState.videoWidth.takeIf { it > 0 }
+                ?: video.width.takeIf { it > 0 }
+                ?: playerViewModel.currentVideo?.width?.takeIf { it > 0 }
+                ?: 16
+            val resolvedHeight = liveUiState.videoHeight.takeIf { it > 0 }
+                ?: video.height.takeIf { it > 0 }
+                ?: playerViewModel.currentVideo?.height?.takeIf { it > 0 }
+                ?: 9
             val entered = PipHelper.enterPip(
                 activity = this,
-                videoWidth = video.width,
-                videoHeight = video.height,
+                videoWidth = resolvedWidth,
+                videoHeight = resolvedHeight,
                 isPlaying = true,
-                seekIntervalSeconds = playerViewModel.uiState.value.seekIntervalSeconds
+                seekIntervalSeconds = liveUiState.seekIntervalSeconds
             )
             if (entered) {
                 playerViewModel.setPipActive(true)

@@ -12,7 +12,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.os.Handler
-import android.os.Looper
+import android.os.HandlerThread
 import android.provider.MediaStore
 import androidx.core.database.getIntOrNull
 import androidx.core.database.getLongOrNull
@@ -25,10 +25,13 @@ import com.videohatak.player.core.model.VideoSortOrder
 import com.videohatak.player.core.permission.PermissionHelper
 import com.videohatak.player.core.playlist.db.VideoHatakDatabaseHelper
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 
@@ -112,13 +115,24 @@ class LocalVideoRepositoryImpl(
     private val playlistDb by lazy { VideoHatakDatabaseHelper(context) }
 
     override fun observeVideos(): Flow<List<VideoItem>> = callbackFlow {
-        trySend(getVideos())
+        trySend(queryVideosInternal())
 
-        val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
+        val refreshChannel = Channel<Unit>(Channel.CONFLATED)
+        val handlerThread = HandlerThread("VideoMediaStoreObserver").apply { start() }
+        val observer = object : ContentObserver(Handler(handlerThread.looper)) {
             override fun onChange(selfChange: Boolean, uri: Uri?) {
                 super.onChange(selfChange, uri)
-                val updatedVideos = queryVideosInternal()
-                trySend(updatedVideos)
+                refreshChannel.trySend(Unit)
+            }
+        }
+
+        val collectorJob = launch(Dispatchers.IO) {
+            for (ignored in refreshChannel) {
+                delay(250L)
+                while (refreshChannel.tryReceive().isSuccess) {
+                    // Coalesce burst MediaStore notifications
+                }
+                trySend(queryVideosInternal())
             }
         }
 
@@ -130,6 +144,9 @@ class LocalVideoRepositoryImpl(
 
         awaitClose {
             contentResolver.unregisterContentObserver(observer)
+            collectorJob.cancel()
+            refreshChannel.close()
+            handlerThread.quitSafely()
         }
     }.flowOn(Dispatchers.IO)
 
@@ -161,7 +178,7 @@ class LocalVideoRepositoryImpl(
             projection.add(MediaStore.Video.Media.RELATIVE_PATH)
         }
 
-        val selection = "${MediaStore.Video.Media.DURATION} > 0 AND ${MediaStore.Video.Media.SIZE} > 0"
+        val selection: String? = null
         val sortOrder = "${MediaStore.Video.Media.DATE_ADDED} DESC"
 
         try {
@@ -259,10 +276,10 @@ class LocalVideoRepositoryImpl(
                 return@withContext VideoFileOperationResult.Error("الاسم الجديد غير صالح")
             }
 
-            val existingExt = video.displayName.substringAfterLast('.', "")
-            val hasExt = cleaned.contains('.') && cleaned.substringAfterLast('.', "").length in 2..5
-            val finalDisplayName = if (hasExt || existingExt.isBlank()) cleaned else "$cleaned.$existingExt"
-            val finalTitle = finalDisplayName.substringBeforeLast('.')
+            val existingExt = video.displayName.substringAfterLast('.', "").trim()
+            val resolved = resolveRenamedDisplayAndTitle(cleaned, existingExt)
+                ?: return@withContext VideoFileOperationResult.Error("الاسم الجديد غير صالح")
+            val (finalDisplayName, finalTitle) = resolved
 
             try {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -360,10 +377,17 @@ class LocalVideoRepositoryImpl(
                     return@withContext VideoFileOperationResult.Error("تعذر العثور على الملف الأصلي")
                 }
                 val moviesRoot = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES)
-                val destDir = File(moviesRoot, targetFolderName.trim().ifBlank { "VideoHatak" })
+                val safeRelativeFolder = sanitizeFolderSegments(targetFolderName).ifEmpty { listOf("VideoHatak") }
+                val destDir = File(moviesRoot, safeRelativeFolder.joinToString(File.separator))
+                val canonicalRoot = moviesRoot.canonicalPath
+                val canonicalDest = destDir.canonicalPath
+                if (canonicalDest != canonicalRoot && !canonicalDest.startsWith(canonicalRoot + File.separator)) {
+                    return@withContext VideoFileOperationResult.Error("مسار المجلد الهدف غير صالح")
+                }
                 if (!destDir.exists()) destDir.mkdirs()
 
-                val fileName = video.displayName.ifBlank { sourceFile.name }
+                val rawFileName = video.displayName.ifBlank { sourceFile.name }
+                val fileName = File(rawFileName).name
                 val destFile = File(destDir, fileName)
                 if (destFile.absolutePath == sourceFile.absolutePath) {
                     return@withContext VideoFileOperationResult.Success
@@ -541,16 +565,62 @@ class LocalVideoRepositoryImpl(
     }
 
     private fun buildNormalizedRelativePath(targetRelativePath: String, targetFolderName: String): String {
-        val raw = targetRelativePath.trim().trim('/')
-        if (raw.isNotEmpty()) {
-            val validRoot = raw.startsWith(Environment.DIRECTORY_MOVIES) ||
-                raw.startsWith(Environment.DIRECTORY_DCIM) ||
-                raw.startsWith(Environment.DIRECTORY_DOWNLOADS) ||
-                raw.startsWith(Environment.DIRECTORY_PICTURES)
-            return if (validRoot) "$raw/" else "${Environment.DIRECTORY_MOVIES}/$raw/"
+        return sanitizeRelativePath(targetRelativePath, targetFolderName)
+    }
+
+    companion object {
+        private val ILLEGAL_PATH_CHARS = Regex("[<>:\"|?*\\u0000-\\u001F]")
+
+        internal fun resolveRenamedDisplayAndTitle(
+            cleanedNewName: String,
+            existingExtension: String
+        ): Pair<String, String>? {
+            val sanitizedName = cleanedNewName.trim().replace('/', '_').replace('\\', '_')
+            if (sanitizedName.isBlank()) return null
+
+            val cleanExt = existingExtension.trim().trimStart('.')
+            if (cleanExt.isBlank()) {
+                return sanitizedName to sanitizedName
+            }
+
+            val baseTitle = if (sanitizedName.endsWith(".$cleanExt", ignoreCase = true)) {
+                sanitizedName.dropLast(cleanExt.length + 1).trim()
+            } else {
+                sanitizedName
+            }
+            if (baseTitle.isBlank()) return null
+            return "$baseTitle.$cleanExt" to baseTitle
         }
-        val cleanName = targetFolderName.trim().trim('/').ifBlank { "VideoHatak" }
-        return "${Environment.DIRECTORY_MOVIES}/$cleanName/"
+
+        internal fun sanitizeFolderSegments(rawPath: String): List<String> {
+            return rawPath
+                .replace('\\', '/')
+                .split('/')
+                .map { segment -> ILLEGAL_PATH_CHARS.replace(segment, "").trim() }
+                .filter { segment -> segment.isNotEmpty() && segment != "." && segment != ".." }
+        }
+
+        internal fun sanitizeRelativePath(targetRelativePath: String, targetFolderName: String): String {
+            val allowedRoots = listOf(
+                Environment.DIRECTORY_MOVIES,
+                Environment.DIRECTORY_DCIM,
+                Environment.DIRECTORY_DOWNLOADS,
+                Environment.DIRECTORY_PICTURES
+            )
+            val pathSegments = sanitizeFolderSegments(targetRelativePath)
+            if (pathSegments.isNotEmpty()) {
+                val firstLower = pathSegments.first().lowercase()
+                val canonicalRoot = allowedRoots.firstOrNull { it.lowercase() == firstLower }
+                val finalSegments = if (canonicalRoot != null) {
+                    listOf(canonicalRoot) + pathSegments.drop(1)
+                } else {
+                    listOf(Environment.DIRECTORY_MOVIES) + pathSegments
+                }
+                return finalSegments.joinToString("/") + "/"
+            }
+            val folderSegments = sanitizeFolderSegments(targetFolderName).ifEmpty { listOf("VideoHatak") }
+            return (listOf(Environment.DIRECTORY_MOVIES) + folderSegments).joinToString("/") + "/"
+        }
     }
 
     private fun buildWritePermissionRequest(

@@ -161,7 +161,7 @@ class BackupManager internal constructor(
         runCatching {
             val nonNullContext = requireNotNull(context) { "Context is required for importFromUri" }
             val rawJson = nonNullContext.contentResolver.openInputStream(uri)?.use { input ->
-                input.readBytes().toString(Charsets.UTF_8)
+                readBoundedUtf8Stream(input, MAX_BACKUP_BYTES)
             } ?: throw IllegalStateException("تعذر قراءة ملف النسخة الاحتياطية")
 
             when (val parsed = parseAndValidateBackupJson(rawJson)) {
@@ -318,6 +318,29 @@ class BackupManager internal constructor(
     companion object {
         const val SCHEMA_VERSION = 3
         val SUPPORTED_SCHEMA_VERSIONS = setOf(1, 2, 3)
+        const val MAX_BACKUP_BYTES = 16 * 1024 * 1024
+        private const val MAX_PLAYLISTS = 200
+        private const val MAX_ITEMS_PER_PLAYLIST = 2_000
+        private const val MAX_RESUME_POSITIONS = 5_000
+        private const val MAX_SUBTITLE_TRACKS = 500
+
+        private fun readBoundedUtf8Stream(input: java.io.InputStream, maxBytes: Int): String {
+            val buffer = ByteArray(8 * 1024)
+            val baos = java.io.ByteArrayOutputStream()
+            var total = 0
+            while (true) {
+                val read = input.read(buffer)
+                if (read == -1) break
+                total += read
+                if (total > maxBytes) {
+                    throw IllegalArgumentException(
+                        "حجم ملف النسخة الاحتياطية يتجاوز الحد المسموح (${maxBytes / (1024 * 1024)} MB)"
+                    )
+                }
+                baos.write(buffer, 0, read)
+            }
+            return baos.toByteArray().toString(Charsets.UTF_8)
+        }
 
         internal fun createForTesting(
             themeRepository: ThemePreferencesRepository,
@@ -353,6 +376,9 @@ class BackupManager internal constructor(
         }
 
         fun parseAndValidateBackupJson(rawJson: String): BackupParseResult {
+            if (rawJson.length > MAX_BACKUP_BYTES) {
+                return BackupParseResult.Error("حجم ملف النسخة الاحتياطية يتجاوز الحد المسموح")
+            }
             val root = try {
                 MiniJsonParser(rawJson).parseValue() as? Map<*, *>
             } catch (_: Exception) {
@@ -389,6 +415,9 @@ class BackupManager internal constructor(
                 ?: return BackupParseResult.Error("قسم الترجمة مفقود")
             val playlistsRaw = bodyMap["playlists"] as? List<*>
                 ?: return BackupParseResult.Error("قسم قوائم التشغيل مفقود")
+            if (playlistsRaw.size > MAX_PLAYLISTS) {
+                return BackupParseResult.Error("عدد قوائم التشغيل في النسخة الاحتياطية يتجاوز الحد المسموح ($MAX_PLAYLISTS)")
+            }
 
             val themeName = settingsMap["selectedTheme"] as? String
                 ?: return BackupParseResult.Error("اسم الثيم مفقود")
@@ -402,6 +431,9 @@ class BackupManager internal constructor(
 
             val rawSpeed = asJsonNumber(settingsMap["playbackSpeed"])?.toFloat()
                 ?: return BackupParseResult.Error("سرعة التشغيل مفقودة")
+            if (!rawSpeed.isFinite()) {
+                return BackupParseResult.Error("قيمة سرعة التشغيل غير صالحة")
+            }
             val playbackSpeed = VideoPlayerManager.clampPlaybackSpeed(rawSpeed)
 
             val rawResize = asJsonNumber(settingsMap["resizeMode"])?.toInt()
@@ -415,8 +447,11 @@ class BackupManager internal constructor(
 
             val resumeModeName = settingsMap["resumeMode"] as? String
                 ?: return BackupParseResult.Error("وضع الاستئناف مفقود")
-            val resumeMode = ResumeMode.entries.firstOrNull { it.name == resumeModeName }
-                ?: return BackupParseResult.Error("وضع استئناف غير معروف")
+            val resumeMode = when (resumeModeName) {
+                "ASK_EVERY_TIME" -> ResumeMode.RESUME
+                else -> ResumeMode.entries.firstOrNull { it.name == resumeModeName }
+                    ?: return BackupParseResult.Error("وضع استئناف غير معروف")
+            }
 
             val rawSeekInterval = asJsonNumber(settingsMap["seekIntervalSeconds"])?.toInt()
             val seekIntervalSeconds = PlaybackPreferencesRepository.sanitizeSeekIntervalSeconds(
@@ -425,6 +460,9 @@ class BackupManager internal constructor(
 
             val rawPrimarySub = asJsonNumber(subtitlesMap["primaryFontSizeSp"])?.toFloat() ?: 18f
             val rawSecondarySub = asJsonNumber(subtitlesMap["secondaryFontSizeSp"])?.toFloat() ?: 15f
+            if (!rawPrimarySub.isFinite() || !rawSecondarySub.isFinite()) {
+                return BackupParseResult.Error("حجم خط الترجمة غير صالح")
+            }
             val primarySubSize = rawPrimarySub.coerceIn(12f, 36f)
             val secondarySubSize = rawSecondarySub.coerceIn(10f, 32f)
 
@@ -452,6 +490,9 @@ class BackupManager internal constructor(
                 asJsonLexeme(plMap["updatedAt"])?.let { numberLexemes["playlists.$idx.updatedAt"] = it }
 
                 val itemsRaw = plMap["items"] as? List<*> ?: emptyList<Any>()
+                if (itemsRaw.size > MAX_ITEMS_PER_PLAYLIST) {
+                    return BackupParseResult.Error("عدد المقاطع داخل القائمة $title يتجاوز الحد المسموح ($MAX_ITEMS_PER_PLAYLIST)")
+                }
                 val items = itemsRaw.mapIndexed { itemIdx, itemAny ->
                     val itemMap = itemAny as? Map<*, *>
                         ?: return BackupParseResult.Error("عنصر فيديو غير صالح داخل القائمة $title")
@@ -462,9 +503,9 @@ class BackupManager internal constructor(
                     BackupPlaylistItemData(
                         videoId = asJsonNumber(itemMap["videoId"])?.toLong() ?: 0L,
                         videoTitle = (itemMap["videoTitle"] as? String).orEmpty(),
-                        durationMs = asJsonNumber(itemMap["durationMs"])?.toLong() ?: 0L,
-                        sizeBytes = asJsonNumber(itemMap["sizeBytes"])?.toLong() ?: 0L,
-                        dateAddedSec = asJsonNumber(itemMap["dateAddedSec"])?.toLong() ?: 0L,
+                        durationMs = (asJsonNumber(itemMap["durationMs"])?.toLong() ?: 0L).coerceAtLeast(0L),
+                        sizeBytes = (asJsonNumber(itemMap["sizeBytes"])?.toLong() ?: 0L).coerceAtLeast(0L),
+                        dateAddedSec = (asJsonNumber(itemMap["dateAddedSec"])?.toLong() ?: 0L).coerceAtLeast(0L),
                         contentUri = (itemMap["contentUri"] as? String).orEmpty(),
                         isAvailable = (itemMap["isAvailable"] as? Boolean) ?: true
                     )
@@ -478,6 +519,9 @@ class BackupManager internal constructor(
             }
 
             val rawPositions = bodyMap["resumePositions"] as? Map<*, *>
+            if (rawPositions != null && rawPositions.size > MAX_RESUME_POSITIONS) {
+                return BackupParseResult.Error("عدد مواضع الاستئناف يتجاوز الحد المسموح ($MAX_RESUME_POSITIONS)")
+            }
             val resumePositions = linkedMapOf<String, Long>()
             if (rawPositions != null) {
                 for ((k, v) in rawPositions) {
@@ -491,6 +535,9 @@ class BackupManager internal constructor(
             }
 
             val rawLocalSubtitles = bodyMap["localSubtitles"] as? List<*>
+            if (rawLocalSubtitles != null && rawLocalSubtitles.size > MAX_SUBTITLE_TRACKS) {
+                return BackupParseResult.Error("عدد مسارات الترجمة يتجاوز الحد المسموح ($MAX_SUBTITLE_TRACKS)")
+            }
             val localSubtitles = mutableListOf<LocalSubtitleStore.BackupStoredSubtitleTrack>()
             rawLocalSubtitles?.forEach { entry ->
                 val map = entry as? Map<*, *> ?: return@forEach
@@ -541,7 +588,13 @@ class BackupManager internal constructor(
                 localSubtitles = localSubtitles
             )
 
-            val expectedChecksum = sha256Hex(buildCanonicalBodyJson(candidate, numberLexemes))
+            val expectedChecksum = sha256Hex(
+                buildCanonicalBodyJson(
+                    payload = candidate,
+                    numberLexemes = numberLexemes,
+                    rawResumeModeName = resumeModeName
+                )
+            )
             if (!MessageDigest.isEqual(
                     expectedChecksum.toByteArray(Charsets.UTF_8),
                     declaredChecksum.toByteArray(Charsets.UTF_8)
@@ -579,7 +632,8 @@ class BackupManager internal constructor(
 
         private fun buildCanonicalBodyJson(
             payload: BackupPayload,
-            numberLexemes: Map<String, String> = emptyMap()
+            numberLexemes: Map<String, String> = emptyMap(),
+            rawResumeModeName: String? = null
         ): String {
             fun numToken(path: String, fallback: Any): String = numberLexemes[path] ?: fallback.toString()
             return buildString {
@@ -590,7 +644,7 @@ class BackupManager internal constructor(
                 append("\"playbackSpeed\":").append(numToken("settings.playbackSpeed", payload.settings.playbackSpeed)).append(",")
                 append("\"resizeMode\":").append(numToken("settings.resizeMode", payload.settings.resizeMode)).append(",")
                 append("\"playbackMode\":").append(quoteJson(payload.settings.playbackMode.name)).append(",")
-                append("\"resumeMode\":").append(quoteJson(payload.settings.resumeMode.name))
+                append("\"resumeMode\":").append(quoteJson(rawResumeModeName ?: payload.settings.resumeMode.name))
                 if (payload.schemaVersion >= 3 || payload.settings.seekIntervalSeconds != PlaybackPreferencesRepository.DEFAULT_SEEK_INTERVAL_SECONDS) {
                     append(",\"seekIntervalSeconds\":").append(numToken("settings.seekIntervalSeconds", payload.settings.seekIntervalSeconds))
                 }
@@ -687,6 +741,14 @@ class BackupManager internal constructor(
 
 private class MiniJsonParser(private val src: String) {
     private var pos = 0
+    private var depth = 0
+    private var totalElements = 0
+
+    companion object {
+        private const val MAX_JSON_DEPTH = 32
+        private const val MAX_JSON_ELEMENTS = 50_000
+        private const val MAX_JSON_STRING_LEN = 2 * 1024 * 1024
+    }
 
     fun parseValue(): Any? {
         skipWs()
@@ -703,56 +765,82 @@ private class MiniJsonParser(private val src: String) {
         }
     }
 
-    private fun parseObject(): Map<String, Any?> {
-        pos++ // '{'
-        val map = LinkedHashMap<String, Any?>()
-        skipWs()
-        if (pos < src.length && src[pos] == '}') {
-            pos++
-            return map
+    private fun enterContainer() {
+        depth++
+        if (depth > MAX_JSON_DEPTH) {
+            throw IllegalArgumentException("JSON nesting depth exceeds $MAX_JSON_DEPTH")
         }
-        while (true) {
+    }
+
+    private fun countElement() {
+        totalElements++
+        if (totalElements > MAX_JSON_ELEMENTS) {
+            throw IllegalArgumentException("JSON element count exceeds $MAX_JSON_ELEMENTS")
+        }
+    }
+
+    private fun parseObject(): Map<String, Any?> {
+        enterContainer()
+        try {
+            pos++ // '{'
+            val map = LinkedHashMap<String, Any?>()
             skipWs()
-            if (pos >= src.length || src[pos] != '"') throw IllegalArgumentException("Expected string key")
-            val key = parseString()
-            skipWs()
-            if (pos >= src.length || src[pos] != ':') throw IllegalArgumentException("Expected ':'")
-            pos++
-            val value = parseValue()
-            map[key] = value
-            skipWs()
-            if (pos >= src.length) throw IllegalArgumentException("Unterminated object")
-            when (src[pos]) {
-                ',' -> pos++
-                '}' -> {
-                    pos++
-                    return map
-                }
-                else -> throw IllegalArgumentException("Expected ',' or '}'")
+            if (pos < src.length && src[pos] == '}') {
+                pos++
+                return map
             }
+            while (true) {
+                skipWs()
+                if (pos >= src.length || src[pos] != '"') throw IllegalArgumentException("Expected string key")
+                countElement()
+                val key = parseString()
+                skipWs()
+                if (pos >= src.length || src[pos] != ':') throw IllegalArgumentException("Expected ':'")
+                pos++
+                val value = parseValue()
+                map[key] = value
+                skipWs()
+                if (pos >= src.length) throw IllegalArgumentException("Unterminated object")
+                when (src[pos]) {
+                    ',' -> pos++
+                    '}' -> {
+                        pos++
+                        return map
+                    }
+                    else -> throw IllegalArgumentException("Expected ',' or '}'")
+                }
+            }
+        } finally {
+            depth--
         }
     }
 
     private fun parseArray(): List<Any?> {
-        pos++ // '['
-        val list = ArrayList<Any?>()
-        skipWs()
-        if (pos < src.length && src[pos] == ']') {
-            pos++
-            return list
-        }
-        while (true) {
-            list.add(parseValue())
+        enterContainer()
+        try {
+            pos++ // '['
+            val list = ArrayList<Any?>()
             skipWs()
-            if (pos >= src.length) throw IllegalArgumentException("Unterminated array")
-            when (src[pos]) {
-                ',' -> pos++
-                ']' -> {
-                    pos++
-                    return list
-                }
-                else -> throw IllegalArgumentException("Expected ',' or ']'")
+            if (pos < src.length && src[pos] == ']') {
+                pos++
+                return list
             }
+            while (true) {
+                countElement()
+                list.add(parseValue())
+                skipWs()
+                if (pos >= src.length) throw IllegalArgumentException("Unterminated array")
+                when (src[pos]) {
+                    ',' -> pos++
+                    ']' -> {
+                        pos++
+                        return list
+                    }
+                    else -> throw IllegalArgumentException("Expected ',' or ']'")
+                }
+            }
+        } finally {
+            depth--
         }
     }
 
@@ -760,6 +848,9 @@ private class MiniJsonParser(private val src: String) {
         pos++ // '"'
         val sb = StringBuilder()
         while (pos < src.length) {
+            if (sb.length >= MAX_JSON_STRING_LEN) {
+                throw IllegalArgumentException("JSON string length exceeds $MAX_JSON_STRING_LEN")
+            }
             val ch = src[pos++]
             when (ch) {
                 '"' -> return sb.toString()

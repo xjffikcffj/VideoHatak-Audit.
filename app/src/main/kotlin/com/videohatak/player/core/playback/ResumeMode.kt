@@ -11,10 +11,6 @@ enum class ResumeMode(
     START_FROM_BEGINNING(
         titleArabic = "البدء من البداية دائمًا",
         descriptionArabic = "يبدأ أي فيديو من الثانية 00:00 في كل مرة"
-    ),
-    ASK_EVERY_TIME(
-        titleArabic = "السؤال عند كل فيديو",
-        descriptionArabic = "يسألك إن كنت تريد الاستئناف أو البدء من البداية إذا سبق تشغيله"
     )
 }
 

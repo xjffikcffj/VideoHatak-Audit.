@@ -258,12 +258,16 @@ class MlKitOfflineSubtitleTranslator(
                     val restored = SubtitleTurnAndGlossaryHelper.restoreGlossaryTerms(rawTranslated, protected)
                     ContextAwareDialogueTranslator.formatSubtitleLines(restored).ifBlank { cue.text }
                 } else {
-                    turns.joinToString("\n") { segment ->
-                        val protected = SubtitleTurnAndGlossaryHelper.protectGlossaryTerms(segment.cleanText, glossary)
-                        val rawTranslated = activeTranslator.translate(protected.maskedText).awaitTaskResult()
-                        val restored = SubtitleTurnAndGlossaryHelper.restoreGlossaryTerms(rawTranslated, protected)
-                        "${segment.prefix}$restored".trim()
+                    val translatedTurns = buildList(turns.size) {
+                        for (segment in turns) {
+                            coroutineContext.ensureActive()
+                            val protected = SubtitleTurnAndGlossaryHelper.protectGlossaryTerms(segment.cleanText, glossary)
+                            val rawTranslated = activeTranslator.translate(protected.maskedText).awaitTaskResult()
+                            val restored = SubtitleTurnAndGlossaryHelper.restoreGlossaryTerms(rawTranslated, protected)
+                            add("${segment.prefix}$restored".trim())
+                        }
                     }
+                    translatedTurns.joinToString("\n")
                 }
 
                 results.add(

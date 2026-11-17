@@ -273,13 +273,17 @@ class OfflineModelManager private constructor(
             val isMlKitDownloading = activeMlKitJobs[lang]?.isActive == true
 
             val (speechStatus, installedVer, diskBytes) = if (isSpeechDownloading) {
-                Triple(
-                    OfflineModelDownloadStatus.DOWNLOADING,
-                    current.speechInstalledVersion,
-                    current.speechDiskBytes
+                SpeechDiskInspection(
+                    status = OfflineModelDownloadStatus.DOWNLOADING,
+                    version = current.speechInstalledVersion,
+                    bytes = current.speechDiskBytes
                 )
             } else if (spec == null) {
-                Triple(OfflineModelDownloadStatus.NOT_DOWNLOADED, null, 0L)
+                SpeechDiskInspection(
+                    status = OfflineModelDownloadStatus.NOT_DOWNLOADED,
+                    version = null,
+                    bytes = 0L
+                )
             } else {
                 inspectVoskModelOnDisk(spec, persistedRecords[lang.code])
             }
@@ -444,6 +448,7 @@ class OfflineModelManager private constructor(
                 }
 
                 var movedExistingToBackup = false
+                var replaceSucceeded = false
                 try {
                     val maxDownloadBytes = maxOf(spec.expectedZipBytes * 3L, 640L * 1024L * 1024L)
                     if (streamDownloader != null) {
@@ -491,6 +496,14 @@ class OfflineModelManager private constructor(
                         }
                     }
 
+                    val extractAvailableBytes = runCatching {
+                        StatFs(rootDir.absolutePath).availableBytes
+                    }.getOrDefault(Long.MAX_VALUE)
+                    val requiredExtractMargin = maxOf(spec.approximateDiskExtractedMb.toLong() * 1024L * 1024L, 64L * 1024L * 1024L)
+                    if (extractAvailableBytes < requiredExtractMargin) {
+                        throw IOException("المساحة التخزينية المتاحة غير كافية لفك ضغط نموذج ${language.arabicName}")
+                    }
+
                     updateLanguageState(language) {
                         it.copy(
                             speechStatus = OfflineModelDownloadStatus.DOWNLOADING,
@@ -509,11 +522,8 @@ class OfflineModelManager private constructor(
                     }
 
                     if (modelDir.exists()) {
-                        movedExistingToBackup = modelDir.renameTo(backupDir) || run {
-                            locatedModelRoot.let {
-                                modelDir.copyRecursively(backupDir, overwrite = true) && modelDir.deleteRecursively()
-                            }
-                        }
+                        movedExistingToBackup = modelDir.renameTo(backupDir) ||
+                            (modelDir.copyRecursively(backupDir, overwrite = true) && modelDir.deleteRecursively())
                         if (!movedExistingToBackup) {
                             throw IOException("تعذر تجهيز النسخة السابقة للاستبدال الآمن لنموذج ${language.arabicName}")
                         }
@@ -526,6 +536,7 @@ class OfflineModelManager private constructor(
                         throw IOException("تعذر تثبيت ملفات نموذج ${language.arabicName} داخل ذاكرة التطبيق")
                     }
 
+                    replaceSucceeded = true
                     backupDir.deleteRecursively()
                     persistSpeechRecord(language.code, spec)
                     val finalBytes = calculateDirectoryBytes(modelDir)
@@ -543,11 +554,12 @@ class OfflineModelManager private constructor(
                     withContext(NonCancellable) {
                         modelDir.deleteRecursively()
                         if (movedExistingToBackup && backupDir.exists()) {
-                            if (!backupDir.renameTo(modelDir)) {
-                                backupDir.copyRecursively(modelDir, overwrite = true)
+                            if (backupDir.renameTo(modelDir)) {
+                                refreshAllStates()
+                            } else if (backupDir.copyRecursively(modelDir, overwrite = true) && hasValidVoskStructure(modelDir, minExpectedBytes)) {
                                 backupDir.deleteRecursively()
+                                refreshAllStates()
                             }
-                            refreshAllStates()
                         } else {
                             updateLanguageState(language) {
                                 it.copy(
@@ -564,8 +576,9 @@ class OfflineModelManager private constructor(
                     modelDir.deleteRecursively()
                     if (movedExistingToBackup && backupDir.exists()) {
                         if (!backupDir.renameTo(modelDir)) {
-                            backupDir.copyRecursively(modelDir, overwrite = true)
-                            backupDir.deleteRecursively()
+                            if (backupDir.copyRecursively(modelDir, overwrite = true) && hasValidVoskStructure(modelDir, minExpectedBytes)) {
+                                backupDir.deleteRecursively()
+                            }
                         }
                     }
                     val msg = "تعذر تنزيل نموذج ${language.arabicName}: ${e.localizedMessage ?: "خطأ في الشبكة"}"
@@ -580,14 +593,17 @@ class OfflineModelManager private constructor(
                 } finally {
                     tempZip.delete()
                     stagingDir.deleteRecursively()
-                    backupDir.deleteRecursively()
+                    if (replaceSucceeded) {
+                        backupDir.deleteRecursively()
+                    }
                     activeSpeechJobs.remove(language)
                 }
             }
         }
 
     fun cancelSpeechModelDownload(language: SubtitleTranslationLanguage) {
-        activeSpeechJobs.remove(language)?.cancel()
+        val cancelledJob = activeSpeechJobs.remove(language)
+        cancelledJob?.cancel()
         updateLanguageState(language) {
             it.copy(
                 speechStatus = OfflineModelDownloadStatus.NOT_DOWNLOADED,
@@ -595,6 +611,10 @@ class OfflineModelManager private constructor(
                 speechDownloadedBytes = 0L,
                 speechErrorMessage = null
             )
+        }
+        scope.launch {
+            runCatching { cancelledJob?.join() }
+            runCatching { refreshAllStates() }
         }
     }
 
@@ -905,9 +925,49 @@ class OfflineModelManager private constructor(
         maxDownloadBytes: Long,
         onProgress: suspend (bytesRead: Long, totalBytes: Long) -> Unit
     ) {
+        val maxAttempts = 3
+        var lastError: IOException? = null
+
+        for (attempt in 1..maxAttempts) {
+            coroutineContext.ensureActive()
+            try {
+                downloadFileSingleAttempt(
+                    urlString = urlString,
+                    destFile = destFile,
+                    fallbackTotalBytes = fallbackTotalBytes,
+                    maxDownloadBytes = maxDownloadBytes,
+                    onProgress = onProgress
+                )
+                return
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (se: SecurityException) {
+                throw se
+            } catch (e: IOException) {
+                lastError = e
+                if (attempt < maxAttempts) {
+                    kotlinx.coroutines.delay(attempt * 1_500L)
+                }
+            }
+        }
+        throw lastError ?: IOException("فشل تنزيل ملف النموذج الصوتي بعد عدة محاولات")
+    }
+
+    private suspend fun downloadFileSingleAttempt(
+        urlString: String,
+        destFile: File,
+        fallbackTotalBytes: Long,
+        maxDownloadBytes: Long,
+        onProgress: suspend (bytesRead: Long, totalBytes: Long) -> Unit
+    ) {
         var currentUrl = urlString
         var redirects = 0
         var conn: HttpURLConnection? = null
+        val existingBytes = if (destFile.exists() && destFile.length() > 0L && destFile.length() < maxDownloadBytes) {
+            destFile.length()
+        } else {
+            0L
+        }
 
         while (true) {
             coroutineContext.ensureActive()
@@ -921,6 +981,9 @@ class OfflineModelManager private constructor(
                 readTimeout = 45_000
                 requestMethod = "GET"
                 setRequestProperty("Accept", "application/zip, application/octet-stream, */*")
+                if (existingBytes > 0L) {
+                    setRequestProperty("Range", "bytes=$existingBytes-")
+                }
             }
             conn = connection
             val code = connection.responseCode
@@ -938,23 +1001,35 @@ class OfflineModelManager private constructor(
                 redirects++
                 continue
             }
+            if (code == 416 && existingBytes > 0L) {
+                connection.disconnect()
+                destFile.delete()
+                throw IOException("إعادة محاولة التنزيل من البداية بعد عدم تطابق نطاق الاستئناف")
+            }
             if (code !in 200..299) {
                 connection.disconnect()
                 throw IOException("استجابة خادم التنزيل غير صالحة (رمز الحالة: $code)")
             }
 
+            val isResuming = code == HttpURLConnection.HTTP_PARTIAL && existingBytes > 0L
+            val baseOffset = if (isResuming) existingBytes else 0L
             val reportedBytes = connection.contentLengthLong
-            if (reportedBytes > maxDownloadBytes) {
+            val expectedTotalBytes = when {
+                isResuming && reportedBytes > 0L -> baseOffset + reportedBytes
+                reportedBytes > 0L -> reportedBytes
+                else -> fallbackTotalBytes
+            }
+            if (expectedTotalBytes > maxDownloadBytes) {
                 connection.disconnect()
                 throw SecurityException("حجم الملف المُبلغ من الخادم يتجاوز الحد الأقصى الآمن المسموح به")
             }
-            val totalBytes = reportedBytes.takeIf { it > 0L } ?: fallbackTotalBytes
+
             try {
                 BufferedInputStream(connection.inputStream).use { input ->
-                    FileOutputStream(destFile).use { output ->
+                    FileOutputStream(destFile, isResuming).use { output ->
                         val buffer = ByteArray(32 * 1024)
-                        var copied = 0L
-                        var lastUiUpdateBytes = 0L
+                        var copied = baseOffset
+                        var lastUiUpdateBytes = baseOffset
                         while (true) {
                             coroutineContext.ensureActive()
                             val read = input.read(buffer)
@@ -964,9 +1039,9 @@ class OfflineModelManager private constructor(
                                 throw SecurityException("تجاوز حجم التنزيل الحد الأقصى المسموح به للنموذج")
                             }
                             output.write(buffer, 0, read)
-                            if (copied - lastUiUpdateBytes >= 256 * 1024 || copied >= totalBytes) {
+                            if (copied - lastUiUpdateBytes >= 256 * 1024 || copied >= expectedTotalBytes) {
                                 lastUiUpdateBytes = copied
-                                onProgress(copied, totalBytes)
+                                onProgress(copied, expectedTotalBytes)
                             }
                         }
                         output.flush()
@@ -1041,6 +1116,30 @@ class OfflineModelManager private constructor(
         rootDir.mkdirs()
         voskBaseDir.mkdirs()
         tmpBaseDir.mkdirs()
+        recoverInterruptedBackups()
+    }
+
+    private fun recoverInterruptedBackups() {
+        val entries = voskBaseDir.listFiles() ?: return
+        for (entry in entries) {
+            if (!entry.isDirectory || !entry.name.endsWith(".bak")) continue
+            val modelId = entry.name.removeSuffix(".bak")
+            if (modelId.isBlank()) continue
+            val targetDir = File(voskBaseDir, modelId)
+            val matchingSpec = VoskModelCatalog.ALL_MODELS.firstOrNull { it.modelId == modelId }
+            val minBytes = matchingSpec?.let { productionMinExpectedBytes(it) } ?: 0L
+            val targetValid = targetDir.exists() && hasValidVoskStructure(targetDir, minBytes)
+            if (targetValid) {
+                entry.deleteRecursively()
+            } else if (hasValidVoskStructure(entry, minBytes)) {
+                targetDir.deleteRecursively()
+                if (!entry.renameTo(targetDir)) {
+                    if (entry.copyRecursively(targetDir, overwrite = true) && hasValidVoskStructure(targetDir, minBytes)) {
+                        entry.deleteRecursively()
+                    }
+                }
+            }
+        }
     }
 
     private suspend fun readCatalogRecords(): Map<String, JSONObject> = catalogMutex.withLock {

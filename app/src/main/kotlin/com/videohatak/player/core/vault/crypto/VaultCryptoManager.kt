@@ -485,6 +485,66 @@ class VaultCryptoManager internal constructor(
         return encSize
     }
 
+    fun verifyEncryptedFileIntegrity(encryptedFile: File) {
+        if (!encryptedFile.exists() || encryptedFile.length() <= 0L) {
+            throw IllegalStateException("Encrypted vault file verification failed")
+        }
+        val header = parseEncryptedFileHeader(encryptedFile)
+        val headerAad = buildHeaderAad(
+            MAGIC_HEADER,
+            header.fileSalt,
+            header.chunkSize,
+            header.plaintextSizeBytes
+        )
+        val dek = unwrapDataKeyWithFallback(header.encryptedDek, headerAad)
+        try {
+            RandomAccessFile(encryptedFile, "r").use { raf ->
+                raf.seek(header.headerSize.toLong())
+                var totalPlaintext = 0L
+                var chunkIndex = 0
+                while (totalPlaintext < header.plaintextSizeBytes) {
+                    val encSize = validateEncryptedChunkSize(raf.readInt(), header.chunkSize)
+                    val encBytes = ByteArray(encSize)
+                    raf.readFully(encBytes)
+
+                    val nonce = deriveChunkNonce(header.fileSalt, chunkIndex)
+                    val chunkAad = buildChunkAad(header.fileSalt, chunkIndex)
+                    val cipher = Cipher.getInstance(TRANSFORMATION)
+                    cipher.init(Cipher.DECRYPT_MODE, dek, GCMParameterSpec(GCM_TAG_LENGTH_BITS, nonce))
+                    cipher.updateAAD(chunkAad)
+
+                    val plainChunk = try {
+                        cipher.doFinal(encBytes)
+                    } catch (e: AEADBadTagException) {
+                        try {
+                            val fallbackCipher = Cipher.getInstance(TRANSFORMATION)
+                            fallbackCipher.init(Cipher.DECRYPT_MODE, dek, GCMParameterSpec(GCM_TAG_LENGTH_BITS, nonce))
+                            fallbackCipher.doFinal(encBytes)
+                        } catch (_: Exception) {
+                            throw e
+                        }
+                    }
+
+                    try {
+                        totalPlaintext += plainChunk.size
+                        chunkIndex++
+                    } finally {
+                        zeroByteArray(plainChunk)
+                    }
+                }
+                if (totalPlaintext != header.plaintextSizeBytes) {
+                    throw IOException("Encrypted vault plaintext size mismatch: expected ${header.plaintextSizeBytes}, got $totalPlaintext")
+                }
+                if (raf.filePointer != raf.length()) {
+                    throw IOException("Unexpected trailing bytes after encrypted chunks at ${raf.filePointer}/${raf.length()}")
+                }
+            }
+        } finally {
+            runCatching { zeroByteArray(dek.encoded) }
+            runCatching { dek.destroy() }
+        }
+    }
+
     fun readDecryptedRange(
         encryptedFile: File,
         fileSalt: ByteArray,

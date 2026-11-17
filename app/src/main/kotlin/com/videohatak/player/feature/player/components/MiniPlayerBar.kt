@@ -29,6 +29,7 @@ import androidx.compose.ui.unit.dp
 import com.videohatak.player.core.designsystem.theme.LocalVideoHatakPalette
 import com.videohatak.player.core.model.VideoItem
 import com.videohatak.player.core.playback.PlayerUiState
+import com.videohatak.player.core.playback.service.MediaNotificationPrivacy
 
 @Composable
 fun MiniPlayerBar(
@@ -42,6 +43,7 @@ fun MiniPlayerBar(
     modifier: Modifier = Modifier
 ) {
     val palette = LocalVideoHatakPalette.current
+    val isVaultPrivate = MediaNotificationPrivacy.isVaultVideo(video)
 
     Column(
         modifier = modifier
@@ -72,7 +74,7 @@ fun MiniPlayerBar(
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = video.safeTitle,
+                    text = if (isVaultPrivate) MediaNotificationPrivacy.VAULT_MASKED_TITLE else video.safeTitle,
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.SemiBold,
                     color = palette.onSurface,
@@ -80,7 +82,11 @@ fun MiniPlayerBar(
                     overflow = TextOverflow.Ellipsis
                 )
                 Text(
-                    text = "${uiState.formattedCurrentTime} / ${uiState.formattedTotalDuration}",
+                    text = if (isVaultPrivate) {
+                        MediaNotificationPrivacy.VAULT_MASKED_TEXT
+                    } else {
+                        "${uiState.formattedCurrentTime} / ${uiState.formattedTotalDuration}"
+                    },
                     style = MaterialTheme.typography.labelSmall,
                     color = palette.onSurfaceMuted
                 )

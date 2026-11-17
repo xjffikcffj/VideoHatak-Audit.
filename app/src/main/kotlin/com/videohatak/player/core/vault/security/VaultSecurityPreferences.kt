@@ -28,7 +28,8 @@ enum class VaultAutoLockTimeout(
     IMMEDIATE(0L, "فوري عند مغادرة التطبيق أو الخزنة"),
     SECONDS_30(30_000L, "بعد 30 ثانية من عدم النشاط"),
     MINUTE_1(60_000L, "بعد دقيقة واحدة"),
-    MINUTES_5(300_000L, "بعد 5 دقائق");
+    MINUTES_5(300_000L, "بعد 5 دقائق"),
+    MINUTES_10(600_000L, "بعد 10 دقائق");
 
     fun shouldAutoLockOnBackground(): Boolean = this == IMMEDIATE
 

@@ -272,18 +272,7 @@ class VaultRepositoryImpl internal constructor(
     }
 
     private fun verifyEncryptedOutputIntegrity(destFile: File) {
-        if (!destFile.exists() || destFile.length() <= 0L) {
-            throw IllegalStateException("Encrypted vault file verification failed")
-        }
-        val header = cryptoManager.parseEncryptedFileHeader(destFile)
-        val aad = cryptoManager.buildHeaderAad(
-            VaultCryptoManager.MAGIC_HEADER,
-            header.fileSalt,
-            header.chunkSize,
-            header.plaintextSizeBytes
-        )
-        val dek = cryptoManager.unwrapDataKeyWithFallback(header.encryptedDek, aad)
-        cryptoManager.zeroByteArray(dek.encoded)
+        cryptoManager.verifyEncryptedFileIntegrity(destFile)
     }
 
     private fun decodeVaultRow(row: VaultVideo): VaultVideo? {
@@ -510,8 +499,19 @@ class VaultRepositoryImpl internal constructor(
                 return@withContext false
             }
             val internalFile = File(decoded.relativeEncryptedPath).name
+            val existingSourceFingerprint = existing.encryptedMetaBase64
+                ?.takeIf { it.isNotBlank() }
+                ?.let { enc ->
+                    runCatching { JSONObject(cryptoManager.decryptMetadata(enc)).optString("src") }.getOrNull()
+                }
+                .orEmpty()
             val rows = try {
-                val newEncryptedMeta = encodeMetadata(cleanTitle, internalFile, decoded.mimeType)
+                val newEncryptedMeta = encodeMetadata(
+                    displayName = cleanTitle,
+                    internalFileName = internalFile,
+                    mimeType = decoded.mimeType,
+                    sourceFingerprint = existingSourceFingerprint
+                )
                 dbHelper.updateEncryptedMetadata(
                     id = videoId,
                     maskedDisplayName = MASKED_DISPLAY_NAME,

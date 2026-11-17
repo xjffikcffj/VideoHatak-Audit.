@@ -327,7 +327,7 @@ class EngineeringFixesVerificationTest {
                 playbackSpeed = 1.5f,
                 resizeMode = VideoResizeMode.RATIO_16_9.storageCode,
                 playbackMode = PlaybackMode.REPEAT_ONE,
-                resumeMode = ResumeMode.ASK_EVERY_TIME
+                resumeMode = ResumeMode.START_FROM_BEGINNING
             ),
             subtitles = BackupSubtitleData(
                 primaryFontSizeSp = 20f,
@@ -367,7 +367,7 @@ class EngineeringFixesVerificationTest {
         assertEquals(1.5f, restored.settings.playbackSpeed, 0.001f)
         assertEquals(VideoResizeMode.RATIO_16_9.storageCode, restored.settings.resizeMode)
         assertEquals(PlaybackMode.REPEAT_ONE, restored.settings.playbackMode)
-        assertEquals(ResumeMode.ASK_EVERY_TIME, restored.settings.resumeMode)
+        assertEquals(ResumeMode.START_FROM_BEGINNING, restored.settings.resumeMode)
         assertEquals(VaultAutoLockTimeout.MINUTE_1, restored.vaultSecurity.autoLockTimeout)
         assertEquals(1, restored.playlists.size)
         assertEquals("المفضلة \\ \"الخاصة\"", restored.playlists[0].title)

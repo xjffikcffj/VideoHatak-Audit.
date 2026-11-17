@@ -20,6 +20,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
@@ -63,7 +64,9 @@ class VaultViewModel(
     val biometricError: StateFlow<String?> = _biometricError.asStateFlow()
 
     val errorMessage: StateFlow<String?> = biometricError
-    val isImporting: StateFlow<Boolean> = MutableStateFlow(false)
+    val isImporting: StateFlow<Boolean> = importState
+        .map { it is VaultImportState.Encrypting }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
 
     private var importJob: Job? = null
     private var inactivityJob: Job? = null
@@ -247,7 +250,8 @@ class VaultViewModel(
     fun importVideoFromUri(
         sourceUri: Uri,
         displayName: String? = null,
-        deleteOriginal: Boolean = false
+        deleteOriginal: Boolean = false,
+        onComplete: (Boolean) -> Unit = {}
     ) {
         importJob?.cancel()
         isImportCancelled = false
@@ -276,12 +280,14 @@ class VaultViewModel(
             if (result != null) {
                 _importState.value = VaultImportState.Success
                 refresh()
+                onComplete(true)
             } else {
                 _importState.value = if (isImportCancelled) {
                     VaultImportState.Idle
                 } else {
                     VaultImportState.Error("فشل تشفير واستيراد الفيديو إلى الخزنة")
                 }
+                onComplete(false)
             }
         }
     }
@@ -292,8 +298,12 @@ class VaultViewModel(
         durationMs: Long,
         onComplete: (Boolean) -> Unit = {}
     ) {
-        importVideoFromUri(sourceUri = uri, displayName = title, deleteOriginal = false)
-        onComplete(true)
+        importVideoFromUri(
+            sourceUri = uri,
+            displayName = title,
+            deleteOriginal = false,
+            onComplete = onComplete
+        )
     }
 
     fun cancelImport() {

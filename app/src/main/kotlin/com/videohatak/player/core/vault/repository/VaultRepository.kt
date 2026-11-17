@@ -261,13 +261,19 @@ class VaultRepositoryImpl internal constructor(
 
     private fun hasEnoughStorageForEncryption(estimatedSize: Long): Boolean {
         if (estimatedSize <= 0L) return true
+        val required = estimatedSize + (estimatedSize / 10L) + (8L * 1024L * 1024L)
         return try {
             val stat = StatFs(vaultDir.absolutePath)
-            val available = stat.availableBytes
-            val required = estimatedSize + (estimatedSize / 10L) + (8L * 1024L * 1024L)
+            val available = if (stat.blockCountLong > 0L && stat.totalBytes > 0L) {
+                stat.availableBytes
+            } else if (vaultDir.totalSpace > 0L) {
+                vaultDir.usableSpace
+            } else {
+                return true
+            }
             available >= required
         } catch (_: Exception) {
-            true
+            if (vaultDir.totalSpace > 0L) vaultDir.usableSpace >= required else true
         }
     }
 
@@ -363,6 +369,7 @@ class VaultRepositoryImpl internal constructor(
 
         activeImportTempNames.add(stagingFile.name)
         activeImportTempNames.add(stagingInnerTempName)
+        var destCommittedInDb = false
         try {
             val encResult = inputStream.use { input ->
                 cryptoManager.encryptStream(
@@ -419,6 +426,7 @@ class VaultRepositoryImpl internal constructor(
                     destFile.delete()
                     throw IllegalStateException("Failed to persist vault record")
                 }
+                destCommittedInDb = true
 
                 _vaultError.value = null
                 val savedVideo = dbRow.copy(
@@ -434,6 +442,9 @@ class VaultRepositoryImpl internal constructor(
         } catch (e: Exception) {
             stagingFile.delete()
             File(vaultDir, stagingInnerTempName).delete()
+            if (!destCommittedInDb && destFile.exists()) {
+                destFile.delete()
+            }
             if (e !is InterruptedException) {
                 _vaultError.value = "فشل تشفير الفيديو إلى الخزنة: بقي الملف الأصلي سليمًا في مكانه"
             }

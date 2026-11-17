@@ -865,9 +865,16 @@ class PlaybackIntegrationTest {
 
         val playlistRepo = PlaylistRepositoryImpl(testApp())
         val playlistId = playlistRepo.createPlaylist("قائمة عشوائية للاختبار")
+        val shuffleFiles = (1..3).map { idx ->
+            File.createTempFile("shuffle_${idx}_", ".mp4").apply {
+                writeBytes(byteArrayOf(1, 2, 3))
+                deleteOnExit()
+                tempFiles.add(this)
+            }
+        }
         val item1 = VideoItem(
             id = 2001L,
-            contentUri = Uri.parse("content://media/external/video/media/shuffle_1"),
+            contentUri = Uri.fromFile(shuffleFiles[0]),
             title = "Shuffle 1",
             displayName = "Shuffle 1",
             durationMs = 60_000L,
@@ -876,7 +883,7 @@ class PlaybackIntegrationTest {
         )
         val item2 = VideoItem(
             id = 2002L,
-            contentUri = Uri.parse("content://media/external/video/media/shuffle_2"),
+            contentUri = Uri.fromFile(shuffleFiles[1]),
             title = "Shuffle 2",
             displayName = "Shuffle 2",
             durationMs = 60_000L,
@@ -885,7 +892,7 @@ class PlaybackIntegrationTest {
         )
         val item3 = VideoItem(
             id = 2003L,
-            contentUri = Uri.parse("content://media/external/video/media/shuffle_3"),
+            contentUri = Uri.fromFile(shuffleFiles[2]),
             title = "Shuffle 3",
             displayName = "Shuffle 3",
             durationMs = 60_000L,

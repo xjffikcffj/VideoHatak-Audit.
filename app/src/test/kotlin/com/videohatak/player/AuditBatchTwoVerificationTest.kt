@@ -93,8 +93,11 @@ import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
-import org.junit.rules.Timeout
+import org.junit.rules.TestRule
+import org.junit.runner.Description
 import org.junit.runner.RunWith
+import org.junit.runners.model.Statement
+import org.junit.runners.model.TestTimedOutException
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
@@ -105,6 +108,9 @@ import java.lang.reflect.Method
 import java.lang.reflect.Proxy
 import java.security.MessageDigest
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.PI
 import kotlin.math.roundToInt
@@ -120,7 +126,36 @@ class AuditBatchTwoVerificationTest {
     val tempFolder = TemporaryFolder()
 
     @get:Rule
-    val timeoutRule: Timeout = Timeout.seconds(30)
+    val timeoutRule: TestRule = TestRule { base: Statement, _: Description ->
+        object : Statement() {
+            override fun evaluate() {
+                val testThread = Thread.currentThread()
+                val timedOut = AtomicBoolean(false)
+                val scheduler = Executors.newSingleThreadScheduledExecutor { r ->
+                    Thread(r, "AuditBatchTwoTimeoutWatchdog").apply { isDaemon = true }
+                }
+                val timeoutTask = scheduler.schedule({
+                    timedOut.set(true)
+                    testThread.interrupt()
+                }, 30L, TimeUnit.SECONDS)
+                try {
+                    base.evaluate()
+                    if (timedOut.get()) {
+                        throw TestTimedOutException(30L, TimeUnit.SECONDS)
+                    }
+                } catch (t: Throwable) {
+                    if (timedOut.get()) {
+                        throw TestTimedOutException(30L, TimeUnit.SECONDS).apply { initCause(t) }
+                    }
+                    throw t
+                } finally {
+                    timeoutTask.cancel(false)
+                    scheduler.shutdownNow()
+                    Thread.interrupted()
+                }
+            }
+        }
+    }
 
     private val testDispatcher = StandardTestDispatcher()
     private val tempFiles = mutableListOf<File>()

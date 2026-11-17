@@ -49,6 +49,9 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
+import java.io.OutputStream
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34], manifest = Config.NONE)
@@ -809,5 +812,428 @@ class BuildFixesMigrationAndBackupLimitTest {
         assertTrue(fileUriFail.isFailure)
         assertTrue(realUserFile.exists())
         assertEquals(originalUserBytes.toString(Charsets.UTF_8), realUserFile.readText(Charsets.UTF_8))
+    }
+
+    private fun assertNoLeftoverBackupTemps(vararg dirs: File) {
+        for (dir in dirs) {
+            if (!dir.exists()) continue
+            val leftovers = dir.listFiles().orEmpty().filter { f ->
+                f.name.endsWith(".tmp") || f.name.endsWith(".partial") || f.name.endsWith(".bak.tmp") || f.name.endsWith(".restore.tmp")
+            }
+            assertTrue(
+                "No leftover backup temp/partial files allowed in ${dir.absolutePath}, found: ${leftovers.map { it.name }}",
+                leftovers.isEmpty()
+            )
+        }
+    }
+
+    @Test
+    fun backupManager_fileExport_newSuccess_isReadableIntegrityVerified_andLeavesNoTemps() = runBlocking {
+        val themeRepo = FakeThemeRepo().apply { setAppTheme(AppThemeId.ROYAL_IVORY) }
+        val playbackPrefs = FakePlaybackPrefs().apply { setPlaybackMode(PlaybackMode.SHUFFLE_ALL) }
+        val manager = BackupManager.createForTesting(
+            themeRepository = themeRepo,
+            playbackRepository = playbackPrefs,
+            subtitleRepository = FakeSubtitlePrefStore(),
+            vaultSecurityStore = FakeVaultSecurityStore(),
+            playlistStore = FakePlaylistStore(),
+            subtitleStore = null
+        )
+
+        val targetDir = tempFolder.newFolder("new_export_target")
+        val stagingDir = tempFolder.newFolder("new_export_staging")
+        val targetFile = File(targetDir, "videohatak_backup.json")
+
+        val exportRes = manager.exportToFile(targetFile, stagingDir)
+        assertTrue("New file export must succeed: ${exportRes.exceptionOrNull()}", exportRes.isSuccess)
+        assertTrue(targetFile.exists() && targetFile.length() > 0L)
+        assertEquals(targetFile.length().toInt(), exportRes.getOrThrow().byteSize)
+
+        // Must be readable and pass JSON + SHA-256 verification and full import round-trip
+        val parsed = BackupManager.parseAndValidateBackupJson(targetFile.readText(Charsets.UTF_8))
+        assertTrue("Exported file must pass full integrity validation", parsed is BackupParseResult.Success)
+        val imported = manager.importFromFile(targetFile)
+        assertTrue("Exported file must import cleanly: ${imported.exceptionOrNull()}", imported.isSuccess)
+        assertEquals(AppThemeId.ROYAL_IVORY, imported.getOrThrow().themeRestored)
+
+        assertNoLeftoverBackupTemps(targetDir, stagingDir)
+    }
+
+    @Test
+    fun backupManager_fileExport_midStageWriteFailure_preservesExistingValidBackupAndLeavesNoTemps() = runBlocking {
+        val manager = BackupManager.createForTesting(
+            themeRepository = FakeThemeRepo(),
+            playbackRepository = FakePlaybackPrefs(),
+            subtitleRepository = FakeSubtitlePrefStore(),
+            vaultSecurityStore = FakeVaultSecurityStore(),
+            playlistStore = FakePlaylistStore(),
+            subtitleStore = null
+        )
+
+        val targetDir = tempFolder.newFolder("mid_stage_target")
+        val stagingDir = tempFolder.newFolder("mid_stage_dir")
+        val targetFile = File(targetDir, "existing_backup.json")
+
+        val oldPayload = buildSizedPayload(2_048)
+        assertTrue(manager.exportPayloadToFile(oldPayload, targetFile, stagingDir).isSuccess)
+        val oldContent = targetFile.readText(Charsets.UTF_8)
+
+        val newPayload = buildSizedPayload(4_096)
+        manager.fileOutputStreamOpenerForTesting = { file, role ->
+            if (role == "stage") {
+                val inner = FileOutputStream(file)
+                object : OutputStream() {
+                    private var written = 0
+                    override fun write(b: Int) {
+                        if (written >= 120) throw IOException("Simulated mid-stage disk full")
+                        inner.write(b)
+                        written++
+                    }
+                    override fun write(b: ByteArray, off: Int, len: Int) {
+                        val rem = 120 - written
+                        if (rem <= 0) throw IOException("Simulated mid-stage disk full")
+                        val chunk = minOf(len, rem)
+                        inner.write(b, off, chunk)
+                        written += chunk
+                        if (chunk < len) throw IOException("Simulated mid-stage disk full")
+                    }
+                    override fun flush() = inner.flush()
+                    override fun close() = inner.close()
+                }
+            } else {
+                FileOutputStream(file)
+            }
+        }
+
+        val failedExport = manager.exportPayloadToFile(newPayload, targetFile, stagingDir)
+        assertTrue("Mid-stage write failure must fail export", failedExport.isFailure)
+        assertTrue(targetFile.exists())
+        assertEquals("Pre-existing valid backup must remain untouched", oldContent, targetFile.readText(Charsets.UTF_8))
+        assertTrue(BackupManager.parseAndValidateBackupJson(targetFile.readText(Charsets.UTF_8)) is BackupParseResult.Success)
+        assertTrue(manager.importFromFile(targetFile).isSuccess)
+        assertNoLeftoverBackupTemps(targetDir, stagingDir)
+    }
+
+    @Test
+    fun backupManager_fileExport_partialToDestinationCopyFailure_restoresExistingValidBackupAndCleansTemps() = runBlocking {
+        val manager = BackupManager.createForTesting(
+            themeRepository = FakeThemeRepo(),
+            playbackRepository = FakePlaybackPrefs(),
+            subtitleRepository = FakeSubtitlePrefStore(),
+            vaultSecurityStore = FakeVaultSecurityStore(),
+            playlistStore = FakePlaylistStore(),
+            subtitleStore = null
+        )
+
+        val targetDir = tempFolder.newFolder("copy_fail_target")
+        val stagingDir = tempFolder.newFolder("copy_fail_staging")
+        val existingFile = File(targetDir, "existing.json")
+        val oldPayload = buildSizedPayload(3_072)
+        assertTrue(manager.exportPayloadToFile(oldPayload, existingFile, stagingDir).isSuccess)
+        val oldBytes = existingFile.readBytes()
+
+        val newPayload = buildSizedPayload(6_144)
+
+        // Force fallback copy path (.partial move fails) AND fail mid-write during dest_copy
+        manager.fileMoveHookForTesting = { _, _ -> false }
+        manager.fileOutputStreamOpenerForTesting = { file, role ->
+            if (role == "dest_copy") {
+                val inner = FileOutputStream(file)
+                object : OutputStream() {
+                    private var written = 0
+                    override fun write(b: Int) {
+                        if (written >= 200) throw IOException("Simulated destination copy I/O error")
+                        inner.write(b)
+                        written++
+                    }
+                    override fun write(b: ByteArray, off: Int, len: Int) {
+                        val rem = 200 - written
+                        if (rem <= 0) throw IOException("Simulated destination copy I/O error")
+                        val chunk = minOf(len, rem)
+                        inner.write(b, off, chunk)
+                        inner.flush()
+                        written += chunk
+                        if (chunk < len) throw IOException("Simulated destination copy I/O error")
+                    }
+                    override fun flush() = inner.flush()
+                    override fun close() = inner.close()
+                }
+            } else {
+                FileOutputStream(file)
+            }
+        }
+
+        val failOverExisting = manager.exportPayloadToFile(newPayload, existingFile, stagingDir)
+        assertTrue("Copy failure to destination must return failure", failOverExisting.isFailure)
+        assertTrue(existingFile.exists())
+        assertEquals(
+            "Pre-existing valid backup must be completely restored after fallback copy failure",
+            oldBytes.toString(Charsets.UTF_8),
+            existingFile.readText(Charsets.UTF_8)
+        )
+        assertTrue(manager.importFromFile(existingFile).isSuccess)
+        assertNoLeftoverBackupTemps(targetDir, stagingDir)
+
+        // When target did not exist beforehand, failed fallback copy must delete partial target
+        val brandNewTarget = File(targetDir, "brand_new_copy_fail.json")
+        val failOverNew = manager.exportPayloadToFile(newPayload, brandNewTarget, stagingDir)
+        assertTrue(failOverNew.isFailure)
+        assertFalse("Partial new target file must be removed after copy failure", brandNewTarget.exists())
+        assertNoLeftoverBackupTemps(targetDir, stagingDir)
+    }
+
+    @Test
+    fun backupManager_fileExport_corruptPostWriteDestination_rejectsAndRestoresOldBackup() = runBlocking {
+        val manager = BackupManager.createForTesting(
+            themeRepository = FakeThemeRepo(),
+            playbackRepository = FakePlaybackPrefs(),
+            subtitleRepository = FakeSubtitlePrefStore(),
+            vaultSecurityStore = FakeVaultSecurityStore(),
+            playlistStore = FakePlaylistStore(),
+            subtitleStore = null
+        )
+
+        val targetDir = tempFolder.newFolder("corrupt_verify_target")
+        val stagingDir = tempFolder.newFolder("corrupt_verify_staging")
+        val targetFile = File(targetDir, "verified_backup.json")
+        val oldPayload = buildSizedPayload(2_500)
+        assertTrue(manager.exportPayloadToFile(oldPayload, targetFile, stagingDir).isSuccess)
+        val oldJson = targetFile.readText(Charsets.UTF_8)
+
+        // Inject silent data corruption during dest_copy (non-zero file size > 0, yet invalid content!)
+        manager.fileMoveHookForTesting = { _, _ -> false }
+        manager.fileOutputStreamOpenerForTesting = { file, role ->
+            if (role == "dest_copy") {
+                val inner = FileOutputStream(file)
+                object : OutputStream() {
+                    override fun write(b: Int) {
+                        inner.write('X'.code)
+                    }
+                    override fun write(b: ByteArray, off: Int, len: Int) {
+                        val corrupted = ByteArray(len) { 'X'.code.toByte() }
+                        inner.write(corrupted, 0, len)
+                    }
+                    override fun flush() = inner.flush()
+                    override fun close() = inner.close()
+                }
+            } else {
+                FileOutputStream(file)
+            }
+        }
+
+        val newPayload = buildSizedPayload(5_000)
+        val res = manager.exportPayloadToFile(newPayload, targetFile, stagingDir)
+        assertTrue("Non-valid backup content with size > 0 must fail verification, not succeed", res.isFailure)
+        assertTrue(targetFile.exists())
+        assertEquals("Old valid backup must be restored when post-write verification fails", oldJson, targetFile.readText(Charsets.UTF_8))
+        assertTrue(BackupManager.parseAndValidateBackupJson(targetFile.readText(Charsets.UTF_8)) is BackupParseResult.Success)
+        assertNoLeftoverBackupTemps(targetDir, stagingDir)
+    }
+
+    @Test
+    fun backupManager_fileExport_dualFailureAndOversizedOverwrite_preserveOldBackupOrReportRestoreError() = runBlocking {
+        val manager = BackupManager.createForTesting(
+            themeRepository = FakeThemeRepo(),
+            playbackRepository = FakePlaybackPrefs(),
+            subtitleRepository = FakeSubtitlePrefStore(),
+            vaultSecurityStore = FakeVaultSecurityStore(),
+            playlistStore = FakePlaylistStore(),
+            subtitleStore = null
+        )
+
+        val targetDir = tempFolder.newFolder("dual_fail_target")
+        val stagingDir = tempFolder.newFolder("dual_fail_staging")
+        val targetFile = File(targetDir, "protected_backup.json")
+        val oldPayload = buildSizedPayload(2_048)
+        assertTrue(manager.exportPayloadToFile(oldPayload, targetFile, stagingDir).isSuccess)
+        val oldJson = targetFile.readText(Charsets.UTF_8)
+
+        // 1. Oversized (> 16MB) export over existing valid backup leaves existing backup 100% untouched
+        val overPayload = buildSizedPayload(BackupManager.MAX_BACKUP_BYTES + 1)
+        val overRes = manager.exportPayloadToFile(overPayload, targetFile, stagingDir)
+        assertTrue(overRes.isFailure)
+        assertEquals(oldJson, targetFile.readText(Charsets.UTF_8))
+        assertNoLeftoverBackupTemps(targetDir, stagingDir)
+
+        // 2. Dual failure: dest_copy fails AND restore also fails -> explicit restore failure reported
+        manager.fileMoveHookForTesting = { _, _ -> false }
+        manager.fileOutputStreamOpenerForTesting = { file, role ->
+            when (role) {
+                "dest_copy" -> object : OutputStream() {
+                    override fun write(b: Int) = throw IOException("Primary copy failed")
+                }
+                "restore" -> object : OutputStream() {
+                    override fun write(b: Int) = throw IOException("Rollback restore also failed")
+                }
+                else -> FileOutputStream(file)
+            }
+        }
+        val dualFail = manager.exportPayloadToFile(buildSizedPayload(4_096), targetFile, stagingDir)
+        assertTrue(dualFail.isFailure)
+        val err = dualFail.exceptionOrNull()!!
+        assertTrue(
+            "Dual failure must report both export and restore failure clearly: ${err.message}",
+            err.message.orEmpty().contains("فشلت استعادة") && err.suppressed.isNotEmpty()
+        )
+        assertNoLeftoverBackupTemps(targetDir, stagingDir)
+    }
+
+    @Test
+    fun backupManager_uriExport_rollbackSnapshotFailure_abortsBeforeTruncatingAndDualFailureReports() = runBlocking {
+        val appContext = ApplicationProvider.getApplicationContext<Context>()
+        val authority = "com.videohatak.player.test.snapfailprovider"
+        val backingDir = tempFolder.newFolder("snapfail_docs")
+        val docFiles = linkedMapOf<String, File>()
+
+        val provider = object : android.content.ContentProvider() {
+            override fun onCreate(): Boolean = true
+            override fun query(
+                uri: Uri,
+                projection: Array<out String>?,
+                selection: String?,
+                selectionArgs: Array<out String>?,
+                sortOrder: String?
+            ): android.database.Cursor? {
+                val id = uri.lastPathSegment ?: return null
+                val file = docFiles[id] ?: return null
+                val cols = projection ?: arrayOf(android.provider.OpenableColumns.SIZE)
+                val cursor = android.database.MatrixCursor(cols)
+                val row = Array<Any?>(cols.size) { idx ->
+                    when (cols[idx]) {
+                        android.provider.OpenableColumns.SIZE -> file.length()
+                        else -> null
+                    }
+                }
+                cursor.addRow(row)
+                return cursor
+            }
+
+            override fun getType(uri: Uri): String = "application/json"
+            override fun insert(uri: Uri, values: android.content.ContentValues?): Uri? = null
+            override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int = 0
+            override fun update(
+                uri: Uri,
+                values: android.content.ContentValues?,
+                selection: String?,
+                selectionArgs: Array<out String>?
+            ): Int = 0
+
+            override fun openFile(uri: Uri, mode: String): android.os.ParcelFileDescriptor {
+                val id = uri.lastPathSegment ?: throw java.io.FileNotFoundException()
+                val file = docFiles[id] ?: throw java.io.FileNotFoundException()
+                val pfdMode = if (mode.contains("w")) {
+                    android.os.ParcelFileDescriptor.MODE_WRITE_ONLY or
+                        android.os.ParcelFileDescriptor.MODE_CREATE or
+                        android.os.ParcelFileDescriptor.MODE_TRUNCATE
+                } else {
+                    android.os.ParcelFileDescriptor.MODE_READ_ONLY
+                }
+                return android.os.ParcelFileDescriptor.open(file, pfdMode)
+            }
+        }
+        val info = android.content.pm.ProviderInfo().apply {
+            this.authority = authority
+            this.exported = false
+        }
+        provider.attachInfo(appContext, info)
+        org.robolectric.shadows.ShadowContentResolver.registerProviderInternal(authority, provider)
+
+        val manager = BackupManager.createForTesting(
+            themeRepository = FakeThemeRepo(),
+            playbackRepository = FakePlaybackPrefs(),
+            subtitleRepository = FakeSubtitlePrefStore(),
+            vaultSecurityStore = FakeVaultSecurityStore(),
+            playlistStore = FakePlaylistStore(),
+            subtitleStore = null,
+            context = appContext
+        )
+
+        val originalContent = """{"schemaVersion":3,"user":"must_never_be_truncated"}"""
+        val existingDoc = File(backingDir, "snap_fail.json").apply { writeText(originalContent, Charsets.UTF_8) }
+        docFiles["snap_fail"] = existingDoc
+        val docUri = Uri.parse("content://$authority/document/snap_fail")
+        val payload = buildSizedPayload(4_096)
+
+        // 1. Rollback snapshot creation fails while reading existing URI -> MUST abort BEFORE opening "wt"
+        var wtOpenedCount = 0
+        manager.uriInputStreamOpenerForTesting = { uri ->
+            if (uri == docUri) {
+                object : java.io.InputStream() {
+                    override fun read(): Int = throw IOException("Simulated snapshot read failure")
+                }
+            } else {
+                appContext.contentResolver.openInputStream(uri)
+            }
+        }
+        manager.uriStreamOpenerForTesting = { uri, mode ->
+            if (mode.contains("w")) wtOpenedCount++
+            appContext.contentResolver.openOutputStream(uri, mode)
+        }
+
+        val snapFailRes = manager.exportPayloadToUri(payload, docUri)
+        assertTrue("Export must fail when rollback snapshot cannot be created", snapFailRes.isFailure)
+        assertEquals("Must NEVER open URI in 'wt' mode when rollback snapshot fails", 0, wtOpenedCount)
+        assertEquals("Original existing URI file must remain 100% intact", originalContent, existingDoc.readText(Charsets.UTF_8))
+
+        // 2. Also for file:// URI: snapshot failure aborts BEFORE truncating target
+        val fileTarget = File(tempFolder.root, "file_uri_snap_fail.json").apply { writeText(originalContent, Charsets.UTF_8) }
+        val fileTargetUri = Uri.fromFile(fileTarget)
+        wtOpenedCount = 0
+        manager.uriInputStreamOpenerForTesting = null
+        manager.fileOutputStreamOpenerForTesting = { file, role ->
+            if (role == "rollback_snapshot") {
+                object : OutputStream() {
+                    override fun write(b: Int) = throw IOException("Simulated rollback disk full")
+                }
+            } else {
+                FileOutputStream(file)
+            }
+        }
+        val fileSnapFailRes = manager.exportPayloadToUri(payload, fileTargetUri)
+        assertTrue(fileSnapFailRes.isFailure)
+        assertEquals(0, wtOpenedCount)
+        assertEquals(originalContent, fileTarget.readText(Charsets.UTF_8))
+
+        // 3. Dual failure on content:// URI (mid-write failure AND restore write fails) -> clear error + non-empty suppressed
+        manager.fileOutputStreamOpenerForTesting = null
+        var openWriteCalls = 0
+        manager.uriStreamOpenerForTesting = { uri, mode ->
+            openWriteCalls++
+            val inner = FileOutputStream(existingDoc, false) // simulates SAF "wt" truncate
+            if (openWriteCalls == 1) {
+                object : OutputStream() {
+                    private var count = 0
+                    override fun write(b: Int) {
+                        if (count >= 50) throw IOException("Mid-write failure on URI")
+                        inner.write(b)
+                        count++
+                    }
+                    override fun write(b: ByteArray, off: Int, len: Int) {
+                        val rem = 50 - count
+                        if (rem <= 0) throw IOException("Mid-write failure on URI")
+                        val chunk = minOf(len, rem)
+                        inner.write(b, off, chunk)
+                        count += chunk
+                        if (chunk < len) throw IOException("Mid-write failure on URI")
+                    }
+                    override fun flush() = inner.flush()
+                    override fun close() = inner.close()
+                }
+            } else {
+                inner.close()
+                object : OutputStream() {
+                    override fun write(b: Int) = throw IOException("Simulated restore URI write failure")
+                }
+            }
+        }
+
+        val uriDualFail = manager.exportPayloadToUri(payload, docUri)
+        assertTrue(uriDualFail.isFailure)
+        val dualErr = uriDualFail.exceptionOrNull()!!
+        assertTrue(
+            "URI dual failure must clearly report failed restoration: ${dualErr.message}",
+            dualErr.message.orEmpty().contains("فشلت استعادة") && dualErr.suppressed.isNotEmpty()
+        )
+        assertNoLeftoverBackupTemps(File(appContext.cacheDir, "backup_staging"))
     }
 }

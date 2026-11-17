@@ -2,6 +2,7 @@ package com.videohatak.player.core.backup
 
 import android.content.Context
 import android.net.Uri
+import android.os.Build
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import com.videohatak.player.core.designsystem.theme.AppThemeId
@@ -31,7 +32,13 @@ import kotlinx.coroutines.withContext
 import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileInputStream
+import java.io.FileNotFoundException
 import java.io.FileOutputStream
+import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 import java.util.Locale
 
@@ -145,7 +152,9 @@ class BackupManager internal constructor(
 
     private data class ExportUriPreWriteState(
         val wasInitiallyEmptyOrMissing: Boolean,
-        val rollbackFile: File?
+        val rollbackFile: File?,
+        val rollbackExpectedBytes: Long = 0L,
+        val rollbackSha256: ByteArray? = null
     )
 
     suspend fun exportToUri(uri: Uri): Result<BackupExportSummary> = withContext(Dispatchers.IO) {
@@ -167,11 +176,165 @@ class BackupManager internal constructor(
     }
 
     @Volatile
-    internal var uriStreamOpenerForTesting: ((Uri, String) -> java.io.OutputStream?)? = null
+    internal var uriStreamOpenerForTesting: ((Uri, String) -> OutputStream?)? = null
 
-    private fun openUriOutputStream(context: Context, uri: Uri, mode: String): java.io.OutputStream? {
+    @Volatile
+    internal var uriInputStreamOpenerForTesting: ((Uri) -> InputStream?)? = null
+
+    @Volatile
+    internal var fileOutputStreamOpenerForTesting: ((File, String) -> OutputStream?)? = null
+
+    @Volatile
+    internal var fileMoveHookForTesting: ((File, File) -> Boolean)? = null
+
+    private fun openUriOutputStream(context: Context, uri: Uri, mode: String): OutputStream? {
         return uriStreamOpenerForTesting?.invoke(uri, mode)
             ?: context.contentResolver.openOutputStream(uri, mode)
+    }
+
+    private fun openUriInputStream(context: Context, uri: Uri): InputStream? {
+        return uriInputStreamOpenerForTesting?.invoke(uri)
+            ?: context.contentResolver.openInputStream(uri)
+    }
+
+    private fun openFileOutputStream(file: File, role: String): OutputStream {
+        return fileOutputStreamOpenerForTesting?.invoke(file, role)
+            ?: FileOutputStream(file)
+    }
+
+    private fun syncOutputStream(output: OutputStream) {
+        output.flush()
+        if (output is FileOutputStream) {
+            runCatching { output.fd.sync() }
+        }
+    }
+
+    private fun computeFileDigest(file: File): ByteArray {
+        val digest = MessageDigest.getInstance("SHA-256")
+        FileInputStream(file).use { input ->
+            val buffer = ByteArray(8 * 1024)
+            while (true) {
+                val read = input.read(buffer)
+                if (read == -1) break
+                digest.update(buffer, 0, read)
+            }
+        }
+        return digest.digest()
+    }
+
+    private fun verifyReadableAndIntegrity(
+        file: File,
+        expectedBytes: Long,
+        expectedFileDigest: ByteArray
+    ) {
+        if (!file.exists() || !file.isFile) {
+            throw IOException("ملف النسخة الاحتياطية غير موجود بعد الكتابة: ${file.name}")
+        }
+        val actualLen = file.length()
+        if (actualLen <= 0L || actualLen != expectedBytes) {
+            throw IOException("حجم ملف النسخة الاحتياطية غير مطابق المتوقع ($actualLen / $expectedBytes)")
+        }
+        if (actualLen > MAX_BACKUP_BYTES.toLong()) {
+            throw IllegalArgumentException(formatBackupSizeExceededMessage(actualLen))
+        }
+        val actualDigest = computeFileDigest(file)
+        if (!MessageDigest.isEqual(actualDigest, expectedFileDigest)) {
+            throw IOException("فشل التحقق من تطابق بصمة الملف المؤقت أو النهائي للنسخة الاحتياطية")
+        }
+        val rawJson = FileInputStream(file).use { input ->
+            readBoundedUtf8Stream(input, MAX_BACKUP_BYTES)
+        }
+        when (val parsed = parseAndValidateBackupJson(rawJson)) {
+            is BackupParseResult.Error -> throw IOException("ملف النسخة الاحتياطية الناتج غير قابل للتحقق: ${parsed.message}")
+            is BackupParseResult.Success -> Unit
+        }
+    }
+
+    private fun verifyCommittedUriBackup(
+        context: Context,
+        uri: Uri,
+        expectedBytes: Long,
+        expectedFileDigest: ByteArray
+    ) {
+        if (uri.scheme.equals("file", ignoreCase = true)) {
+            val file = uri.path?.let(::File)
+                ?: throw IOException("مسار ملف التصدير غير صالح للتحقق")
+            verifyReadableAndIntegrity(file, expectedBytes, expectedFileDigest)
+            return
+        }
+        val reportedSize = queryContentUriSize(context, uri)
+        if (reportedSize != null && reportedSize != expectedBytes) {
+            throw IOException("حجم ملف التصدير عبر URI غير مكتمل ($reportedSize / $expectedBytes)")
+        }
+        val inputStream = openUriInputStream(context, uri)
+            ?: throw IOException("تعذر إعادة فتح ملف التصدير للتحقق من قابليته للقراءة وسلامته")
+        val rawBytes = inputStream.use { input ->
+            readBoundedBytes(input, MAX_BACKUP_BYTES)
+        }
+        if (rawBytes.size.toLong() != expectedBytes) {
+            throw IOException("طول بيانات التصدير عبر URI غير مطابق (${rawBytes.size} / $expectedBytes)")
+        }
+        val actualDigest = MessageDigest.getInstance("SHA-256").digest(rawBytes)
+        if (!MessageDigest.isEqual(actualDigest, expectedFileDigest)) {
+            throw IOException("تلف محتوى النسخة الاحتياطية بعد التصدير عبر URI")
+        }
+        when (val parsed = parseAndValidateBackupJson(rawBytes.toString(Charsets.UTF_8))) {
+            is BackupParseResult.Error -> throw IOException("فشل التحقق من سلامة النسخة الاحتياطية بعد التصدير: ${parsed.message}")
+            is BackupParseResult.Success -> Unit
+        }
+    }
+
+    private fun snapshotExistingFileForRollback(source: File, stagingDir: File): Triple<File, Long, ByteArray> {
+        if (!stagingDir.exists() && !stagingDir.mkdirs()) {
+            throw IllegalStateException("تعذر إنشاء مجلد التراجع المؤقت للنسخة الاحتياطية")
+        }
+        val sourceSize = source.length()
+        if (sourceSize > MAX_ROLLBACK_SNAPSHOT_BYTES) {
+            throw IllegalStateException("حجم الملف الموجود يتجاوز الحد المسموح لإنشاء نسخة تراجع آمنة")
+        }
+        val sourceDigest = computeFileDigest(source)
+        val rollback = File.createTempFile("videohatak_rollback_", ".bak.tmp", stagingDir)
+        try {
+            FileInputStream(source).use { input ->
+                openFileOutputStream(rollback, "rollback_snapshot").use { out ->
+                    input.copyTo(out)
+                    syncOutputStream(out)
+                }
+            }
+            if (!rollback.exists() || rollback.length() != sourceSize) {
+                throw IOException("حجم نسخة التراجع غير مطابق للملف الأصلي")
+            }
+            val rollbackDigest = computeFileDigest(rollback)
+            if (!MessageDigest.isEqual(rollbackDigest, sourceDigest)) {
+                throw IOException("بصمة نسخة التراجع غير مطابقة للملف الأصلي")
+            }
+            return Triple(rollback, sourceSize, sourceDigest)
+        } catch (t: Throwable) {
+            runCatching { rollback.delete() }
+            throw IllegalStateException("تعذر إنشاء نسخة تراجع موثقة للملف الموجود قبل الكتابة عليه", t)
+        }
+    }
+
+    private fun restoreRollbackToFile(
+        rollbackFile: File,
+        expectedBytes: Long,
+        expectedDigest: ByteArray,
+        targetFile: File
+    ) {
+        targetFile.parentFile?.mkdirs()
+        FileInputStream(rollbackFile).use { input ->
+            openFileOutputStream(targetFile, "restore").use { out ->
+                input.copyTo(out)
+                syncOutputStream(out)
+            }
+        }
+        if (!targetFile.exists() || targetFile.length() != expectedBytes) {
+            throw IOException("حجم الملف المستعاد غير مطابق للنسخة الأصلية (${targetFile.length()} / $expectedBytes)")
+        }
+        val restoredDigest = computeFileDigest(targetFile)
+        if (!MessageDigest.isEqual(restoredDigest, expectedDigest)) {
+            throw IOException("فشل التحقق من تطابق بصمة النسخة المستعادة")
+        }
     }
 
     private fun exportPayloadToUriInternal(
@@ -186,7 +349,7 @@ class BackupManager internal constructor(
         val preWriteState = inspectExportUriPreWriteState(nonNullContext, uri, stagingDir)
         var streamOpenedAndTruncated = false
         try {
-            return exportPayloadViaTempFile(payload, stagingDir) { tempFile, _ ->
+            return exportPayloadViaTempFile(payload, stagingDir) { tempFile, expectedBytes, expectedFileDigest ->
                 val outStream = openUriOutputStream(nonNullContext, uri, "wt")
                     ?: throw IllegalStateException("تعذر فتح ملف التصدير للكتابة")
                 streamOpenedAndTruncated = true
@@ -194,15 +357,17 @@ class BackupManager internal constructor(
                     FileInputStream(tempFile).use { input ->
                         input.copyTo(out)
                     }
-                    out.flush()
+                    syncOutputStream(out)
                 }
+                verifyCommittedUriBackup(nonNullContext, uri, expectedBytes, expectedFileDigest)
             }
         } catch (t: Throwable) {
             cleanupOrRestoreExportUriOnFailure(
                 context = nonNullContext,
                 uri = uri,
                 preWriteState = preWriteState,
-                streamOpenedAndTruncated = streamOpenedAndTruncated
+                streamOpenedAndTruncated = streamOpenedAndTruncated,
+                originalFailure = t
             )
             throw t
         } finally {
@@ -230,31 +395,88 @@ class BackupManager internal constructor(
         }
     }
 
+    private fun moveStageToTarget(stageDest: File, targetFile: File): Boolean {
+        fileMoveHookForTesting?.let { hook ->
+            return runCatching { hook(stageDest, targetFile) }.getOrDefault(false)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val atomicMoved = runCatching {
+                Files.move(
+                    stageDest.toPath(),
+                    targetFile.toPath(),
+                    StandardCopyOption.ATOMIC_MOVE,
+                    StandardCopyOption.REPLACE_EXISTING
+                )
+                true
+            }.getOrDefault(false)
+            if (atomicMoved) return true
+        }
+        if (!targetFile.exists()) {
+            return runCatching { stageDest.renameTo(targetFile) }.getOrDefault(false)
+        }
+        return false
+    }
+
     private fun exportPayloadToFileInternal(
         payload: BackupPayload,
         targetFile: File,
         tempDir: File
     ): BackupExportSummary {
-        return exportPayloadViaTempFile(payload, tempDir) { tempFile, _ ->
+        return exportPayloadViaTempFile(payload, tempDir) { tempFile, expectedBytes, expectedFileDigest ->
             targetFile.parentFile?.mkdirs()
             val stageDest = File(targetFile.parentFile ?: tempDir, "${targetFile.name}.partial")
+            var rollbackFile: File? = null
+            var rollbackSize = 0L
+            var rollbackDigest: ByteArray? = null
+            val hadExistingNonEmptyTarget = targetFile.exists() && targetFile.length() > 0L
+
             try {
                 FileInputStream(tempFile).use { input ->
-                    FileOutputStream(stageDest).use { output ->
+                    openFileOutputStream(stageDest, "stage").use { output ->
                         input.copyTo(output)
-                        output.flush()
+                        syncOutputStream(output)
                     }
                 }
-                if (!stageDest.renameTo(targetFile)) {
-                    FileInputStream(stageDest).use { input ->
-                        FileOutputStream(targetFile).use { output ->
-                            input.copyTo(output)
-                            output.flush()
+                verifyReadableAndIntegrity(stageDest, expectedBytes, expectedFileDigest)
+
+                if (hadExistingNonEmptyTarget) {
+                    val snapshot = snapshotExistingFileForRollback(targetFile, tempDir)
+                    rollbackFile = snapshot.first
+                    rollbackSize = snapshot.second
+                    rollbackDigest = snapshot.third
+                }
+
+                try {
+                    val moved = moveStageToTarget(stageDest, targetFile)
+                    if (!moved) {
+                        FileInputStream(stageDest).use { input ->
+                            openFileOutputStream(targetFile, "dest_copy").use { output ->
+                                input.copyTo(output)
+                                syncOutputStream(output)
+                            }
                         }
                     }
+                    verifyReadableAndIntegrity(targetFile, expectedBytes, expectedFileDigest)
+                } catch (commitErr: Throwable) {
+                    if (hadExistingNonEmptyTarget && rollbackFile != null && rollbackDigest != null) {
+                        try {
+                            restoreRollbackToFile(rollbackFile, rollbackSize, rollbackDigest, targetFile)
+                        } catch (restoreErr: Throwable) {
+                            throw IllegalStateException(
+                                "فشل تصدير النسخة الاحتياطية وفشلت استعادة الملف السابق",
+                                commitErr
+                            ).apply { addSuppressed(restoreErr) }
+                        }
+                    } else if (!hadExistingNonEmptyTarget) {
+                        runCatching {
+                            if (targetFile.exists()) targetFile.delete()
+                        }
+                    }
+                    throw commitErr
                 }
             } finally {
                 runCatching { stageDest.delete() }
+                runCatching { rollbackFile?.delete() }
             }
         }
     }
@@ -262,24 +484,32 @@ class BackupManager internal constructor(
     private fun exportPayloadViaTempFile(
         payload: BackupPayload,
         tempDir: File,
-        commitTempFile: (tempFile: File, byteCount: Long) -> Unit
+        commitTempFile: (tempFile: File, byteCount: Long, expectedFileDigest: ByteArray) -> Unit
     ): BackupExportSummary {
         if (!tempDir.exists() && !tempDir.mkdirs()) {
             throw IllegalStateException("تعذر إنشاء مجلد التحضير المؤقت للنسخة الاحتياطية")
         }
+        val json = serializeBackupJson(payload)
+        val bytes = json.toByteArray(Charsets.UTF_8)
+        if (bytes.size.toLong() > MAX_BACKUP_BYTES.toLong()) {
+            throw IllegalArgumentException(formatBackupSizeExceededMessage(bytes.size.toLong()))
+        }
+        val expectedDigest = MessageDigest.getInstance("SHA-256").digest(bytes)
         val tempFile = File.createTempFile("videohatak_backup_", ".json.tmp", tempDir)
         try {
-            val json = serializeBackupJson(payload)
-            val bytes = json.toByteArray(Charsets.UTF_8)
-            BufferedOutputStream(FileOutputStream(tempFile)).use { bos ->
-                bos.write(bytes)
-                bos.flush()
+            openFileOutputStream(tempFile, "temp").use { rawOut ->
+                BufferedOutputStream(rawOut).use { bos ->
+                    bos.write(bytes)
+                    bos.flush()
+                }
+                syncOutputStream(rawOut)
             }
             val actualBytes = tempFile.length()
             if (actualBytes > MAX_BACKUP_BYTES.toLong()) {
                 throw IllegalArgumentException(formatBackupSizeExceededMessage(actualBytes))
             }
-            commitTempFile(tempFile, actualBytes)
+            verifyReadableAndIntegrity(tempFile, bytes.size.toLong(), expectedDigest)
+            commitTempFile(tempFile, actualBytes, expectedDigest)
             return BackupExportSummary(
                 playlistCount = payload.playlists.size,
                 playlistItemCount = payload.playlists.sumOf { it.items.size },
@@ -302,39 +532,21 @@ class BackupManager internal constructor(
                 val file = uri.path?.let(::File)
                 if (file == null || !file.exists() || file.length() == 0L) {
                     ExportUriPreWriteState(wasInitiallyEmptyOrMissing = true, rollbackFile = null)
-                } else if (file.length() <= MAX_ROLLBACK_SNAPSHOT_BYTES) {
-                    val rollback = snapshotFileToTemp(file, stagingDir)
-                    ExportUriPreWriteState(wasInitiallyEmptyOrMissing = false, rollbackFile = rollback)
                 } else {
-                    ExportUriPreWriteState(wasInitiallyEmptyOrMissing = false, rollbackFile = null)
+                    val (rollback, size, digest) = snapshotExistingFileForRollback(file, stagingDir)
+                    ExportUriPreWriteState(
+                        wasInitiallyEmptyOrMissing = false,
+                        rollbackFile = rollback,
+                        rollbackExpectedBytes = size,
+                        rollbackSha256 = digest
+                    )
                 }
             }
             "content" -> {
                 val docSize = queryContentUriSize(context, uri)
-                if (docSize == 0L) {
-                    ExportUriPreWriteState(wasInitiallyEmptyOrMissing = true, rollbackFile = null)
-                } else {
-                    snapshotContentUriBeforeOverwrite(context, uri, docSize, stagingDir)
-                }
+                snapshotContentUriBeforeOverwrite(context, uri, docSize, stagingDir)
             }
-            else -> ExportUriPreWriteState(wasInitiallyEmptyOrMissing = false, rollbackFile = null)
-        }
-    }
-
-    private fun snapshotFileToTemp(source: File, stagingDir: File): File? {
-        var rollback: File? = null
-        return try {
-            rollback = File.createTempFile("videohatak_rollback_", ".bak.tmp", stagingDir)
-            FileInputStream(source).use { input ->
-                FileOutputStream(rollback).use { out ->
-                    input.copyTo(out)
-                    out.flush()
-                }
-            }
-            rollback
-        } catch (_: Throwable) {
-            runCatching { rollback?.delete() }
-            null
+            else -> throw IllegalStateException("نوع مسار التصدير غير مدعوم لحماية التراجع الآمن: ${uri.scheme}")
         }
     }
 
@@ -345,13 +557,32 @@ class BackupManager internal constructor(
         stagingDir: File
     ): ExportUriPreWriteState {
         var rollback: File? = null
+        val inputStream = try {
+            openUriInputStream(context, uri)
+        } catch (fnf: FileNotFoundException) {
+            if (reportedSize != null && reportedSize > 0L) {
+                throw IllegalStateException("تعذر فتح الملف الموجود لإنشاء نسخة تراجع قبل الكتابة عليه", fnf)
+            }
+            return ExportUriPreWriteState(wasInitiallyEmptyOrMissing = true, rollbackFile = null)
+        } catch (t: Throwable) {
+            throw IllegalStateException("فشل إنشاء نسخة التراجع للملف الموجود قبل الكتابة عليه", t)
+        }
+
+        if (inputStream == null) {
+            if (reportedSize == 0L) {
+                return ExportUriPreWriteState(wasInitiallyEmptyOrMissing = true, rollbackFile = null)
+            }
+            throw IllegalStateException("تعذر قراءة الملف الموجود لإنشاء نسخة تراجع آمنة قبل الاستبدال")
+        }
+
         return try {
-            context.contentResolver.openInputStream(uri)?.use { input ->
+            inputStream.use { input ->
                 val temp = File.createTempFile("videohatak_rollback_", ".bak.tmp", stagingDir)
                 rollback = temp
+                val digest = MessageDigest.getInstance("SHA-256")
                 val buffer = ByteArray(8 * 1024)
                 var total = 0L
-                FileOutputStream(temp).use { out ->
+                openFileOutputStream(temp, "rollback_snapshot").use { out ->
                     while (true) {
                         val read = input.read(buffer)
                         if (read == -1) break
@@ -359,26 +590,38 @@ class BackupManager internal constructor(
                         if (total > MAX_ROLLBACK_SNAPSHOT_BYTES) {
                             throw IllegalStateException("Existing file exceeds rollback snapshot cap")
                         }
+                        digest.update(buffer, 0, read)
                         out.write(buffer, 0, read)
                     }
-                    out.flush()
+                    syncOutputStream(out)
+                }
+                if (reportedSize != null && reportedSize > 0L && total != reportedSize) {
+                    throw IOException("نسخة التراجع غير مكتملة ($total / $reportedSize)")
                 }
                 if (total == 0L) {
                     runCatching { temp.delete() }
+                    rollback = null
                     ExportUriPreWriteState(wasInitiallyEmptyOrMissing = true, rollbackFile = null)
                 } else {
-                    ExportUriPreWriteState(wasInitiallyEmptyOrMissing = false, rollbackFile = temp)
+                    val expectedDigest = digest.digest()
+                    if (!temp.exists() || temp.length() != total) {
+                        throw IOException("حجم ملف التراجع المؤقت غير مطابق")
+                    }
+                    val actualTempDigest = computeFileDigest(temp)
+                    if (!MessageDigest.isEqual(actualTempDigest, expectedDigest)) {
+                        throw IOException("فشل التحقق من بصمة نسخة التراجع المؤقتة")
+                    }
+                    ExportUriPreWriteState(
+                        wasInitiallyEmptyOrMissing = false,
+                        rollbackFile = temp,
+                        rollbackExpectedBytes = total,
+                        rollbackSha256 = expectedDigest
+                    )
                 }
-            } ?: ExportUriPreWriteState(
-                wasInitiallyEmptyOrMissing = (reportedSize == 0L),
-                rollbackFile = null
-            )
-        } catch (_: Throwable) {
+            }
+        } catch (t: Throwable) {
             runCatching { rollback?.delete() }
-            ExportUriPreWriteState(
-                wasInitiallyEmptyOrMissing = (reportedSize == 0L),
-                rollbackFile = null
-            )
+            throw IllegalStateException("فشل إنشاء نسخة التراجع للملف الموجود قبل الكتابة عليه", t)
         }
     }
 
@@ -403,56 +646,117 @@ class BackupManager internal constructor(
         return docSize
     }
 
+    private fun verifyRestoredUriMatchesRollback(
+        context: Context,
+        uri: Uri,
+        expectedBytes: Long,
+        expectedDigest: ByteArray
+    ) {
+        if (uri.scheme.equals("file", ignoreCase = true)) {
+            val dest = uri.path?.let(::File) ?: throw IOException("مسار ملف الاستعادة غير صالح")
+            if (!dest.exists() || dest.length() != expectedBytes) {
+                throw IOException("حجم الملف المستعاد غير مطابق (${dest.length()} / $expectedBytes)")
+            }
+            val actualDigest = computeFileDigest(dest)
+            if (!MessageDigest.isEqual(actualDigest, expectedDigest)) {
+                throw IOException("بصمة الملف المستعاد غير مطابقة للنسخة الأصلية")
+            }
+            return
+        }
+        val reportedSize = queryContentUriSize(context, uri)
+        if (reportedSize != null && reportedSize != expectedBytes) {
+            throw IOException("حجم المستند المستعاد غير مطابق ($reportedSize / $expectedBytes)")
+        }
+        val verifyStream = openUriInputStream(context, uri)
+            ?: throw IOException("تعذر التحقق من قراءة المستند المستعاد")
+        val actualDigest = MessageDigest.getInstance("SHA-256")
+        var total = 0L
+        verifyStream.use { input ->
+            val buf = ByteArray(8 * 1024)
+            while (true) {
+                val read = input.read(buf)
+                if (read == -1) break
+                total += read
+                if (total > MAX_ROLLBACK_SNAPSHOT_BYTES) {
+                    throw IOException("تجاوز حجم المستند المستعاد الحد المتوقع")
+                }
+                actualDigest.update(buf, 0, read)
+            }
+        }
+        if (total != expectedBytes || !MessageDigest.isEqual(actualDigest.digest(), expectedDigest)) {
+            throw IOException("محتوى المستند المستعاد غير مطابق للنسخة الأصلية")
+        }
+    }
+
     private fun cleanupOrRestoreExportUriOnFailure(
         context: Context,
         uri: Uri,
         preWriteState: ExportUriPreWriteState,
-        streamOpenedAndTruncated: Boolean
+        streamOpenedAndTruncated: Boolean,
+        originalFailure: Throwable
     ) {
-        runCatching {
-            val rollbackFile = preWriteState.rollbackFile
-            if (streamOpenedAndTruncated && rollbackFile != null && rollbackFile.exists()) {
+        val rollbackFile = preWriteState.rollbackFile
+        if (streamOpenedAndTruncated && rollbackFile != null && rollbackFile.exists()) {
+            try {
                 when (uri.scheme?.lowercase(Locale.US)) {
                     "file" -> {
                         val dest = uri.path?.let(::File)
-                        if (dest != null) {
-                            val stage = File(dest.parentFile ?: rollbackFile.parentFile, "${dest.name}.restore.tmp")
-                            try {
-                                FileInputStream(rollbackFile).use { input ->
-                                    FileOutputStream(stage).use { out ->
-                                        input.copyTo(out)
-                                        out.flush()
-                                    }
+                            ?: throw IOException("مسار الملف المستهدف للاستعادة غير صالح")
+                        val stage = File(dest.parentFile ?: rollbackFile.parentFile, "${dest.name}.restore.tmp")
+                        try {
+                            FileInputStream(rollbackFile).use { input ->
+                                openFileOutputStream(stage, "restore").use { out ->
+                                    input.copyTo(out)
+                                    syncOutputStream(out)
                                 }
-                                if (!stage.renameTo(dest)) {
-                                    FileInputStream(stage).use { input ->
-                                        FileOutputStream(dest).use { out ->
-                                            input.copyTo(out)
-                                            out.flush()
-                                        }
-                                    }
-                                }
-                            } finally {
-                                runCatching { stage.delete() }
                             }
+                            val moved = runCatching { stage.renameTo(dest) }.getOrDefault(false)
+                            if (!moved) {
+                                FileInputStream(stage).use { input ->
+                                    openFileOutputStream(dest, "restore").use { out ->
+                                        input.copyTo(out)
+                                        syncOutputStream(out)
+                                    }
+                                }
+                            }
+                        } finally {
+                            runCatching { stage.delete() }
                         }
                     }
                     else -> {
-                        openUriOutputStream(context, uri, "wt")?.use { out ->
+                        val restoreStream = openUriOutputStream(context, uri, "wt")
+                            ?: throw IOException("تعذر فتح مسار URI لاستعادة النسخة السابقة")
+                        restoreStream.use { out ->
                             FileInputStream(rollbackFile).use { input ->
                                 input.copyTo(out)
                             }
-                            out.flush()
+                            syncOutputStream(out)
                         }
                     }
                 }
-                return@runCatching
+                val expectedDigest = preWriteState.rollbackSha256
+                if (expectedDigest != null) {
+                    verifyRestoredUriMatchesRollback(
+                        context = context,
+                        uri = uri,
+                        expectedBytes = preWriteState.rollbackExpectedBytes,
+                        expectedDigest = expectedDigest
+                    )
+                }
+                return
+            } catch (restoreErr: Throwable) {
+                throw IllegalStateException(
+                    "فشل تصدير النسخة الاحتياطية وفشلت استعادة الملف السابق",
+                    originalFailure
+                ).apply { addSuppressed(restoreErr) }
             }
+        }
 
-            if (!preWriteState.wasInitiallyEmptyOrMissing) {
-                return@runCatching
-            }
+        if (!preWriteState.wasInitiallyEmptyOrMissing) {
+            return
+        }
 
+        runCatching {
             when (uri.scheme?.lowercase(Locale.US)) {
                 "file" -> {
                     val file = uri.path?.let(::File)
@@ -687,7 +991,7 @@ class BackupManager internal constructor(
             }
         }
 
-        private fun readBoundedUtf8Stream(input: java.io.InputStream, maxBytes: Int): String {
+        private fun readBoundedBytes(input: InputStream, maxBytes: Int): ByteArray {
             val buffer = ByteArray(8 * 1024)
             val baos = java.io.ByteArrayOutputStream()
             var total = 0
@@ -700,7 +1004,11 @@ class BackupManager internal constructor(
                 }
                 baos.write(buffer, 0, read)
             }
-            return baos.toByteArray().toString(Charsets.UTF_8)
+            return baos.toByteArray()
+        }
+
+        private fun readBoundedUtf8Stream(input: InputStream, maxBytes: Int): String {
+            return readBoundedBytes(input, maxBytes).toString(Charsets.UTF_8)
         }
 
         internal fun createForTesting(

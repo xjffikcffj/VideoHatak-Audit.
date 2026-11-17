@@ -413,10 +413,7 @@ class OfflineModelManager private constructor(
                 }
 
                 // Check available disk space in internal app storage
-                val availableBytes = runCatching {
-                    val stat = StatFs(rootDir.absolutePath)
-                    stat.availableBytes
-                }.getOrDefault(Long.MAX_VALUE)
+                val availableBytes = readAvailableStorageBytes(rootDir)
 
                 if (availableBytes < spec.requiredFreeBytesWithMargin) {
                     val needMb = spec.requiredFreeBytesWithMargin / (1024L * 1024L)
@@ -496,9 +493,7 @@ class OfflineModelManager private constructor(
                         }
                     }
 
-                    val extractAvailableBytes = runCatching {
-                        StatFs(rootDir.absolutePath).availableBytes
-                    }.getOrDefault(Long.MAX_VALUE)
+                    val extractAvailableBytes = readAvailableStorageBytes(rootDir)
                     val requiredExtractMargin = maxOf(spec.approximateDiskExtractedMb.toLong() * 1024L * 1024L, 64L * 1024L * 1024L)
                     if (extractAvailableBytes < requiredExtractMargin) {
                         throw IOException("المساحة التخزينية المتاحة غير كافية لفك ضغط نموذج ${language.arabicName}")
@@ -1110,6 +1105,21 @@ class OfflineModelManager private constructor(
             }
         }
         return null
+    }
+
+    private fun readAvailableStorageBytes(dir: File): Long {
+        return runCatching {
+            val stat = StatFs(dir.absolutePath)
+            if (stat.blockCountLong > 0L && stat.totalBytes > 0L) {
+                stat.availableBytes
+            } else if (dir.totalSpace > 0L) {
+                dir.usableSpace
+            } else {
+                Long.MAX_VALUE
+            }
+        }.getOrElse {
+            if (dir.totalSpace > 0L) dir.usableSpace else Long.MAX_VALUE
+        }
     }
 
     private fun ensureDirectories() {

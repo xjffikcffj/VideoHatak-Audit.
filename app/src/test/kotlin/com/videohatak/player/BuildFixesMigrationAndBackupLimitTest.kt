@@ -453,9 +453,16 @@ class BuildFixesMigrationAndBackupLimitTest {
     // 3. Unified 16MB Backup Size Limit across Export & Import
     // -------------------------------------------------------------------------
 
-    private fun buildSizedPayload(totalTargetBytes: Int): BackupPayload {
-        // Use 10 localSubtitle tracks (< 2MB each) so MiniJsonParser limits hold cleanly up to 16MB
-        val trackCount = 10
+    private fun buildSizedPayload(
+        totalTargetBytes: Int,
+        trackCount: Int = if (totalTargetBytes >= 10_000) 10 else 1
+    ): BackupPayload {
+        require(trackCount > 0) {
+            "trackCount must be positive, but was $trackCount"
+        }
+        // Use 10 localSubtitle tracks (< 2MB each) for large payloads so MiniJsonParser limits hold cleanly up to 16MB,
+        // and 1 track for smaller payloads so base serialized size remains minimal (~677 bytes).
+        val minTrackContentLen = 1
         val placeholderTracks = (0 until trackCount).map { idx ->
             LocalSubtitleStore.BackupStoredSubtitleTrack(
                 videoKeyHash = "%032x".format(idx + 1),
@@ -463,7 +470,7 @@ class BuildFixesMigrationAndBackupLimitTest {
                 trackName = "Track $idx",
                 language = "en",
                 format = SubtitleFormat.SRT,
-                content = "A".repeat(1_000),
+                content = "A".repeat(minTrackContentLen),
                 updatedAtMs = 1700000000L
             )
         }
@@ -486,12 +493,19 @@ class BuildFixesMigrationAndBackupLimitTest {
             localSubtitles = placeholderTracks
         )
         val baseSize = BackupManager.serializeBackupJson(basePayload).toByteArray(Charsets.UTF_8).size
+        require(totalTargetBytes >= baseSize) {
+            "totalTargetBytes ($totalTargetBytes) is smaller than the minimum valid serialized payload size ($baseSize bytes for $trackCount track(s))."
+        }
         val extraNeeded = totalTargetBytes - baseSize
         val chunkPerTrack = extraNeeded / trackCount
         val remainder = extraNeeded % trackCount
         val finalTracks = placeholderTracks.mapIndexed { idx, track ->
             val add = chunkPerTrack + if (idx == trackCount - 1) remainder else 0
-            track.copy(content = "A".repeat(1_000 + add))
+            val contentLength = minTrackContentLen + add
+            check(contentLength >= minTrackContentLen) {
+                "Computed invalid track content length ($contentLength) for totalTargetBytes=$totalTargetBytes"
+            }
+            track.copy(content = "A".repeat(contentLength))
         }
         return basePayload.copy(localSubtitles = finalTracks)
     }

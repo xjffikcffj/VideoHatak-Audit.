@@ -30,6 +30,7 @@ import org.junit.rules.TemporaryFolder
 import org.junit.rules.Timeout
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
@@ -54,6 +55,7 @@ private class FakeMlKitModelBridge : MlKitModelBridge {
 }
 
 @RunWith(RobolectricTestRunner::class)
+@Config(sdk = [34], manifest = Config.NONE)
 class OfflineTranslationIntegrationTest {
 
     @get:Rule

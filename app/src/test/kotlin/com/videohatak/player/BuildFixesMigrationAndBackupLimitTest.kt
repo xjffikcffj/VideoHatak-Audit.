@@ -20,9 +20,9 @@ import com.videohatak.player.core.playlist.model.Playlist
 import com.videohatak.player.core.playlist.model.PlaylistItem
 import com.videohatak.player.core.subtitle.model.SubtitleCue
 import com.videohatak.player.core.subtitle.model.SubtitleFormat
+import com.videohatak.player.core.subtitle.model.SubtitleStyleConfig
 import com.videohatak.player.core.subtitle.repository.LocalSubtitleStore
 import com.videohatak.player.core.subtitle.repository.SubtitlePreferencesStore
-import com.videohatak.player.core.subtitle.repository.SubtitleStyleConfig
 import com.videohatak.player.core.subtitle.translation.MlKitModelBridge
 import com.videohatak.player.core.subtitle.translation.OfflineModelDownloadStatus
 import com.videohatak.player.core.subtitle.translation.OfflineModelManager
@@ -605,5 +605,209 @@ class BuildFixesMigrationAndBackupLimitTest {
         assertTrue(uriResult.isFailure)
         assertFalse("0-byte placeholder should be cleaned up on export failure", uriTargetFile.exists())
         assertEquals(true, BackupManager.parseAndValidateBackupJson(BackupManager.serializeBackupJson(buildSizedPayload(60_000))) is BackupParseResult.Success)
+    }
+
+    @Test
+    fun backupManager_exportToUri_cleansPartialNonEmptyPlaceholderAndRestoresExistingFileOnMidWriteFailure() = runBlocking {
+        val appContext = ApplicationProvider.getApplicationContext<Context>()
+        val authority = "com.videohatak.player.test.failingbackupprovider"
+        val backingDir = tempFolder.newFolder("failing_provider_docs")
+
+        val docFiles = linkedMapOf<String, File>()
+        val provider = object : android.content.ContentProvider() {
+            override fun onCreate(): Boolean = true
+            override fun query(
+                uri: Uri,
+                projection: Array<out String>?,
+                selection: String?,
+                selectionArgs: Array<out String>?,
+                sortOrder: String?
+            ): android.database.Cursor? {
+                val id = uri.lastPathSegment ?: return null
+                val file = docFiles[id] ?: return null
+                val cols = projection ?: arrayOf(android.provider.OpenableColumns.SIZE)
+                val cursor = android.database.MatrixCursor(cols)
+                val row = Array<Any?>(cols.size) { idx ->
+                    when (cols[idx]) {
+                        android.provider.OpenableColumns.SIZE -> file.length()
+                        else -> null
+                    }
+                }
+                cursor.addRow(row)
+                return cursor
+            }
+
+            override fun getType(uri: Uri): String = "application/json"
+            override fun insert(uri: Uri, values: android.content.ContentValues?): Uri? = null
+            override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int {
+                val id = uri.lastPathSegment ?: return 0
+                val removed = docFiles.remove(id) ?: return 0
+                return if (removed.delete()) 1 else 0
+            }
+
+            override fun update(
+                uri: Uri,
+                values: android.content.ContentValues?,
+                selection: String?,
+                selectionArgs: Array<out String>?
+            ): Int = 0
+
+            override fun call(method: String, arg: String?, extras: android.os.Bundle?): android.os.Bundle? {
+                if (method == "android:deleteDocument") {
+                    val targetUri = extras?.let {
+                        androidx.core.os.BundleCompat.getParcelable(it, "uri", Uri::class.java)
+                    } ?: arg?.let(Uri::parse)
+                    val id = targetUri?.lastPathSegment
+                    val removed = if (id != null) docFiles.remove(id) else null
+                    val deleted = removed?.delete() == true
+                    return android.os.Bundle().apply {
+                        putBoolean("result", deleted)
+                    }
+                }
+                return super.call(method, arg, extras)
+            }
+
+            override fun openFile(uri: Uri, mode: String): android.os.ParcelFileDescriptor {
+                val id = uri.lastPathSegment ?: throw java.io.FileNotFoundException()
+                val file = docFiles[id] ?: throw java.io.FileNotFoundException()
+                val pfdMode = if (mode.contains("w")) {
+                    android.os.ParcelFileDescriptor.MODE_WRITE_ONLY or
+                        android.os.ParcelFileDescriptor.MODE_CREATE or
+                        android.os.ParcelFileDescriptor.MODE_TRUNCATE
+                } else {
+                    android.os.ParcelFileDescriptor.MODE_READ_ONLY
+                }
+                return android.os.ParcelFileDescriptor.open(file, pfdMode)
+            }
+        }
+
+        val info = android.content.pm.ProviderInfo().apply {
+            this.authority = authority
+            this.exported = false
+        }
+        provider.attachInfo(appContext, info)
+        org.robolectric.shadows.ShadowContentResolver.registerProviderInternal(authority, provider)
+
+        val manager = BackupManager.createForTesting(
+            themeRepository = FakeThemeRepo(),
+            playbackRepository = FakePlaybackPrefs(),
+            subtitleRepository = FakeSubtitlePrefStore(),
+            vaultSecurityStore = FakeVaultSecurityStore(),
+            playlistStore = FakePlaylistStore(),
+            subtitleStore = null,
+            context = appContext
+        )
+        val payload = buildSizedPayload(4_096)
+
+        var failOnNextWrite = true
+        var failAfterBytes = 128
+        manager.uriStreamOpenerForTesting = { uri, mode ->
+            val id = uri.lastPathSegment!!
+            val backingFile = docFiles.getValue(id)
+            if (mode.contains("w") && failOnNextWrite) {
+                failOnNextWrite = false
+                // Truncate upfront just like SAF "wt"
+                val inner = java.io.FileOutputStream(backingFile, false)
+                object : java.io.OutputStream() {
+                    private var written = 0
+                    override fun write(b: Int) {
+                        if (written >= failAfterBytes) {
+                            throw java.io.IOException("Simulated disk full after $written bytes")
+                        }
+                        inner.write(b)
+                        written++
+                    }
+
+                    override fun write(b: ByteArray, off: Int, len: Int) {
+                        val remaining = failAfterBytes - written
+                        if (remaining <= 0) {
+                            throw java.io.IOException("Simulated disk full after $written bytes")
+                        }
+                        val chunk = minOf(len, remaining)
+                        inner.write(b, off, chunk)
+                        inner.flush()
+                        written += chunk
+                        if (chunk < len) {
+                            throw java.io.IOException("Simulated disk full after $written bytes")
+                        }
+                    }
+
+                    override fun flush() = inner.flush()
+                    override fun close() = inner.close()
+                }
+            } else {
+                appContext.contentResolver.openOutputStream(uri, mode)
+            }
+        }
+
+        // Case 1: Fresh empty document (0 bytes before write) fails mid-write after writing 128 partial bytes
+        val emptyDocFile = File(backingDir, "fresh_empty.json").apply { writeBytes(ByteArray(0)) }
+        docFiles["fresh_empty"] = emptyDocFile
+        val emptyDocUri = Uri.parse("content://$authority/document/fresh_empty")
+        failOnNextWrite = true
+        failAfterBytes = 128
+
+        val freshFailResult = manager.exportPayloadToUri(payload, emptyDocUri)
+        assertTrue("Mid-write failure must return failure", freshFailResult.isFailure)
+        assertFalse(
+            "Partial non-empty placeholder document must be deleted or cleaned up on mid-write failure",
+            emptyDocFile.exists() && emptyDocFile.length() > 0L
+        )
+        assertFalse("Fresh placeholder document should be removed via deleteDocument", docFiles.containsKey("fresh_empty"))
+
+        // Case 2: Pre-existing non-empty user file fails mid-write -> must restore original content (never delete or corrupt!)
+        val originalUserBytes = """{"schemaVersion":3,"user":"original_intact"}""".toByteArray(Charsets.UTF_8)
+        val existingDocFile = File(backingDir, "existing_user.json").apply { writeBytes(originalUserBytes) }
+        docFiles["existing_user"] = existingDocFile
+        val existingDocUri = Uri.parse("content://$authority/document/existing_user")
+        failOnNextWrite = true
+        failAfterBytes = 96
+
+        val existingFailResult = manager.exportPayloadToUri(payload, existingDocUri)
+        assertTrue("Mid-write failure on existing file must return failure", existingFailResult.isFailure)
+        assertTrue("Pre-existing user document must NOT be deleted on failure", existingDocFile.exists())
+        assertEquals(
+            "Pre-existing user document must be restored intact without partial corruption",
+            originalUserBytes.toString(Charsets.UTF_8),
+            existingDocFile.readText(Charsets.UTF_8)
+        )
+
+        // Case 3: File URI (pre-existing non-empty) fails mid-write -> original file also restored intact
+        val realUserFile = File(tempFolder.root, "existing_file_uri.json").apply { writeBytes(originalUserBytes) }
+        val fileUri = Uri.fromFile(realUserFile)
+        manager.uriStreamOpenerForTesting = { uri, mode ->
+            if (uri == fileUri && mode.contains("w") && failOnNextWrite) {
+                failOnNextWrite = false
+                val inner = java.io.FileOutputStream(realUserFile, false)
+                object : java.io.OutputStream() {
+                    private var written = 0
+                    override fun write(b: Int) {
+                        if (written >= 64) throw java.io.IOException("Simulated IO failure")
+                        inner.write(b)
+                        written++
+                    }
+
+                    override fun write(b: ByteArray, off: Int, len: Int) {
+                        val remaining = 64 - written
+                        if (remaining <= 0) throw java.io.IOException("Simulated IO failure")
+                        val chunk = minOf(len, remaining)
+                        inner.write(b, off, chunk)
+                        inner.flush()
+                        written += chunk
+                        if (chunk < len) throw java.io.IOException("Simulated IO failure")
+                    }
+
+                    override fun flush() = inner.flush()
+                    override fun close() = inner.close()
+                }
+            } else {
+                appContext.contentResolver.openOutputStream(uri, mode)
+            }
+        }
+        failOnNextWrite = true
+        val fileUriFail = manager.exportPayloadToUri(payload, fileUri)
+        assertTrue(fileUriFail.isFailure)
+        assertTrue(realUserFile.exists())
+        assertEquals(originalUserBytes.toString(Charsets.UTF_8), realUserFile.readText(Charsets.UTF_8))
     }
 }

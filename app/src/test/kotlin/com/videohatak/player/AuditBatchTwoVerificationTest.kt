@@ -675,7 +675,7 @@ class AuditBatchTwoVerificationTest {
         vm.clearError()
         drainAsync { vm.vaultError.value == null }
 
-        vm.deleteVaultVideo(rowId)
+        vm.deleteVideo(rowId)
         drainAsync { hookedIds.contains(rowId) && db.getVideoById(rowId) == null }
         assertEquals(listOf(rowId), hookedIds)
     }
@@ -749,7 +749,7 @@ class AuditBatchTwoVerificationTest {
         val emptySubsPayload = BackupPayload(
             createdAtEpochMs = 1_000L,
             settings = BackupSettingsData(
-                selectedTheme = AppThemeId.ROYAL_GOLD,
+                selectedTheme = AppThemeId.ROYAL_IVORY,
                 themeMode = ThemeMode.DARK,
                 playbackSpeed = 1.0f,
                 resizeMode = 0,

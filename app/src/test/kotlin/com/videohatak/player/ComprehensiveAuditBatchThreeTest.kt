@@ -366,7 +366,10 @@ class ComprehensiveAuditBatchThreeTest {
         val spyProvider = object : SubtitleTranslationProvider {
             override suspend fun translateBatch(request: SubtitleBatchRequest): SubtitleBatchResponse {
                 providerInvoked = true
-                return SubtitleBatchResponse(emptyMap())
+                return SubtitleBatchResponse(
+                    batchIndex = request.batchIndex,
+                    translatedTextsByIndex = emptyMap()
+                )
             }
 
             override suspend fun transcribeAndTranslateAudio(

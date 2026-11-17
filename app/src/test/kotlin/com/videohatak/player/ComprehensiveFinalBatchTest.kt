@@ -52,10 +52,12 @@ import org.junit.rules.TemporaryFolder
 import org.junit.rules.Timeout
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
 import java.io.File
 import java.nio.charset.Charset
 
 @RunWith(RobolectricTestRunner::class)
+@Config(sdk = [34], manifest = Config.NONE)
 class ComprehensiveFinalBatchTest {
 
     @get:Rule
@@ -98,7 +100,7 @@ class ComprehensiveFinalBatchTest {
             schemaVersion = BackupManager.SCHEMA_VERSION,
             createdAtEpochMs = 1700000000000L,
             settings = BackupSettingsData(
-                selectedTheme = AppThemeId.ROYAL_GOLD,
+                selectedTheme = AppThemeId.ROYAL_IVORY,
                 themeMode = ThemeMode.DARK,
                 playbackSpeed = 1.25f,
                 resizeMode = 0,

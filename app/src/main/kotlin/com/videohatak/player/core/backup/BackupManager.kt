@@ -143,24 +143,70 @@ class BackupManager internal constructor(
         subtitleStore = subtitleStore
     )
 
+    private data class ExportUriPreWriteState(
+        val wasInitiallyEmptyOrMissing: Boolean,
+        val rollbackFile: File?
+    )
+
     suspend fun exportToUri(uri: Uri): Result<BackupExportSummary> = withContext(Dispatchers.IO) {
         runCatching {
             val nonNullContext = requireNotNull(context) { "Context is required for exportToUri" }
             val payload = captureCurrentPayload()
-            val stagingDir = File(nonNullContext.cacheDir, "backup_staging")
-            try {
-                exportPayloadViaTempFile(payload, stagingDir) { tempFile, _ ->
-                    nonNullContext.contentResolver.openOutputStream(uri, "wt")?.use { out ->
-                        FileInputStream(tempFile).use { input ->
-                            input.copyTo(out)
-                        }
-                        out.flush()
-                    } ?: throw IllegalStateException("تعذر فتح ملف التصدير للكتابة")
+            exportPayloadToUriInternal(nonNullContext, payload, uri)
+        }
+    }
+
+    internal suspend fun exportPayloadToUri(
+        payload: BackupPayload,
+        uri: Uri
+    ): Result<BackupExportSummary> = withContext(Dispatchers.IO) {
+        runCatching {
+            val nonNullContext = requireNotNull(context) { "Context is required for exportPayloadToUri" }
+            exportPayloadToUriInternal(nonNullContext, payload, uri)
+        }
+    }
+
+    @Volatile
+    internal var uriStreamOpenerForTesting: ((Uri, String) -> java.io.OutputStream?)? = null
+
+    private fun openUriOutputStream(context: Context, uri: Uri, mode: String): java.io.OutputStream? {
+        return uriStreamOpenerForTesting?.invoke(uri, mode)
+            ?: context.contentResolver.openOutputStream(uri, mode)
+    }
+
+    private fun exportPayloadToUriInternal(
+        nonNullContext: Context,
+        payload: BackupPayload,
+        uri: Uri
+    ): BackupExportSummary {
+        val stagingDir = File(nonNullContext.cacheDir, "backup_staging")
+        if (!stagingDir.exists() && !stagingDir.mkdirs()) {
+            throw IllegalStateException("تعذر إنشاء مجلد التحضير المؤقت للنسخة الاحتياطية")
+        }
+        val preWriteState = inspectExportUriPreWriteState(nonNullContext, uri, stagingDir)
+        var streamOpenedAndTruncated = false
+        try {
+            return exportPayloadViaTempFile(payload, stagingDir) { tempFile, _ ->
+                val outStream = openUriOutputStream(nonNullContext, uri, "wt")
+                    ?: throw IllegalStateException("تعذر فتح ملف التصدير للكتابة")
+                streamOpenedAndTruncated = true
+                outStream.use { out ->
+                    FileInputStream(tempFile).use { input ->
+                        input.copyTo(out)
+                    }
+                    out.flush()
                 }
-            } catch (t: Throwable) {
-                cleanupEmptyExportUriOnFailure(nonNullContext, uri)
-                throw t
             }
+        } catch (t: Throwable) {
+            cleanupOrRestoreExportUriOnFailure(
+                context = nonNullContext,
+                uri = uri,
+                preWriteState = preWriteState,
+                streamOpenedAndTruncated = streamOpenedAndTruncated
+            )
+            throw t
+        } finally {
+            runCatching { preWriteState.rollbackFile?.delete() }
         }
     }
 
@@ -246,33 +292,191 @@ class BackupManager internal constructor(
         }
     }
 
-    private fun cleanupEmptyExportUriOnFailure(context: Context, uri: Uri) {
+    private fun inspectExportUriPreWriteState(
+        context: Context,
+        uri: Uri,
+        stagingDir: File
+    ): ExportUriPreWriteState {
+        return when (uri.scheme?.lowercase(Locale.US)) {
+            "file" -> {
+                val file = uri.path?.let(::File)
+                if (file == null || !file.exists() || file.length() == 0L) {
+                    ExportUriPreWriteState(wasInitiallyEmptyOrMissing = true, rollbackFile = null)
+                } else if (file.length() <= MAX_ROLLBACK_SNAPSHOT_BYTES) {
+                    val rollback = snapshotFileToTemp(file, stagingDir)
+                    ExportUriPreWriteState(wasInitiallyEmptyOrMissing = false, rollbackFile = rollback)
+                } else {
+                    ExportUriPreWriteState(wasInitiallyEmptyOrMissing = false, rollbackFile = null)
+                }
+            }
+            "content" -> {
+                val docSize = queryContentUriSize(context, uri)
+                if (docSize == 0L) {
+                    ExportUriPreWriteState(wasInitiallyEmptyOrMissing = true, rollbackFile = null)
+                } else {
+                    snapshotContentUriBeforeOverwrite(context, uri, docSize, stagingDir)
+                }
+            }
+            else -> ExportUriPreWriteState(wasInitiallyEmptyOrMissing = false, rollbackFile = null)
+        }
+    }
+
+    private fun snapshotFileToTemp(source: File, stagingDir: File): File? {
+        var rollback: File? = null
+        return try {
+            rollback = File.createTempFile("videohatak_rollback_", ".bak.tmp", stagingDir)
+            FileInputStream(source).use { input ->
+                FileOutputStream(rollback).use { out ->
+                    input.copyTo(out)
+                    out.flush()
+                }
+            }
+            rollback
+        } catch (_: Throwable) {
+            runCatching { rollback?.delete() }
+            null
+        }
+    }
+
+    private fun snapshotContentUriBeforeOverwrite(
+        context: Context,
+        uri: Uri,
+        reportedSize: Long?,
+        stagingDir: File
+    ): ExportUriPreWriteState {
+        var rollback: File? = null
+        return try {
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                val temp = File.createTempFile("videohatak_rollback_", ".bak.tmp", stagingDir)
+                rollback = temp
+                val buffer = ByteArray(8 * 1024)
+                var total = 0L
+                FileOutputStream(temp).use { out ->
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read == -1) break
+                        total += read
+                        if (total > MAX_ROLLBACK_SNAPSHOT_BYTES) {
+                            throw IllegalStateException("Existing file exceeds rollback snapshot cap")
+                        }
+                        out.write(buffer, 0, read)
+                    }
+                    out.flush()
+                }
+                if (total == 0L) {
+                    runCatching { temp.delete() }
+                    ExportUriPreWriteState(wasInitiallyEmptyOrMissing = true, rollbackFile = null)
+                } else {
+                    ExportUriPreWriteState(wasInitiallyEmptyOrMissing = false, rollbackFile = temp)
+                }
+            } ?: ExportUriPreWriteState(
+                wasInitiallyEmptyOrMissing = (reportedSize == 0L),
+                rollbackFile = null
+            )
+        } catch (_: Throwable) {
+            runCatching { rollback?.delete() }
+            ExportUriPreWriteState(
+                wasInitiallyEmptyOrMissing = (reportedSize == 0L),
+                rollbackFile = null
+            )
+        }
+    }
+
+    private fun queryContentUriSize(context: Context, uri: Uri): Long? {
+        var docSize: Long? = null
         runCatching {
-            when (uri.scheme?.lowercase()) {
+            context.contentResolver.query(
+                uri,
+                arrayOf(OpenableColumns.SIZE),
+                null,
+                null,
+                null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idx = cursor.getColumnIndex(OpenableColumns.SIZE)
+                    if (idx != -1 && !cursor.isNull(idx)) {
+                        docSize = cursor.getLong(idx)
+                    }
+                }
+            }
+        }
+        return docSize
+    }
+
+    private fun cleanupOrRestoreExportUriOnFailure(
+        context: Context,
+        uri: Uri,
+        preWriteState: ExportUriPreWriteState,
+        streamOpenedAndTruncated: Boolean
+    ) {
+        runCatching {
+            val rollbackFile = preWriteState.rollbackFile
+            if (streamOpenedAndTruncated && rollbackFile != null && rollbackFile.exists()) {
+                when (uri.scheme?.lowercase(Locale.US)) {
+                    "file" -> {
+                        val dest = uri.path?.let(::File)
+                        if (dest != null) {
+                            val stage = File(dest.parentFile ?: rollbackFile.parentFile, "${dest.name}.restore.tmp")
+                            try {
+                                FileInputStream(rollbackFile).use { input ->
+                                    FileOutputStream(stage).use { out ->
+                                        input.copyTo(out)
+                                        out.flush()
+                                    }
+                                }
+                                if (!stage.renameTo(dest)) {
+                                    FileInputStream(stage).use { input ->
+                                        FileOutputStream(dest).use { out ->
+                                            input.copyTo(out)
+                                            out.flush()
+                                        }
+                                    }
+                                }
+                            } finally {
+                                runCatching { stage.delete() }
+                            }
+                        }
+                    }
+                    else -> {
+                        openUriOutputStream(context, uri, "wt")?.use { out ->
+                            FileInputStream(rollbackFile).use { input ->
+                                input.copyTo(out)
+                            }
+                            out.flush()
+                        }
+                    }
+                }
+                return@runCatching
+            }
+
+            if (!preWriteState.wasInitiallyEmptyOrMissing) {
+                return@runCatching
+            }
+
+            when (uri.scheme?.lowercase(Locale.US)) {
                 "file" -> {
                     val file = uri.path?.let(::File)
-                    if (file != null && file.exists() && file.length() == 0L) {
+                    if (file != null && file.exists() && (streamOpenedAndTruncated || file.length() == 0L)) {
                         file.delete()
                     }
                 }
                 "content" -> {
-                    var docSize: Long? = null
-                    context.contentResolver.query(
-                        uri,
-                        arrayOf(OpenableColumns.SIZE),
-                        null,
-                        null,
-                        null
-                    )?.use { cursor ->
-                        if (cursor.moveToFirst()) {
-                            val idx = cursor.getColumnIndex(OpenableColumns.SIZE)
-                            if (idx != -1 && !cursor.isNull(idx)) {
-                                docSize = cursor.getLong(idx)
+                    if (!streamOpenedAndTruncated) {
+                        val currentSize = queryContentUriSize(context, uri)
+                        if (currentSize == 0L) {
+                            DocumentsContract.deleteDocument(context.contentResolver, uri)
+                        }
+                    } else {
+                        val deleted = runCatching {
+                            DocumentsContract.deleteDocument(context.contentResolver, uri)
+                        }.getOrDefault(false)
+                        if (!deleted) {
+                            runCatching {
+                                openUriOutputStream(context, uri, "wt")?.use { out ->
+                                    out.flush()
+                                }
                             }
                         }
-                    }
-                    if (docSize == 0L) {
-                        DocumentsContract.deleteDocument(context.contentResolver, uri)
                     }
                 }
             }
@@ -462,6 +666,7 @@ class BackupManager internal constructor(
         const val SCHEMA_VERSION = 3
         val SUPPORTED_SCHEMA_VERSIONS = setOf(1, 2, 3)
         const val MAX_BACKUP_BYTES = 16 * 1024 * 1024
+        private const val MAX_ROLLBACK_SNAPSHOT_BYTES = MAX_BACKUP_BYTES * 2L
         private const val MAX_BACKUP_MB = MAX_BACKUP_BYTES / (1024 * 1024)
         private const val MAX_PLAYLISTS = 200
         private const val MAX_ITEMS_PER_PLAYLIST = 2_000
@@ -535,6 +740,12 @@ class BackupManager internal constructor(
         fun parseAndValidateBackupJson(rawJson: String): BackupParseResult {
             if (rawJson.length > MAX_BACKUP_BYTES) {
                 return BackupParseResult.Error(formatBackupSizeExceededMessage())
+            }
+            if (rawJson.length > MAX_BACKUP_BYTES / 3) {
+                val utf8Size = rawJson.toByteArray(Charsets.UTF_8).size.toLong()
+                if (utf8Size > MAX_BACKUP_BYTES.toLong()) {
+                    return BackupParseResult.Error(formatBackupSizeExceededMessage(utf8Size))
+                }
             }
             val root = try {
                 MiniJsonParser(rawJson).parseValue() as? Map<*, *>

@@ -26,8 +26,36 @@ android {
         }
     }
 
+    signingConfigs {
+        create("release") {
+            val keystorePath = (project.findProperty("VIDEOHATAK_KEYSTORE_PATH") as? String)
+                ?: System.getenv("VIDEOHATAK_KEYSTORE_PATH")
+            val keystorePassword = (project.findProperty("VIDEOHATAK_KEYSTORE_PASSWORD") as? String)
+                ?: System.getenv("VIDEOHATAK_KEYSTORE_PASSWORD")
+            val keyAliasValue = (project.findProperty("VIDEOHATAK_KEY_ALIAS") as? String)
+                ?: System.getenv("VIDEOHATAK_KEY_ALIAS")
+            val keyPasswordValue = (project.findProperty("VIDEOHATAK_KEY_PASSWORD") as? String)
+                ?: System.getenv("VIDEOHATAK_KEY_PASSWORD")
+
+            if (!keystorePath.isNullOrBlank() &&
+                !keystorePassword.isNullOrBlank() &&
+                !keyAliasValue.isNullOrBlank() &&
+                !keyPasswordValue.isNullOrBlank()
+            ) {
+                storeFile = file(keystorePath)
+                storePassword = keystorePassword
+                keyAlias = keyAliasValue
+                keyPassword = keyPasswordValue
+            }
+        }
+    }
+
     buildTypes {
         release {
+            val releaseSigning = signingConfigs.getByName("release")
+            if (releaseSigning.storeFile != null) {
+                signingConfig = releaseSigning
+            }
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(

@@ -1,8 +1,11 @@
 package com.videohatak.player
 
 import com.videohatak.player.core.vault.crypto.VaultCryptoManager
+import com.videohatak.player.core.vault.db.VaultDatabaseStore
 import com.videohatak.player.core.vault.model.VaultVideo
 import com.videohatak.player.core.vault.model.toVideoItem
+import com.videohatak.player.core.vault.repository.VaultRepositoryImpl
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -17,6 +20,7 @@ import org.junit.rules.TemporaryFolder
 import org.junit.rules.Timeout
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 import java.io.ByteArrayInputStream
 import java.io.File
@@ -829,5 +833,73 @@ class VaultCryptoTest {
 
         // Temp file must be purged cleanly upon cancellation
         assertFalse(tempFile.exists())
+    }
+
+    @Test
+    fun testTwoPhaseVaultDeletionRestoresFileOnDbFailureAndDeletesOnCommit() = runBlocking {
+        val appContext = RuntimeEnvironment.getApplication()
+        val vaultDir = File(appContext.filesDir, "vault_encrypted").apply { mkdirs() }
+        val encryptedFile = File(vaultDir, "two_phase_test.enc")
+        val cipherBytes = "ENCRYPTED_PAYLOAD_BYTES".toByteArray()
+        encryptedFile.writeBytes(cipherBytes)
+
+        val encryptedMeta = cryptoManager.encryptMetadata(
+            """{"title":"Secret Video","file":"two_phase_test.enc","mime":"video/mp4"}"""
+        )
+        val storedRow = VaultVideo(
+            id = 77L,
+            displayName = "مقطع خاص مشفر",
+            originalSizeBytes = cipherBytes.size.toLong(),
+            encryptedSizeBytes = cipherBytes.size.toLong(),
+            durationMs = 5_000L,
+            mimeType = "application/octet-stream",
+            width = 1280,
+            height = 720,
+            relativeEncryptedPath = "two_phase_test.enc",
+            createdAtEpochMs = 1_700_000_000L,
+            ivBase64 = "AA==",
+            encryptedMetaBase64 = encryptedMeta
+        )
+
+        var failDbDelete = true
+        val fakeDb = object : VaultDatabaseStore {
+            private var rowPresent = true
+            override fun insertVideo(video: VaultVideo): Long = storedRow.id
+            override fun updateEncryptedMetadata(
+                id: Long,
+                maskedDisplayName: String,
+                internalPath: String,
+                maskedMimeType: String,
+                encryptedMetaBase64: String
+            ): Int = 1
+            override fun getAllVideos(): List<VaultVideo> = if (rowPresent) listOf(storedRow) else emptyList()
+            override fun getVideoById(id: Long): VaultVideo? = if (rowPresent && id == storedRow.id) storedRow else null
+            override fun deleteVideo(id: Long): Int {
+                if (failDbDelete) return 0
+                rowPresent = false
+                return 1
+            }
+        }
+
+        val repo = VaultRepositoryImpl(
+            context = appContext,
+            cryptoManager = cryptoManager,
+            dbHelper = fakeDb
+        )
+        repo.setUnlocked(true)
+
+        // Phase 1 failure: DB delete returns 0 -> encrypted file must be rolled back intact
+        val failedDelete = repo.deleteVaultVideo(storedRow.id)
+        assertFalse(failedDelete)
+        assertTrue("Encrypted vault file must be restored when DB delete fails", encryptedFile.exists())
+        assertArrayEquals(cipherBytes, encryptedFile.readBytes())
+        assertFalse(vaultDir.listFiles().orEmpty().any { it.name.endsWith(".pending_delete") })
+
+        // Phase 2 success: DB delete commits -> encrypted file & staging file removed cleanly
+        failDbDelete = false
+        val succeededDelete = repo.deleteVaultVideo(storedRow.id)
+        assertTrue(succeededDelete)
+        assertFalse("Encrypted vault file must be removed after committed DB delete", encryptedFile.exists())
+        assertFalse(vaultDir.listFiles().orEmpty().any { it.name.endsWith(".pending_delete") })
     }
 }

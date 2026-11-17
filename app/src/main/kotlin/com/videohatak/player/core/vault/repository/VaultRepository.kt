@@ -16,12 +16,15 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
 import java.io.InputStream
 import java.security.MessageDigest
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 interface VaultRepository {
     val vaultVideos: Flow<List<VaultVideo>>
@@ -98,6 +101,15 @@ class VaultRepositoryImpl internal constructor(
         }
     }
 
+    private val repoMutex = Mutex()
+    private val activeImportTempNames = ConcurrentHashMap.newKeySet<String>()
+
+    internal var beforeDeleteHook: (suspend (Long) -> Unit)? = null
+
+    @Volatile
+    var lastPreservedOrphanCount: Int = 0
+        private set
+
     private val _vaultVideos = MutableStateFlow<List<VaultVideo>>(emptyList())
     override val vaultVideos: Flow<List<VaultVideo>> = _vaultVideos.asStateFlow()
 
@@ -115,11 +127,18 @@ class VaultRepositoryImpl internal constructor(
     }
 
     override suspend fun refresh() = withContext(Dispatchers.IO) {
+        repoMutex.withLock {
+            refreshLocked()
+        }
+    }
+
+    private fun refreshLocked() {
         if (!_isUnlocked.value) {
             _vaultVideos.value = emptyList()
-            return@withContext
+            return
         }
         val rawList = dbHelper.getAllVideos()
+        reconcileVaultStorageLocked(rawList)
         var firstDecodeError: String? = null
         val decoded = rawList.mapNotNull { row ->
             val result = decodeVaultRow(row)
@@ -130,6 +149,60 @@ class VaultRepositoryImpl internal constructor(
         }
         _vaultError.value = firstDecodeError
         _vaultVideos.update { decoded }
+    }
+
+    private fun reconcileVaultStorageLocked(rows: List<VaultVideo>) {
+        val activeFileNames = buildSet {
+            rows.forEach { row ->
+                add(File(row.relativeEncryptedPath).name)
+                row.encryptedMetaBase64?.takeIf { it.isNotBlank() }?.let { enc ->
+                    runCatching {
+                        val json = JSONObject(cryptoManager.decryptMetadata(enc))
+                        val fName = File(json.optString("file")).name
+                        if (fName.isNotBlank()) add(fName)
+                    }
+                }
+            }
+        }
+        var preservedOrphans = 0
+        vaultDir.listFiles()?.forEach { file ->
+            if (!file.isFile) return@forEach
+            val name = file.name
+            when {
+                name.endsWith(".pending_delete") -> {
+                    val baseWithTs = name.removeSuffix(".pending_delete")
+                    val lastDot = baseWithTs.lastIndexOf('.')
+                    val tsPart = if (lastDot > 0) baseWithTs.substring(lastDot + 1) else ""
+                    val originalName = if (lastDot > 0 && tsPart.isNotEmpty() && tsPart.all { it.isDigit() }) {
+                        baseWithTs.substring(0, lastDot)
+                    } else {
+                        baseWithTs.substringBeforeLast('.', missingDelimiterValue = "")
+                    }
+                    if (originalName.isNotBlank() && originalName in activeFileNames) {
+                        val originalFile = File(vaultDir, originalName)
+                        if (!originalFile.exists()) {
+                            runCatching { file.renameTo(originalFile) }
+                        } else {
+                            runCatching { file.delete() }
+                        }
+                    } else {
+                        runCatching { file.delete() }
+                    }
+                }
+                name.endsWith(".tmp") || name.endsWith(".stage") -> {
+                    if (name !in activeImportTempNames) {
+                        runCatching { file.delete() }
+                    }
+                }
+                name.endsWith(".enc") -> {
+                    if (name !in activeFileNames) {
+                        // Never delete unreferenced encrypted payloads blindly; preserve on disk.
+                        preservedOrphans++
+                    }
+                }
+            }
+        }
+        lastPreservedOrphanCount = preservedOrphans
     }
 
     private fun computeSourceFingerprint(sourceUri: Uri): String {
@@ -265,6 +338,8 @@ class VaultRepositoryImpl internal constructor(
         val uniqueName = "vault_${UUID.randomUUID()}"
         val fileName = "$uniqueName.enc"
         val destFile = File(vaultDir, fileName)
+        val stagingFile = File(vaultDir, "$fileName.stage")
+        val stagingInnerTempName = "${stagingFile.name}.tmp"
         val resolvedName = displayName?.ifBlank { null } ?: queryFileName(sourceUri) ?: "$uniqueName.mp4"
         val sourceFingerprint = computeSourceFingerprint(sourceUri)
 
@@ -273,7 +348,10 @@ class VaultRepositoryImpl internal constructor(
             context.contentResolver.openFileDescriptor(sourceUri, "r")?.use { it.statSize } ?: 0L
         } catch (_: Exception) { 0L }
 
-        if (isDuplicateInVault(sourceFingerprint, resolvedName, estimatedSize, metadata.durationMs)) {
+        val duplicateBeforeEncrypt = repoMutex.withLock {
+            isDuplicateInVault(sourceFingerprint, resolvedName, estimatedSize, metadata.durationMs)
+        }
+        if (duplicateBeforeEncrypt) {
             _vaultError.value = "هذا الفيديو مضاف مسبقًا داخل الخزنة المشفرة"
             return@withContext null
         }
@@ -294,58 +372,86 @@ class VaultRepositoryImpl internal constructor(
             return@withContext null
         }
 
+        activeImportTempNames.add(stagingFile.name)
+        activeImportTempNames.add(stagingInnerTempName)
         try {
             val encResult = inputStream.use { input ->
                 cryptoManager.encryptStream(
                     inputStream = input,
-                    destinationFile = destFile,
+                    destinationFile = stagingFile,
                     totalBytesEstimated = estimatedSize,
                     onProgress = onProgress,
                     isCancelled = isCancelled
                 )
             }
 
-            verifyEncryptedOutputIntegrity(destFile)
+            verifyEncryptedOutputIntegrity(stagingFile)
 
             val encryptedMeta = encodeMetadata(resolvedName, fileName, metadata.mimeType, sourceFingerprint)
             val ivBase64 = VaultBase64.encodeNoWrap(encResult.encryptedDek)
-            val dbRow = VaultVideo(
-                id = 0L,
-                displayName = MASKED_DISPLAY_NAME,
-                originalSizeBytes = encResult.plaintextSizeBytes,
-                encryptedSizeBytes = destFile.length(),
-                durationMs = metadata.durationMs,
-                mimeType = MASKED_MIME_TYPE,
-                width = metadata.width,
-                height = metadata.height,
-                relativeEncryptedPath = fileName,
-                createdAtEpochMs = System.currentTimeMillis(),
-                ivBase64 = ivBase64,
-                encryptedMetaBase64 = encryptedMeta
-            )
 
-            val newId = dbHelper.insertVideo(dbRow)
-            if (newId <= 0L) {
-                throw IllegalStateException("Failed to persist vault record")
+            repoMutex.withLock {
+                if (isDuplicateInVault(sourceFingerprint, resolvedName, estimatedSize, metadata.durationMs)) {
+                    stagingFile.delete()
+                    _vaultError.value = "هذا الفيديو مضاف مسبقًا داخل الخزنة المشفرة"
+                    return@withContext null
+                }
+
+                if (!stagingFile.renameTo(destFile)) {
+                    stagingFile.copyTo(destFile, overwrite = true)
+                    stagingFile.delete()
+                }
+                if (!destFile.exists() || destFile.length() <= 0L) {
+                    throw IllegalStateException("Failed to move staged encrypted file into place")
+                }
+
+                val dbRow = VaultVideo(
+                    id = 0L,
+                    displayName = MASKED_DISPLAY_NAME,
+                    originalSizeBytes = encResult.plaintextSizeBytes,
+                    encryptedSizeBytes = destFile.length(),
+                    durationMs = metadata.durationMs,
+                    mimeType = MASKED_MIME_TYPE,
+                    width = metadata.width,
+                    height = metadata.height,
+                    relativeEncryptedPath = fileName,
+                    createdAtEpochMs = System.currentTimeMillis(),
+                    ivBase64 = ivBase64,
+                    encryptedMetaBase64 = encryptedMeta
+                )
+
+                val newId = try {
+                    dbHelper.insertVideo(dbRow)
+                } catch (dbErr: Exception) {
+                    destFile.delete()
+                    throw dbErr
+                }
+                if (newId <= 0L) {
+                    destFile.delete()
+                    throw IllegalStateException("Failed to persist vault record")
+                }
+
+                _vaultError.value = null
+                val savedVideo = dbRow.copy(
+                    id = newId,
+                    displayName = resolvedName,
+                    mimeType = metadata.mimeType,
+                    relativeEncryptedPath = destFile.absolutePath
+                )
+                recordActivity()
+                refreshLocked()
+                savedVideo
             }
-            _vaultError.value = null
-            val savedVideo = dbRow.copy(
-                id = newId,
-                displayName = resolvedName,
-                mimeType = metadata.mimeType,
-                relativeEncryptedPath = destFile.absolutePath
-            )
-            recordActivity()
-            refresh()
-            savedVideo
         } catch (e: Exception) {
-            if (destFile.exists()) {
-                destFile.delete()
-            }
+            stagingFile.delete()
+            File(vaultDir, stagingInnerTempName).delete()
             if (e !is InterruptedException) {
                 _vaultError.value = "فشل تشفير الفيديو إلى الخزنة: بقي الملف الأصلي سليمًا في مكانه"
             }
             null
+        } finally {
+            activeImportTempNames.remove(stagingFile.name)
+            activeImportTempNames.remove(stagingInnerTempName)
         }
     }
 
@@ -383,50 +489,88 @@ class VaultRepositoryImpl internal constructor(
     }
 
     override suspend fun renameVideo(videoId: Long, newTitle: String): Boolean = withContext(Dispatchers.IO) {
-        if (!_isUnlocked.value) return@withContext false
-        val cleanTitle = newTitle.trim()
-        if (cleanTitle.isBlank()) return@withContext false
-        val existing = dbHelper.getVideoById(videoId) ?: return@withContext false
-        val decoded = decodeVaultRow(existing) ?: return@withContext false
-        val internalFile = File(decoded.relativeEncryptedPath).name
-        val rows = try {
-            val newEncryptedMeta = encodeMetadata(cleanTitle, internalFile, decoded.mimeType)
-            dbHelper.updateEncryptedMetadata(
-                id = videoId,
-                maskedDisplayName = MASKED_DISPLAY_NAME,
-                internalPath = internalFile,
-                maskedMimeType = MASKED_MIME_TYPE,
-                encryptedMetaBase64 = newEncryptedMeta
-            )
-        } catch (_: Exception) {
-            0
+        repoMutex.withLock {
+            if (!_isUnlocked.value) {
+                _vaultError.value = "يرجى فتح الخزنة أولًا قبل إعادة التسمية"
+                return@withContext false
+            }
+            val cleanTitle = newTitle.trim()
+            if (cleanTitle.isBlank()) {
+                _vaultError.value = "يرجى إدخال اسم صالح للفيديو"
+                return@withContext false
+            }
+            val existing = dbHelper.getVideoById(videoId)
+            if (existing == null) {
+                _vaultError.value = "تعذر العثور على المقطع المطلوب داخل الخزنة"
+                return@withContext false
+            }
+            val decoded = decodeVaultRow(existing)
+            if (decoded == null) {
+                _vaultError.value = "تعذر قراءة بيانات المقطع المشفرة لإعادة تسميته"
+                return@withContext false
+            }
+            val internalFile = File(decoded.relativeEncryptedPath).name
+            val rows = try {
+                val newEncryptedMeta = encodeMetadata(cleanTitle, internalFile, decoded.mimeType)
+                dbHelper.updateEncryptedMetadata(
+                    id = videoId,
+                    maskedDisplayName = MASKED_DISPLAY_NAME,
+                    internalPath = internalFile,
+                    maskedMimeType = MASKED_MIME_TYPE,
+                    encryptedMetaBase64 = newEncryptedMeta
+                )
+            } catch (_: Exception) {
+                0
+            }
+            if (rows > 0) {
+                _vaultError.value = null
+                recordActivity()
+                refreshLocked()
+                true
+            } else {
+                _vaultError.value = "فشل تحديث اسم المقطع داخل قاعدة بيانات الخزنة"
+                false
+            }
         }
-        if (rows > 0) {
-            recordActivity()
-            refresh()
-            true
-        } else false
     }
 
     override suspend fun deleteVaultVideo(id: Long): Boolean = withContext(Dispatchers.IO) {
-        if (!_isUnlocked.value) return@withContext false
-        val raw = dbHelper.getVideoById(id) ?: return@withContext false
-        val resolved = resolveEncryptedFile(raw)
-        if (resolved.exists()) {
-            val fileRemoved = runCatching { resolved.delete() }.getOrDefault(false) && !resolved.exists()
-            if (!fileRemoved) {
-                _vaultError.value = "تعذر حذف الملف المشفر من الذاكرة، لم تتم إزالة السجل"
+        runCatching { beforeDeleteHook?.invoke(id) }
+        repoMutex.withLock {
+            if (!_isUnlocked.value) return@withContext false
+            val raw = dbHelper.getVideoById(id) ?: return@withContext false
+            val resolved = resolveEncryptedFile(raw)
+            var stagedFile: File? = null
+            if (resolved.exists()) {
+                val candidate = File(
+                    resolved.parentFile ?: vaultDir,
+                    "${resolved.name}.${System.currentTimeMillis()}.pending_delete"
+                )
+                val stagedOk = runCatching { resolved.renameTo(candidate) }.getOrDefault(false)
+                if (!stagedOk) {
+                    _vaultError.value = "تعذر عزل الملف المشفر مؤقتًا قبل الحذف، لم تتم إزالة السجل"
+                    return@withContext false
+                }
+                stagedFile = candidate
+            }
+
+            val rows = runCatching { dbHelper.deleteVideo(id) }.getOrDefault(0)
+            if (rows <= 0) {
+                if (stagedFile != null && stagedFile.exists() && !resolved.exists()) {
+                    runCatching { stagedFile.renameTo(resolved) }
+                }
+                _vaultError.value = "تعذر إزالة سجل الفيديو من قاعدة بيانات الخزنة، تم الحفاظ على الملف بأمان"
                 return@withContext false
             }
+
+            if (stagedFile != null && stagedFile.exists()) {
+                runCatching { stagedFile.delete() }
+            }
+            _vaultError.value = null
+            recordActivity()
+            refreshLocked()
+            true
         }
-        val rows = dbHelper.deleteVideo(id)
-        if (rows <= 0) {
-            _vaultError.value = "تعذر إزالة سجل الفيديو من قاعدة بيانات الخزنة"
-            return@withContext false
-        }
-        recordActivity()
-        refresh()
-        true
     }
 
     override fun getVideoById(id: Long): VaultVideo? {

@@ -1,11 +1,17 @@
 package com.videohatak.player
 
+import android.media.AudioFormat
+import com.videohatak.player.core.subtitle.model.SubtitleCue
 import com.videohatak.player.core.subtitle.speech.StreamingPcmResampler
+import com.videohatak.player.core.subtitle.speech.VideoAudioDecodeException
+import com.videohatak.player.core.subtitle.speech.VideoAudioPcmDecoder
 import com.videohatak.player.core.subtitle.speech.VoskResultCueSegmenter
 import com.videohatak.player.core.subtitle.speech.VoskWordToken
 import com.videohatak.player.core.subtitle.translation.MlKitModelBridge
+import com.videohatak.player.core.subtitle.translation.MlKitOfflineSubtitleTranslator
 import com.videohatak.player.core.subtitle.translation.OfflineModelDownloadStatus
 import com.videohatak.player.core.subtitle.translation.OfflineModelManager
+import com.videohatak.player.core.subtitle.translation.OfflineTranslationException
 import com.videohatak.player.core.subtitle.translation.SubtitleSourceMode
 import com.videohatak.player.core.subtitle.translation.SubtitleTranslationLanguage
 import com.videohatak.player.core.subtitle.translation.SubtitleTurnAndGlossaryHelper
@@ -16,6 +22,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -25,15 +32,19 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import java.io.File
 import java.io.FileOutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
 private class FakeMlKitModelBridge : MlKitModelBridge {
     val downloadedCodes = mutableSetOf<String>()
+    var downloadCallCount: Int = 0
 
     override suspend fun getDownloadedLanguageCodes(): Set<String> = downloadedCodes.toSet()
 
     override suspend fun downloadLanguageModel(mlKitCode: String) {
+        downloadCallCount++
         downloadedCodes.add(mlKitCode)
     }
 
@@ -100,6 +111,12 @@ class OfflineTranslationIntegrationTest {
                     zos.putNextEntry(ZipEntry("vosk-model-small-en-us-0.15/conf/model.conf"))
                     zos.write("--sample-frequency=16000".toByteArray())
                     zos.closeEntry()
+                    zos.putNextEntry(ZipEntry("vosk-model-small-en-us-0.15/graph/Gr.fst"))
+                    zos.write(byteArrayOf(5, 6, 7, 8))
+                    zos.closeEntry()
+                    zos.putNextEntry(ZipEntry("vosk-model-small-en-us-0.15/graph/words.txt"))
+                    zos.write("<eps> 0\nhello 1\nworld 2\n".toByteArray())
+                    zos.closeEntry()
                 }
             }
         )
@@ -119,12 +136,12 @@ class OfflineTranslationIntegrationTest {
         assertFalse(blockedDel.success)
         manager.markSpeechInUse(SubtitleTranslationLanguage.ENGLISH, false)
 
-        // Corrupt am/final.mdl -> detects NEEDS_UPDATE
+        // Corrupt am/final.mdl -> detects ERROR and hides corrupt model directory
         val finalMdl = File(rootDir, "vosk/vosk-model-small-en-us-0.15/am/final.mdl")
         assertTrue(finalMdl.delete())
         manager.refreshAllStates()
         assertEquals(
-            OfflineModelDownloadStatus.NEEDS_UPDATE,
+            OfflineModelDownloadStatus.ERROR,
             manager.languageStates.value[SubtitleTranslationLanguage.ENGLISH]?.speechStatus
         )
         assertNull(manager.getVerifiedSpeechModelDirectory(SubtitleTranslationLanguage.ENGLISH))
@@ -251,5 +268,133 @@ class OfflineTranslationIntegrationTest {
         val input48k = ShortArray(4_800) { idx -> (idx % 100).toShort() }
         val output16k = resampler.resampleTo16k(input48k, 48_000)
         assertTrue(output16k.size in 1_595..1_605)
+    }
+
+    @Test
+    fun voskResultSegmenter_tightAdjacentWordsNeverOverlap() {
+        val tightWords = (0 until 15).map { idx ->
+            val start = idx * 450L
+            VoskWordToken(word = "word$idx", startMs = start, endMs = start + 120L)
+        }
+        val cues = VoskResultCueSegmenter.segmentWordsIntoCues(
+            words = tightWords,
+            language = SubtitleTranslationLanguage.ENGLISH
+        )
+        assertTrue("Expected at least 2 cues", cues.size >= 2)
+        for (i in cues.indices) {
+            assertTrue("Cue $i must have positive duration", cues[i].endTimeMs > cues[i].startTimeMs)
+            if (i + 1 < cues.size) {
+                assertTrue(
+                    "Cue $i (${cues[i].endTimeMs}) must not overlap cue ${i + 1} (${cues[i + 1].startTimeMs})",
+                    cues[i].endTimeMs <= cues[i + 1].startTimeMs
+                )
+            }
+        }
+    }
+
+    @Test
+    fun offlineModelManager_rejectsInvalidZipSignature_andMlKitTranslatorBlocksAutoDownloadWhenDisabled() = runTest {
+        val nonZipFile = tempFolder.newFile("not_a_zip.bin")
+        nonZipFile.writeText("<html>404 Not Found</html>".repeat(4))
+        assertFalse(OfflineModelManager.verifyZipSignature(nonZipFile))
+
+        val rootDir = tempFolder.newFolder("no_auto_dl_test")
+        val fakeBridge = FakeMlKitModelBridge()
+        val manager = OfflineModelManager(testRootDir = rootDir, mlKitBridge = fakeBridge)
+        val translator = MlKitOfflineSubtitleTranslator(manager)
+
+        val cues = listOf(SubtitleCue(index = 1, startTimeMs = 1_000L, endTimeMs = 2_000L, text = "Hello"))
+        val failure = runCatching {
+            translator.translateCuesOffline(
+                cues = cues,
+                sourceLanguage = SubtitleTranslationLanguage.ENGLISH,
+                targetLanguage = SubtitleTranslationLanguage.ARABIC,
+                downloadMissingModels = false,
+                onProgress = { _, _, _ -> }
+            )
+        }.exceptionOrNull()
+
+        assertTrue(failure is OfflineTranslationException)
+        assertEquals("Missing ML Kit models must never trigger silent downloads", 0, fakeBridge.downloadCallCount)
+    }
+
+    @Test
+    fun videoAudioPcmDecoder_decodeBufferToMonoSamples_handlesAllPcmEncodingsAndRejectsUnsupported() {
+        // 1. PCM 8-bit unsigned stereo (0xFF -> +32512, 0x01 -> -32512 => average ~0)
+        val buf8 = ByteBuffer.wrap(byteArrayOf(0xFF.toByte(), 0x01.toByte()))
+        val out8 = VideoAudioPcmDecoder.decodeBufferToMonoSamples(
+            buffer = buf8,
+            byteSize = 2,
+            channelCount = 2,
+            pcmEncoding = AudioFormat.ENCODING_PCM_8BIT
+        )
+        assertEquals(1, out8.size)
+        assertTrue(out8[0] in -512..512)
+
+        // 2. PCM 16-bit 6-channel surround downmix: (6000 + 6000 + 6000 + 0 + 0 + 0) / 6 = 3000
+        val buf16 = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN)
+        listOf<Short>(6000, 6000, 6000, 0, 0, 0).forEach { buf16.putShort(it) }
+        buf16.flip()
+        val out16 = VideoAudioPcmDecoder.decodeBufferToMonoSamples(
+            buffer = buf16,
+            byteSize = 12,
+            channelCount = 6,
+            pcmEncoding = AudioFormat.ENCODING_PCM_16BIT
+        )
+        assertArrayEqualsShort(shortArrayOf(3000), out16)
+
+        // 3. PCM Float stereo (0.5f and -0.5f => 0; 1.0f mono => Short.MAX_VALUE)
+        val bufFloat = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).apply {
+            putFloat(0.5f)
+            flip()
+        }
+        val outFloat = VideoAudioPcmDecoder.decodeBufferToMonoSamples(
+            buffer = bufFloat,
+            byteSize = 4,
+            channelCount = 1,
+            pcmEncoding = AudioFormat.ENCODING_PCM_FLOAT
+        )
+        assertEquals(1, outFloat.size)
+        assertTrue(outFloat[0] in 16_380..16_390)
+
+        // 4. PCM 24-bit packed mono (little endian 0x00, 0x10, 0x00 => +16)
+        val buf24 = ByteBuffer.wrap(byteArrayOf(0x00, 0x10, 0x00))
+        val out24 = VideoAudioPcmDecoder.decodeBufferToMonoSamples(
+            buffer = buf24,
+            byteSize = 3,
+            channelCount = 1,
+            pcmEncoding = AudioFormat.ENCODING_PCM_24BIT_PACKED
+        )
+        assertArrayEqualsShort(shortArrayOf(16), out24)
+
+        // 5. PCM 32-bit mono (0x01000000 shr 16 = 256)
+        val buf32 = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).apply {
+            putInt(0x01000000)
+            flip()
+        }
+        val out32 = VideoAudioPcmDecoder.decodeBufferToMonoSamples(
+            buffer = buf32,
+            byteSize = 4,
+            channelCount = 1,
+            pcmEncoding = AudioFormat.ENCODING_PCM_32BIT
+        )
+        assertArrayEqualsShort(shortArrayOf(256), out32)
+
+        // 6. Unsupported encoding must throw VideoAudioDecodeException
+        assertThrows(VideoAudioDecodeException::class.java) {
+            VideoAudioPcmDecoder.decodeBufferToMonoSamples(
+                buffer = ByteBuffer.allocate(4),
+                byteSize = 4,
+                channelCount = 1,
+                pcmEncoding = 9999
+            )
+        }
+    }
+
+    private fun assertArrayEqualsShort(expected: ShortArray, actual: ShortArray) {
+        assertEquals(expected.size, actual.size)
+        for (i in expected.indices) {
+            assertEquals("Mismatch at index $i", expected[i], actual[i])
+        }
     }
 }

@@ -29,7 +29,8 @@ class VaultViewModel(
     private val repository: VaultRepository,
     private val biometricHelper: VaultBiometricHelper,
     private val securityPreferences: VaultSecurityPreferences? = null,
-    private val nowMsProvider: () -> Long = { System.currentTimeMillis() }
+    private val nowMsProvider: () -> Long = { System.currentTimeMillis() },
+    beforeDeleteVideo: (suspend (Long) -> Unit)? = null
 ) : ViewModel() {
 
     val vaultVideos: StateFlow<List<VaultVideo>> = repository.vaultVideos
@@ -48,7 +49,12 @@ class VaultViewModel(
         ?.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), VaultAutoLockTimeout.IMMEDIATE)
         ?: MutableStateFlow(VaultAutoLockTimeout.IMMEDIATE)
 
-    val vaultError: StateFlow<String?> = repository.vaultError
+    private val _actionError = MutableStateFlow<String?>(null)
+    val vaultError: StateFlow<String?> = combine(repository.vaultError, _actionError) { repoErr, actionErr ->
+        actionErr ?: repoErr
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, repository.vaultError.value)
+
+    private var beforeDeleteVideoHook: (suspend (Long) -> Unit)? = beforeDeleteVideo
 
     private val _importState = MutableStateFlow<VaultImportState>(VaultImportState.Idle)
     val importState: StateFlow<VaultImportState> = _importState.asStateFlow()
@@ -300,20 +306,34 @@ class VaultViewModel(
         _importState.value = VaultImportState.Idle
     }
 
+    fun setBeforeDeleteVideoHandler(handler: (suspend (Long) -> Unit)?) {
+        beforeDeleteVideoHook = handler
+    }
+
     fun renameVideo(videoId: Long, newTitle: String) {
         viewModelScope.launch {
-            repository.renameVideo(videoId, newTitle)
+            _actionError.value = null
+            val renamed = repository.renameVideo(videoId, newTitle)
+            if (!renamed && repository.vaultError.value.isNullOrBlank()) {
+                _actionError.value = "تعذر إعادة تسمية الفيديو داخل الخزنة"
+            }
         }
     }
 
     fun deleteVideo(videoId: Long) {
         viewModelScope.launch {
-            repository.deleteVaultVideo(videoId)
+            _actionError.value = null
+            runCatching { beforeDeleteVideoHook?.invoke(videoId) }
+            val deleted = repository.deleteVaultVideo(videoId)
+            if (!deleted && repository.vaultError.value.isNullOrBlank()) {
+                _actionError.value = "تعذر حذف الفيديو من الخزنة"
+            }
         }
     }
 
     fun clearError() {
         _biometricError.value = null
+        _actionError.value = null
         repository.clearError()
     }
 

@@ -18,6 +18,7 @@ import com.videohatak.player.core.playback.PlaybackMode
 import com.videohatak.player.core.playback.PlaybackPositionManager
 import com.videohatak.player.core.playback.PlaybackPreferencesRepository
 import com.videohatak.player.core.playback.PlaybackPreferencesRepositoryImpl
+import com.videohatak.player.core.playlist.repository.PlaylistRepositoryImpl
 import com.videohatak.player.core.playback.VideoPlayerManager
 import com.videohatak.player.feature.player.PlayerViewModel
 import kotlinx.coroutines.CoroutineScope
@@ -850,5 +851,82 @@ class PlaybackIntegrationTest {
         // 5. Assert Video A's position (15_000ms) is NOT applied to Video B
         assertTrue("Video A position (15_000ms) must NOT be applied to Video B", fakePlayer.currentPosition != 15_000L)
         assertEquals(uriB, viewModel.uiState.value.mediaUri)
+    }
+
+    // -------------------------------------------------------------
+    // Test 10: playPlaylist preserves SHUFFLE_ALL when called with default shuffle arg
+    // -------------------------------------------------------------
+    @Test
+    fun test10_playPlaylistPreservesActiveShuffleModeAndConfiguresExoPlayer() = runBlocking {
+        val scope = createTestScope()
+        val (dataStore, _) = createRealDataStore(scope)
+        val realRepo = PlaybackPreferencesRepositoryImpl(dataStore)
+        val posManager = createManager(realRepo, scope)
+
+        val playlistRepo = PlaylistRepositoryImpl(testApp())
+        val playlistId = playlistRepo.createPlaylist("قائمة عشوائية للاختبار")
+        val item1 = VideoItem(
+            id = 2001L,
+            contentUri = Uri.parse("content://media/external/video/media/shuffle_1"),
+            title = "Shuffle 1",
+            displayName = "Shuffle 1",
+            durationMs = 60_000L,
+            sizeBytes = 1000L,
+            dateAddedSec = 1L
+        )
+        val item2 = VideoItem(
+            id = 2002L,
+            contentUri = Uri.parse("content://media/external/video/media/shuffle_2"),
+            title = "Shuffle 2",
+            displayName = "Shuffle 2",
+            durationMs = 60_000L,
+            sizeBytes = 1000L,
+            dateAddedSec = 2L
+        )
+        val item3 = VideoItem(
+            id = 2003L,
+            contentUri = Uri.parse("content://media/external/video/media/shuffle_3"),
+            title = "Shuffle 3",
+            displayName = "Shuffle 3",
+            durationMs = 60_000L,
+            sizeBytes = 1000L,
+            dateAddedSec = 3L
+        )
+        playlistRepo.addVideoToPlaylists(item1, listOf(playlistId))
+        playlistRepo.addVideoToPlaylists(item2, listOf(playlistId))
+        playlistRepo.addVideoToPlaylists(item3, listOf(playlistId))
+
+        val fakePlayer = FakeExoPlayer().apply { duration = 60_000L }
+        val playerManager = VideoPlayerManager.createForTesting(fakePlayer.exoPlayer).also { activePlayerManagers.add(it) }
+
+        val viewModel = createManagedViewModel {
+            PlayerViewModel(
+                application = testApp(),
+                playerManager = playerManager,
+                playbackPreferences = realRepo,
+                positionManager = posManager,
+                subtitlePreferences = null,
+                thumbnailManager = null
+            )
+        }
+
+        // Enable SHUFFLE_ALL prior to starting playlist
+        viewModel.setPlaybackMode(PlaybackMode.SHUFFLE_ALL)
+        drainMainAndIo {
+            playerManager.uiState.value.playbackMode == PlaybackMode.SHUFFLE_ALL
+        }
+
+        // Call playPlaylist without explicitly passing shuffle=true
+        var startedVideo: VideoItem? = null
+        viewModel.playPlaylist(playlistId = playlistId, startVideoId = item1.id) { startedVideo = it }
+        drainMainAndIo {
+            fakePlayer.mediaItems.size == 3 && startedVideo != null
+        }
+        testDispatcher.scheduler.advanceUntilIdle()
+
+        assertTrue("ExoPlayer shuffleModeEnabled must remain true for SHUFFLE_ALL playlist", fakePlayer.shuffleModeEnabled)
+        assertEquals(Player.REPEAT_MODE_ALL, fakePlayer.repeatMode)
+        assertEquals(PlaybackMode.SHUFFLE_ALL, viewModel.uiState.value.playbackMode)
+        assertEquals(item1.id, startedVideo?.id)
     }
 }

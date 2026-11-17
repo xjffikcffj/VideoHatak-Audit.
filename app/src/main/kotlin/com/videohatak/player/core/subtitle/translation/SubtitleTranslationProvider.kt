@@ -311,14 +311,37 @@ data class ExtractedAudioResult(
 object AudioTrackExtractor {
     const val MAX_AUDIO_EXTRACT_BYTES = 18L * 1024L * 1024L
 
+    internal fun resolveAudioTrackIndex(
+        trackMimes: List<String>,
+        selectedTrackIndex: Int?
+    ): Int {
+        if (selectedTrackIndex != null) {
+            if (selectedTrackIndex !in trackMimes.indices ||
+                !trackMimes[selectedTrackIndex].startsWith("audio/")
+            ) {
+                throw TranslationProxyException(
+                    "المسار الصوتي المحدد غير صالح أو غير موجود داخل الفيديو."
+                )
+            }
+            return selectedTrackIndex
+        }
+        val firstAudioIndex = trackMimes.indexOfFirst { it.startsWith("audio/") }
+        if (firstAudioIndex < 0) {
+            throw TranslationProxyException("لا يحتوي هذا الفيديو على مسار صوتي قابل للاستخراج.")
+        }
+        return firstAudioIndex
+    }
+
     suspend fun extractAudioToTempM4a(
         context: Context,
-        videoUri: Uri
-    ): File = extractAudioWithMetadataToTempM4a(context, videoUri).file
+        videoUri: Uri,
+        selectedTrackIndex: Int? = null
+    ): File = extractAudioWithMetadataToTempM4a(context, videoUri, selectedTrackIndex).file
 
     suspend fun extractAudioWithMetadataToTempM4a(
         context: Context,
-        videoUri: Uri
+        videoUri: Uri,
+        selectedTrackIndex: Int? = null
     ): ExtractedAudioResult = withContext(Dispatchers.IO) {
         if (videoUri.scheme.equals("vault", ignoreCase = true)) {
             throw TranslationProxyException(
@@ -332,21 +355,11 @@ object AudioTrackExtractor {
 
         try {
             extractor.setDataSource(context, videoUri, null)
-            var audioTrackIndex = -1
-            var audioFormat: MediaFormat? = null
-            for (i in 0 until extractor.trackCount) {
-                val fmt = extractor.getTrackFormat(i)
-                val mime = fmt.getString(MediaFormat.KEY_MIME) ?: continue
-                if (mime.startsWith("audio/")) {
-                    audioTrackIndex = i
-                    audioFormat = fmt
-                    break
-                }
+            val trackMimes = (0 until extractor.trackCount).map { i ->
+                extractor.getTrackFormat(i).getString(MediaFormat.KEY_MIME).orEmpty()
             }
-
-            if (audioTrackIndex < 0 || audioFormat == null) {
-                throw TranslationProxyException("لا يحتوي هذا الفيديو على مسار صوتي قابل للاستخراج.")
-            }
+            val audioTrackIndex = resolveAudioTrackIndex(trackMimes, selectedTrackIndex)
+            val audioFormat = extractor.getTrackFormat(audioTrackIndex)
 
             extractor.selectTrack(audioTrackIndex)
             muxer = MediaMuxer(outFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)

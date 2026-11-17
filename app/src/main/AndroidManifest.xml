@@ -58,6 +58,11 @@
                 <action android:name="androidx.media3.session.MediaSessionService" />
             </intent-filter>
         </service>
+
+        <!-- Manifest-registered receiver for explicit PiP RemoteAction PendingIntents -->
+        <receiver
+            android:name=".core.playback.pip.PipActionReceiver"
+            android:exported="false" />
     </application>
 
 </manifest>

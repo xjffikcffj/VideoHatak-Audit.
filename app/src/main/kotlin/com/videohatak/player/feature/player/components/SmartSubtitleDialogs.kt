@@ -62,6 +62,7 @@ import androidx.compose.ui.unit.dp
 import com.videohatak.player.core.designsystem.theme.LocalVideoHatakPalette
 import com.videohatak.player.core.subtitle.model.SubtitleFormat
 import com.videohatak.player.core.subtitle.model.SubtitleTrack
+import com.videohatak.player.core.subtitle.speech.VideoAudioTrackOption
 import com.videohatak.player.core.subtitle.translation.BackendProxyConfig
 import com.videohatak.player.core.subtitle.translation.LanguageModelResourceState
 import com.videohatak.player.core.subtitle.translation.OfflineModelDownloadStatus
@@ -71,6 +72,13 @@ import com.videohatak.player.core.subtitle.translation.TranslationEngineMode
 import com.videohatak.player.core.subtitle.translation.TranslationJobStatus
 import com.videohatak.player.core.subtitle.translation.VoskModelCatalog
 import java.util.Locale
+
+private data class PendingModelDownloadConfirmation(
+    val title: String,
+    val details: String,
+    val estimatedMb: Int,
+    val onConfirm: () -> Unit
+)
 
 @Composable
 fun SubtitleCueEditorDialog(
@@ -282,10 +290,14 @@ fun SmartSubtitleTranslationDialog(
     onEngineModeChange: (TranslationEngineMode) -> Unit = {},
     offlineModelStates: Map<SubtitleTranslationLanguage, LanguageModelResourceState> = emptyMap(),
     detectedAudioLanguage: SubtitleTranslationLanguage? = null,
+    availableAudioTracks: List<VideoAudioTrackOption> = emptyList(),
+    selectedAudioTrackIndex: Int? = null,
+    onSelectAudioTrack: (Int) -> Unit = {},
     onDownloadSpeechModel: (SubtitleTranslationLanguage) -> Unit = {},
     onCancelSpeechDownload: (SubtitleTranslationLanguage) -> Unit = {},
     onDeleteSpeechModel: (SubtitleTranslationLanguage) -> Unit = {},
     onDownloadTranslationModel: (SubtitleTranslationLanguage) -> Unit = {},
+    onCancelTranslationDownload: (SubtitleTranslationLanguage) -> Unit = {},
     onDeleteTranslationModel: (SubtitleTranslationLanguage) -> Unit = {},
     onDownloadRequiredPair: (
         sourceMode: SubtitleSourceMode,
@@ -314,6 +326,7 @@ fun SmartSubtitleTranslationDialog(
     var showProxyField by remember(proxyUrl) { mutableStateOf(proxyUrl.isBlank()) }
     var draftProxyUrl by remember(proxyUrl) { mutableStateOf(proxyUrl) }
     var assignAsSecondary by remember { mutableStateOf(false) }
+    var pendingDownloadConfirmation by remember { mutableStateOf<PendingModelDownloadConfirmation?>(null) }
 
     val effectiveSourceForReadiness = if (
         sourceMode == SubtitleSourceMode.VIDEO_AUDIO_EXTRACTION &&
@@ -351,6 +364,57 @@ fun SmartSubtitleTranslationDialog(
                 if (st != OfflineModelDownloadStatus.READY && targetLanguage !in this) add(targetLanguage)
             }
         }
+    }
+    val speechMissingMb = if (speechMissing && effectiveSourceForReadiness != SubtitleTranslationLanguage.AUTO) {
+        VoskModelCatalog.specFor(effectiveSourceForReadiness)?.approximateZipMb ?: 0
+    } else {
+        0
+    }
+    val mlKitMissingMb = missingMlKitCount.sumOf { if (it == SubtitleTranslationLanguage.ENGLISH) 0 else 30 }
+    val estimatedMissingMb = speechMissingMb + mlKitMissingMb
+
+    fun requestSpeechDownloadWithConsent(lang: SubtitleTranslationLanguage) {
+        val spec = VoskModelCatalog.specFor(lang) ?: return
+        pendingDownloadConfirmation = PendingModelDownloadConfirmation(
+            title = "تنزيل نموذج التفريغ الصوتي (${lang.arabicName})",
+            details = "سيتم تنزيل نموذج ${spec.modelId} (${spec.licenseName}) مرة واحدة عبر HTTPS وحفظه داخل ذاكرة التطبيق الداخلية (files/offline_models) للعمل دون إنترنت.\nالحجم التقديري للتنزيل: ~${spec.approximateZipMb} MB، وبعد الفك: ~${spec.approximateDiskExtractedMb} MB.",
+            estimatedMb = spec.approximateZipMb,
+            onConfirm = { onDownloadSpeechModel(lang) }
+        )
+    }
+
+    fun requestTranslationDownloadWithConsent(lang: SubtitleTranslationLanguage) {
+        pendingDownloadConfirmation = PendingModelDownloadConfirmation(
+            title = "تنزيل حزمة الترجمة النصية (${lang.arabicName})",
+            details = "سيتم تنزيل حزمة ML Kit للغة ${lang.arabicName} عبر الإنترنت مرة واحدة وتخزينها محليًا في التطبيق للترجمة دون إنترنت لاحقًا.\nالحجم التقديري: ~30 MB.",
+            estimatedMb = 30,
+            onConfirm = { onDownloadTranslationModel(lang) }
+        )
+    }
+
+    fun requestPairDownloadWithConsent(afterConfirm: (() -> Unit)? = null) {
+        val parts = buildList {
+            if (speechMissing && effectiveSourceForReadiness != SubtitleTranslationLanguage.AUTO) {
+                val spec = VoskModelCatalog.specFor(effectiveSourceForReadiness)
+                add("• نموذج الصوت Vosk للغة ${effectiveSourceForReadiness.arabicName} (~${spec?.approximateZipMb ?: 0} MB)")
+            }
+            missingMlKitCount.forEach { mlLang ->
+                add("• حزمة ترجمة ML Kit للغة ${mlLang.arabicName} (~30 MB)")
+            }
+        }.joinToString("\n")
+        pendingDownloadConfirmation = PendingModelDownloadConfirmation(
+            title = "تأكيد تنزيل النماذج المطلوبة",
+            details = "النماذج التالية غير محملة محليًا بعد:\n$parts\n\nتُحفظ داخل ذاكرة التطبيق (files/offline_models) وتستخدم الإنترنت مرة واحدة فقط.",
+            estimatedMb = estimatedMissingMb,
+            onConfirm = {
+                onDownloadRequiredPair(
+                    sourceMode,
+                    effectiveSourceForReadiness,
+                    targetLanguage
+                )
+                afterConfirm?.invoke()
+            }
+        )
     }
 
     AlertDialog(
@@ -489,6 +553,39 @@ fun SmartSubtitleTranslationDialog(
                     }
                 }
 
+                if (sourceMode == SubtitleSourceMode.VIDEO_AUDIO_EXTRACTION && availableAudioTracks.size > 1) {
+                    Text(
+                        text = "المسار الصوتي المختار داخل الفيديو:",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = palette.accent,
+                        fontWeight = FontWeight.Bold
+                    )
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        availableAudioTracks.forEach { audioOpt ->
+                            val isSelected = selectedAudioTrackIndex == audioOpt.trackIndex ||
+                                (selectedAudioTrackIndex == null && audioOpt == availableAudioTracks.firstOrNull())
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = if (isSelected) palette.accent.copy(alpha = 0.2f) else palette.surfaceElevated,
+                                border = BorderStroke(1.dp, if (isSelected) palette.accent else palette.border),
+                                modifier = Modifier.clickable { onSelectAudioTrack(audioOpt.trackIndex) }
+                            ) {
+                                Text(
+                                    text = audioOpt.displayLabel,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (isSelected) palette.accent else palette.onSurface,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+
                 // 1) Primary Selector: Original Video / Source Language
                 Text(
                     text = "١. لغة الفيديو الأصلية (المصدر):",
@@ -601,6 +698,11 @@ fun SmartSubtitleTranslationDialog(
                                                 style = MaterialTheme.typography.labelSmall,
                                                 color = palette.onSurfaceMuted
                                             )
+                                            Text(
+                                                text = spec.checksumStatusArabic,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = palette.onSurfaceMuted
+                                            )
                                         }
                                     }
                                     when (selectedSpeechState.speechStatus) {
@@ -632,7 +734,7 @@ fun SmartSubtitleTranslationDialog(
                                             }
                                         }
                                         else -> {
-                                            TextButton(onClick = { onDownloadSpeechModel(effectiveSourceForReadiness) }) {
+                                            TextButton(onClick = { requestSpeechDownloadWithConsent(effectiveSourceForReadiness) }) {
                                                 Icon(
                                                     Icons.Default.Download,
                                                     contentDescription = null,
@@ -749,11 +851,17 @@ fun SmartSubtitleTranslationDialog(
                                 if (!selectedTargetState.isBuiltInTranslationLanguage) {
                                     when (selectedTargetState.translationStatus) {
                                         OfflineModelDownloadStatus.DOWNLOADING -> {
-                                            Text(
-                                                text = "جارٍ التنزيل...",
-                                                style = MaterialTheme.typography.labelSmall,
-                                                color = palette.accent
-                                            )
+                                            IconButton(
+                                                onClick = { onCancelTranslationDownload(targetLanguage) },
+                                                modifier = Modifier.size(32.dp)
+                                            ) {
+                                                Icon(
+                                                    Icons.Default.Close,
+                                                    contentDescription = "إلغاء متابعة التنزيل",
+                                                    tint = MaterialTheme.colorScheme.error,
+                                                    modifier = Modifier.size(18.dp)
+                                                )
+                                            }
                                         }
                                         OfflineModelDownloadStatus.READY -> {
                                             IconButton(
@@ -770,7 +878,7 @@ fun SmartSubtitleTranslationDialog(
                                             }
                                         }
                                         else -> {
-                                            TextButton(onClick = { onDownloadTranslationModel(targetLanguage) }) {
+                                            TextButton(onClick = { requestTranslationDownloadWithConsent(targetLanguage) }) {
                                                 Icon(
                                                     Icons.Default.Download,
                                                     contentDescription = null,
@@ -792,6 +900,13 @@ fun SmartSubtitleTranslationDialog(
                                     trackColor = palette.border
                                 )
                             }
+                            selectedTargetState.translationStatusNote?.let { note ->
+                                Text(
+                                    text = note,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = palette.onSurfaceMuted
+                                )
+                            }
                             selectedTargetState.translationErrorMessage?.let { err ->
                                 Text(
                                     text = err,
@@ -810,13 +925,7 @@ fun SmartSubtitleTranslationDialog(
                                 missingMlKitCount.isNotEmpty()
                             ) {
                                 OutlinedButton(
-                                    onClick = {
-                                        onDownloadRequiredPair(
-                                            sourceMode,
-                                            effectiveSourceForReadiness,
-                                            targetLanguage
-                                        )
-                                    },
+                                    onClick = { requestPairDownloadWithConsent() },
                                     border = BorderStroke(1.dp, palette.accent),
                                     modifier = Modifier.fillMaxWidth()
                                 ) {
@@ -828,7 +937,7 @@ fun SmartSubtitleTranslationDialog(
                                     )
                                     Spacer(modifier = Modifier.width(6.dp))
                                     Text(
-                                        text = "تنزيل النماذج المطلوبة تلقائيًا في ذاكرة التطبيق",
+                                        text = "تنزيل النماذج المطلوبة بموافقتك (~${estimatedMissingMb} MB)",
                                         color = palette.accent,
                                         style = MaterialTheme.typography.labelMedium,
                                         fontWeight = FontWeight.Bold
@@ -878,10 +987,11 @@ fun SmartSubtitleTranslationDialog(
                                     val st = offlineModelStates[lang] ?: LanguageModelResourceState(language = lang)
                                     OfflineLanguageRowItem(
                                         state = st,
-                                        onDownloadSpeech = { onDownloadSpeechModel(lang) },
+                                        onDownloadSpeech = { requestSpeechDownloadWithConsent(lang) },
                                         onCancelSpeech = { onCancelSpeechDownload(lang) },
                                         onDeleteSpeech = { onDeleteSpeechModel(lang) },
-                                        onDownloadTranslation = { onDownloadTranslationModel(lang) },
+                                        onDownloadTranslation = { requestTranslationDownloadWithConsent(lang) },
+                                        onCancelTranslation = { onCancelTranslationDownload(lang) },
                                         onDeleteTranslation = { onDeleteTranslationModel(lang) }
                                     )
                                     Spacer(modifier = Modifier.height(6.dp))
@@ -1037,13 +1147,20 @@ fun SmartSubtitleTranslationDialog(
                                 )
                                 Button(
                                     onClick = {
-                                        onStartTranslation(
-                                            sourceMode,
-                                            sourceLanguage,
-                                            targetLanguage,
-                                            activeTrack,
-                                            glossaryText
-                                        )
+                                        if (engineMode == TranslationEngineMode.OFFLINE_ON_DEVICE &&
+                                            ((speechMissing && effectiveSourceForReadiness != SubtitleTranslationLanguage.AUTO) ||
+                                                missingMlKitCount.isNotEmpty())
+                                        ) {
+                                            requestPairDownloadWithConsent()
+                                        } else {
+                                            onStartTranslation(
+                                                sourceMode,
+                                                sourceLanguage,
+                                                targetLanguage,
+                                                activeTrack,
+                                                glossaryText
+                                            )
+                                        }
                                     },
                                     colors = ButtonDefaults.buttonColors(
                                         containerColor = palette.accent,
@@ -1164,13 +1281,20 @@ fun SmartSubtitleTranslationDialog(
             if (translationStatus !is TranslationJobStatus.Running) {
                 Button(
                     onClick = {
-                        onStartTranslation(
-                            sourceMode,
-                            sourceLanguage,
-                            targetLanguage,
-                            activeTrack,
-                            glossaryText
-                        )
+                        if (engineMode == TranslationEngineMode.OFFLINE_ON_DEVICE &&
+                            ((speechMissing && effectiveSourceForReadiness != SubtitleTranslationLanguage.AUTO) ||
+                                missingMlKitCount.isNotEmpty())
+                        ) {
+                            requestPairDownloadWithConsent()
+                        } else {
+                            onStartTranslation(
+                                sourceMode,
+                                sourceLanguage,
+                                targetLanguage,
+                                activeTrack,
+                                glossaryText
+                            )
+                        }
                     },
                     colors = ButtonDefaults.buttonColors(
                         containerColor = palette.accent,
@@ -1196,6 +1320,48 @@ fun SmartSubtitleTranslationDialog(
             }
         }
     )
+
+    val downloadConfirm = pendingDownloadConfirmation
+    if (downloadConfirm != null) {
+        AlertDialog(
+            onDismissRequest = { pendingDownloadConfirmation = null },
+            containerColor = palette.surface,
+            titleContentColor = palette.onSurface,
+            textContentColor = palette.onSurface,
+            title = {
+                Text(downloadConfirm.title, fontWeight = FontWeight.Bold)
+            },
+            text = {
+                Text(
+                    text = downloadConfirm.details,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = palette.onSurfaceMuted
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        pendingDownloadConfirmation = null
+                        downloadConfirm.onConfirm()
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = palette.accent,
+                        contentColor = MaterialTheme.colorScheme.onPrimary
+                    )
+                ) {
+                    Text(
+                        text = "موافق — تنزيل (~${downloadConfirm.estimatedMb} MB)",
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDownloadConfirmation = null }) {
+                    Text("إلغاء", color = palette.onSurfaceMuted)
+                }
+            }
+        )
+    }
 }
 
 @Composable
@@ -1205,6 +1371,7 @@ private fun OfflineLanguageRowItem(
     onCancelSpeech: () -> Unit,
     onDeleteSpeech: () -> Unit,
     onDownloadTranslation: () -> Unit,
+    onCancelTranslation: () -> Unit,
     onDeleteTranslation: () -> Unit
 ) {
     val palette = LocalVideoHatakPalette.current
@@ -1281,7 +1448,9 @@ private fun OfflineLanguageRowItem(
                 if (!state.isBuiltInTranslationLanguage) {
                     when (state.translationStatus) {
                         OfflineModelDownloadStatus.DOWNLOADING -> {
-                            Text("جارٍ التنزيل...", style = MaterialTheme.typography.labelSmall, color = palette.accent)
+                            TextButton(onClick = onCancelTranslation) {
+                                Text("إلغاء", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall)
+                            }
                         }
                         OfflineModelDownloadStatus.READY -> {
                             TextButton(enabled = !state.isTranslationInUse, onClick = onDeleteTranslation) {
@@ -1295,6 +1464,13 @@ private fun OfflineLanguageRowItem(
                         }
                     }
                 }
+            }
+            state.translationStatusNote?.let { note ->
+                Text(
+                    text = note,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = palette.onSurfaceMuted
+                )
             }
         }
     }

@@ -2,12 +2,13 @@
 name: Android CI
 
 on:
-  push:
-    branches:
-      - main
-  pull_request:
-    branches:
-      - main
+  # Automatic CI triggers disabled during static fix phase; use manual workflow_dispatch when ready.
+  # push:
+  #   branches:
+  #     - main
+  # pull_request:
+  #   branches:
+  #     - main
   workflow_dispatch:
 
 permissions:

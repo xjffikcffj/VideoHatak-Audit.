@@ -1,7 +1,6 @@
 package com.videohatak.player
 
 import android.content.Intent
-import android.content.IntentFilter
 import android.content.res.Configuration
 import android.net.Uri
 import android.os.Build
@@ -37,7 +36,6 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
-import androidx.core.content.ContextCompat
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.fragment.app.FragmentActivity
@@ -58,7 +56,6 @@ import com.videohatak.player.core.model.VideoItem
 import com.videohatak.player.core.permission.PermissionHelper
 import com.videohatak.player.core.playback.PlaybackPreferencesRepositoryImpl
 import com.videohatak.player.core.playback.VolumeComboShortcutDetector
-import com.videohatak.player.core.playback.pip.PipActionReceiver
 import com.videohatak.player.core.playback.pip.PipHelper
 import com.videohatak.player.core.playback.playbackDataStore
 import com.videohatak.player.core.playback.service.VideoPlaybackService
@@ -115,7 +112,6 @@ class MainActivity : FragmentActivity() {
 
     private val backupManager by lazy { BackupManager(applicationContext) }
 
-    private val pipReceiver = PipActionReceiver()
     private val isInPipModeState = mutableStateOf(false)
     private val canUseBiometricsState = mutableStateOf(true)
     private var activeVideoState: VideoItem? = null
@@ -132,17 +128,6 @@ class MainActivity : FragmentActivity() {
         val splashScreen = installSplashScreen()
         super.onCreate(savedInstanceState)
         canUseBiometricsState.value = vaultViewModel.canUseBiometrics()
-
-        val pipFilter = IntentFilter().apply {
-            addAction(PipHelper.ACTION_PIP_PLAY_PAUSE)
-            addAction(PipHelper.ACTION_PIP_FORWARD)
-            addAction(PipHelper.ACTION_PIP_REPLAY)
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            ContextCompat.registerReceiver(this, pipReceiver, pipFilter, ContextCompat.RECEIVER_NOT_EXPORTED)
-        } else {
-            registerReceiver(pipReceiver, pipFilter)
-        }
 
         val startTimestamp = System.currentTimeMillis()
         splashScreen.setKeepOnScreenCondition {
@@ -249,9 +234,32 @@ class MainActivity : FragmentActivity() {
             val currentTab by libraryViewModel.currentTab.collectAsStateWithLifecycle()
             val selectedFolder by libraryViewModel.selectedFolder.collectAsStateWithLifecycle()
             val playerUiState by playerViewModel.uiState.collectAsStateWithLifecycle()
+            val currentPlayerVideo by playerViewModel.currentVideoFlow.collectAsStateWithLifecycle()
             val playbackMode by playerViewModel.playbackMode.collectAsStateWithLifecycle()
             val resumeMode by playerViewModel.resumeMode.collectAsStateWithLifecycle()
             val seekIntervalSeconds by playerViewModel.seekIntervalSeconds.collectAsStateWithLifecycle()
+
+            LaunchedEffect(
+                isInPip,
+                playerUiState.isPlaying,
+                playerUiState.seekIntervalSeconds,
+                playerUiState.videoWidth,
+                playerUiState.videoHeight,
+                activeVideoForPlayback?.width,
+                activeVideoForPlayback?.height
+            ) {
+                if (isInPip && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    val w = playerUiState.videoWidth.takeIf { it > 0 } ?: activeVideoForPlayback?.width ?: 16
+                    val h = playerUiState.videoHeight.takeIf { it > 0 } ?: activeVideoForPlayback?.height ?: 9
+                    PipHelper(this@MainActivity).updatePipActions(
+                        activity = this@MainActivity,
+                        isPlaying = playerUiState.isPlaying,
+                        seekIntervalSeconds = playerUiState.seekIntervalSeconds,
+                        videoWidth = w,
+                        videoHeight = h
+                    )
+                }
+            }
 
             val playlists by playlistViewModel.playlists.collectAsStateWithLifecycle()
             val selectedPlaylistWithItems by playlistViewModel.selectedPlaylistWithItems.collectAsStateWithLifecycle()
@@ -360,9 +368,38 @@ class MainActivity : FragmentActivity() {
                 }
             }
 
-            LaunchedEffect(playerViewModel.currentVideo) {
-                if (activeVideoForPlayback != null && playerViewModel.currentVideo != null) {
-                    activeVideoForPlayback = playerViewModel.currentVideo
+            DisposableEffect(Unit) {
+                val repo = VaultRepositoryImpl.getInstance(applicationContext)
+                val stopIfDeletingActiveVaultVideo: suspend (Long) -> Unit = { deletingId ->
+                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main.immediate) {
+                        val livePlayerUri = playerViewModel.uiState.value.mediaUri
+                        val liveActiveVideo = activeVideoState
+                        val liveCurrentPlayerVideo = playerViewModel.currentVideo
+                        val activeUri = livePlayerUri
+                            ?: liveActiveVideo?.contentUri
+                            ?: liveCurrentPlayerVideo?.contentUri
+                        val activeMatchesId = activeUri != null &&
+                            com.videohatak.player.core.playback.service.MediaNotificationPrivacy.isVaultUri(activeUri) &&
+                            (activeUri.host == deletingId.toString() || activeUri.lastPathSegment == deletingId.toString())
+                        val directIdMatch = (liveActiveVideo?.bucketId == "secure_vault" && liveActiveVideo.id == deletingId) ||
+                            (liveCurrentPlayerVideo?.bucketId == "secure_vault" && liveCurrentPlayerVideo.id == deletingId)
+                        if (activeMatchesId || directIdMatch) {
+                            activeVideoForPlayback = null
+                            playerViewModel.stopPlaybackCompletely()
+                        }
+                    }
+                }
+                repo.beforeDeleteHook = stopIfDeletingActiveVaultVideo
+                vaultViewModel.setBeforeDeleteVideoHandler(stopIfDeletingActiveVaultVideo)
+                onDispose {
+                    repo.beforeDeleteHook = null
+                    vaultViewModel.setBeforeDeleteVideoHandler(null)
+                }
+            }
+
+            LaunchedEffect(currentPlayerVideo) {
+                if (activeVideoForPlayback != null && currentPlayerVideo != null) {
+                    activeVideoForPlayback = currentPlayerVideo
                 }
             }
 
@@ -486,7 +523,7 @@ class MainActivity : FragmentActivity() {
                                 )
                             },
                             bottomBar = {
-                                val backgroundVideo = playerViewModel.currentVideo ?: playerUiState.mediaUri?.let { uri ->
+                                val backgroundVideo = currentPlayerVideo ?: playerUiState.mediaUri?.let { uri ->
                                     VideoItem(
                                         id = uri.hashCode().toLong(),
                                         contentUri = uri,
@@ -620,15 +657,15 @@ class MainActivity : FragmentActivity() {
                                 onMovePlaylistItemDown = { index -> playlistViewModel.moveItem(index, index + 1) },
                                 onPlayPlaylist = { playlistId, startVideoId, shuffle ->
                                     requestNotificationIfNeeded()
+                                    playerViewModel.setPipActive(false)
+                                    playerViewModel.setControlsVisible(true)
                                     activeContextVideos = emptyList()
-                                    playerViewModel.playPlaylist(playlistId, startVideoId, shuffle)
-                                    val targetItem = if (startVideoId != null) {
-                                        selectedPlaylistWithItems?.second?.firstOrNull { it.videoId == startVideoId }
-                                    } else {
-                                        selectedPlaylistWithItems?.second?.firstOrNull { it.isAvailable }
-                                    }
-                                    if (targetItem != null) {
-                                        activeVideoForPlayback = targetItem.toVideoItem()
+                                    playerViewModel.playPlaylist(
+                                        playlistId = playlistId,
+                                        startVideoId = startVideoId,
+                                        shuffle = shuffle
+                                    ) { startedVideo ->
+                                        activeVideoForPlayback = startedVideo
                                     }
                                 },
                                 onAddToPlaylists = playlistViewModel::addVideoToPlaylists,
@@ -767,10 +804,6 @@ class MainActivity : FragmentActivity() {
 
     override fun onDestroy() {
         volumeComboDetector.reset()
-        try {
-            unregisterReceiver(pipReceiver)
-        } catch (_: Exception) {
-        }
         super.onDestroy()
     }
 }

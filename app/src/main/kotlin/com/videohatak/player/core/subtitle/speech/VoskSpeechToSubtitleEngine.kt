@@ -58,13 +58,32 @@ object VoskResultCueSegmenter {
         }
     }
 
+    private const val MIN_READABLE_CUE_MS = 250L
+
     fun segmentWordsIntoCues(
         words: List<VoskWordToken>,
-        language: SubtitleTranslationLanguage
+        language: SubtitleTranslationLanguage,
+        videoDurationMs: Long = 0L
     ): List<SubtitleCue> {
         if (words.isEmpty()) return emptyList()
 
-        val sorted = words.sortedWith(compareBy<VoskWordToken> { it.startMs }.thenBy { it.endMs })
+        val sorted = words
+            .asSequence()
+            .filter { token ->
+                token.word.isNotBlank() &&
+                    (videoDurationMs <= 0L || token.startMs < videoDurationMs)
+            }
+            .map { token ->
+                val start = token.startMs.coerceAtLeast(0L)
+                val rawEnd = token.endMs.coerceAtLeast(start + 80L)
+                val clampedEnd = if (videoDurationMs > 0L) minOf(rawEnd, videoDurationMs) else rawEnd
+                token.copy(startMs = start, endMs = maxOf(start + 1L, clampedEnd))
+            }
+            .sortedWith(compareBy<VoskWordToken> { it.startMs }.thenBy { it.endMs })
+            .toList()
+
+        if (sorted.isEmpty()) return emptyList()
+
         val rawGroups = mutableListOf<List<VoskWordToken>>()
         val currentGroup = mutableListOf<VoskWordToken>()
 
@@ -94,39 +113,69 @@ object VoskResultCueSegmenter {
             rawGroups.add(currentGroup.toList())
         }
 
-        val provisionalCues = rawGroups.mapIndexedNotNull { idx, group ->
+        // Merge consecutive groups that have insufficient readable window (< 250ms) instead of emitting 1ms flickers
+        val mergedGroups = mutableListOf<MutableList<VoskWordToken>>()
+        for (group in rawGroups) {
+            val prev = mergedGroups.lastOrNull()
+            if (prev != null) {
+                val prevStart = prev.first().startMs
+                val currStart = group.first().startMs
+                if (currStart - prevStart < MIN_READABLE_CUE_MS) {
+                    prev.addAll(group)
+                    continue
+                }
+            }
+            mergedGroups.add(group.toMutableList())
+        }
+
+        val provisionalCues = mergedGroups.mapIndexedNotNull { idx, group ->
             val joined = joinTokens(group, language).trim()
             if (joined.isBlank()) return@mapIndexedNotNull null
             val startMs = group.first().startMs
             val rawEndMs = group.last().endMs
             val minExtendedEndMs = maxOf(rawEndMs, startMs + MIN_CUE_DISPLAY_MS)
+            val clampedEndMs = if (videoDurationMs > 0L) minOf(minExtendedEndMs, videoDurationMs) else minExtendedEndMs
+            if (videoDurationMs > 0L && startMs >= videoDurationMs) return@mapIndexedNotNull null
             SubtitleCue(
                 index = idx + 1,
                 startTimeMs = startMs,
-                endTimeMs = minExtendedEndMs,
+                endTimeMs = maxOf(startMs + 1L, clampedEndMs),
                 text = ContextAwareDialogueTranslator.formatSubtitleLines(joined)
             )
         }
 
         if (provisionalCues.isEmpty()) return emptyList()
 
-        // Enforce strictly monotonic, non-overlapping timestamps
+        // Enforce strictly monotonic, non-overlapping timestamps within videoDurationMs
         val normalized = ArrayList<SubtitleCue>(provisionalCues.size)
         for (i in provisionalCues.indices) {
             val current = provisionalCues[i]
             val prevEnd = normalized.lastOrNull()?.endTimeMs ?: 0L
             val safeStart = maxOf(current.startTimeMs, prevEnd)
-            val nextStart = provisionalCues.getOrNull(i + 1)?.startTimeMs
-            val boundedEnd = if (nextStart != null && current.endTimeMs > nextStart) {
-                maxOf(safeStart + 250L, nextStart - 20L)
-            } else {
-                maxOf(current.endTimeMs, safeStart + 250L)
+            if (videoDurationMs > 0L && safeStart >= videoDurationMs) {
+                break
             }
+            val nextStart = provisionalCues.getOrNull(i + 1)?.startTimeMs
+            val desiredEnd = maxOf(current.endTimeMs, safeStart + MIN_READABLE_CUE_MS)
+            val nextBoundedEnd = if (nextStart != null && nextStart > safeStart) {
+                val gapAwareLimit = if (nextStart - safeStart >= 40L) nextStart - 20L else nextStart
+                minOf(desiredEnd, gapAwareLimit)
+            } else {
+                desiredEnd
+            }
+            val durationBoundedEnd = if (videoDurationMs > 0L) {
+                minOf(nextBoundedEnd, videoDurationMs)
+            } else {
+                nextBoundedEnd
+            }
+            val finalEnd = maxOf(safeStart + 1L, durationBoundedEnd)
+            val safeFinalEnd = if (videoDurationMs > 0L) minOf(finalEnd, videoDurationMs) else finalEnd
+            if (safeFinalEnd <= safeStart) continue
             normalized.add(
                 current.copy(
                     index = normalized.size + 1,
                     startTimeMs = safeStart,
-                    endTimeMs = boundedEnd
+                    endTimeMs = safeFinalEnd
                 )
             )
         }
@@ -170,6 +219,7 @@ class VoskSpeechToSubtitleEngine(
         context: Context,
         videoUri: Uri,
         sourceLanguage: SubtitleTranslationLanguage,
+        selectedAudioTrackIndex: Int? = null,
         onProgress: (progressFraction: Float, phaseLabel: String) -> Unit
     ): List<SubtitleCue> = withContext(Dispatchers.IO) {
         if (sourceLanguage == SubtitleTranslationLanguage.AUTO || !sourceLanguage.supportsVoskSpeech) {
@@ -216,9 +266,10 @@ class VoskSpeechToSubtitleEngine(
 
                 onProgress(0.10f, "جاري فك ترميز الصوت محليًا إلى 16kHz وتفريغ الكلام (${sourceLanguage.arabicName})...")
 
-                VideoAudioPcmDecoder.decodeTo16kMonoPcmStream(
+                val decodeSummary = VideoAudioPcmDecoder.decodeTo16kMonoPcmStream(
                     context = context,
-                    videoUri = videoUri
+                    videoUri = videoUri,
+                    selectedTrackIndex = selectedAudioTrackIndex
                 ) { pcmBytes, length, decodeProgress ->
                     coroutineContext.ensureActive()
                     val isUtteranceComplete = activeRecognizer.acceptWaveForm(pcmBytes, length)
@@ -233,7 +284,11 @@ class VoskSpeechToSubtitleEngine(
                 coroutineContext.ensureActive()
                 collectedWords += VoskResultCueSegmenter.parseVoskResultWords(activeRecognizer.finalResult)
 
-                val cues = VoskResultCueSegmenter.segmentWordsIntoCues(collectedWords, sourceLanguage)
+                val cues = VoskResultCueSegmenter.segmentWordsIntoCues(
+                    words = collectedWords,
+                    language = sourceLanguage,
+                    videoDurationMs = decodeSummary.durationMs
+                )
                 if (cues.isEmpty()) {
                     throw VoskRecognitionException(
                         "لم يتم اكتشاف كلام واضح باللغة ${sourceLanguage.arabicName} في المسار الصوتي لهذا الفيديو."

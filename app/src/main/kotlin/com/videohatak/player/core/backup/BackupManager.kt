@@ -16,6 +16,8 @@ import com.videohatak.player.core.playlist.db.BackupPlaylistStore
 import com.videohatak.player.core.playlist.db.VideoHatakDatabaseHelper
 import com.videohatak.player.core.playlist.model.Playlist
 import com.videohatak.player.core.playlist.model.PlaylistItem
+import com.videohatak.player.core.subtitle.model.SubtitleFormat
+import com.videohatak.player.core.subtitle.repository.LocalSubtitleStore
 import com.videohatak.player.core.subtitle.repository.SubtitlePreferencesRepository
 import com.videohatak.player.core.subtitle.repository.SubtitlePreferencesStore
 import com.videohatak.player.core.vault.security.VaultAutoLockTimeout
@@ -70,6 +72,7 @@ data class BackupPayload(
     val vaultSecurity: BackupVaultSecurityData,
     val playlists: List<BackupPlaylistData>,
     val resumePositions: Map<String, Long> = emptyMap(),
+    val localSubtitles: List<LocalSubtitleStore.BackupStoredSubtitleTrack> = emptyList(),
     val sha256Checksum: String = ""
 )
 
@@ -77,14 +80,16 @@ data class BackupExportSummary(
     val playlistCount: Int,
     val playlistItemCount: Int,
     val byteSize: Int,
-    val resumePositionCount: Int = 0
+    val resumePositionCount: Int = 0,
+    val localSubtitleTrackCount: Int = 0
 )
 
 data class BackupRestoreSummary(
     val playlistCount: Int,
     val playlistItemCount: Int,
     val themeRestored: AppThemeId,
-    val resumePositionCount: Int = 0
+    val resumePositionCount: Int = 0,
+    val localSubtitleTrackCount: Int = 0
 )
 
 sealed interface BackupParseResult {
@@ -109,7 +114,8 @@ class BackupManager internal constructor(
     private val playbackRepository: PlaybackPreferencesRepository,
     private val subtitleRepository: SubtitlePreferencesStore,
     private val vaultSecurityStore: VaultSecurityBackupStore,
-    private val playlistStore: BackupPlaylistStore
+    private val playlistStore: BackupPlaylistStore,
+    private val subtitleStore: LocalSubtitleStore? = null
 ) {
 
     constructor(
@@ -118,14 +124,16 @@ class BackupManager internal constructor(
         playbackRepository: PlaybackPreferencesRepository = PlaybackPreferencesRepositoryImpl(context),
         subtitleRepository: SubtitlePreferencesRepository = SubtitlePreferencesRepository(context),
         vaultSecurityPreferences: VaultSecurityPreferences = VaultSecurityPreferences(context),
-        databaseHelper: VideoHatakDatabaseHelper = VideoHatakDatabaseHelper(context)
+        databaseHelper: VideoHatakDatabaseHelper = VideoHatakDatabaseHelper(context),
+        subtitleStore: LocalSubtitleStore = LocalSubtitleStore(context)
     ) : this(
         context = context,
         themeRepository = themeRepository,
         playbackRepository = playbackRepository,
         subtitleRepository = subtitleRepository as SubtitlePreferencesStore,
         vaultSecurityStore = vaultSecurityPreferences as VaultSecurityBackupStore,
-        playlistStore = databaseHelper as BackupPlaylistStore
+        playlistStore = databaseHelper as BackupPlaylistStore,
+        subtitleStore = subtitleStore
     )
 
     suspend fun exportToUri(uri: Uri): Result<BackupExportSummary> = withContext(Dispatchers.IO) {
@@ -143,7 +151,8 @@ class BackupManager internal constructor(
                 playlistCount = payload.playlists.size,
                 playlistItemCount = payload.playlists.sumOf { it.items.size },
                 byteSize = bytes.size,
-                resumePositionCount = payload.resumePositions.size
+                resumePositionCount = payload.resumePositions.size,
+                localSubtitleTrackCount = payload.localSubtitles.size
             )
         }
     }
@@ -163,7 +172,8 @@ class BackupManager internal constructor(
                         playlistCount = parsed.payload.playlists.size,
                         playlistItemCount = parsed.payload.playlists.sumOf { it.items.size },
                         themeRestored = parsed.payload.settings.selectedTheme,
-                        resumePositionCount = parsed.payload.resumePositions.size
+                        resumePositionCount = parsed.payload.resumePositions.size,
+                        localSubtitleTrackCount = parsed.payload.localSubtitles.size
                     )
                 }
             }
@@ -206,6 +216,7 @@ class BackupManager internal constructor(
         }
 
         val savedPositions = playbackRepository.exportSavedPositions()
+        val storedSubtitles = runCatching { subtitleStore?.exportAllStoredTracksForBackup() }.getOrNull().orEmpty()
 
         return BackupPayload(
             schemaVersion = SCHEMA_VERSION,
@@ -227,7 +238,8 @@ class BackupManager internal constructor(
                 autoLockTimeout = autoLock
             ),
             playlists = playlists,
-            resumePositions = savedPositions
+            resumePositions = savedPositions,
+            localSubtitles = storedSubtitles
         )
     }
 
@@ -280,6 +292,7 @@ class BackupManager internal constructor(
             subtitleRepository.updatePrimaryFontSize(payload.subtitles.primaryFontSizeSp.coerceIn(12f, 36f))
             subtitleRepository.updateSecondaryFontSize(payload.subtitles.secondaryFontSizeSp.coerceIn(10f, 32f))
             vaultSecurityStore.setAutoLockTimeout(payload.vaultSecurity.autoLockTimeout)
+            subtitleStore?.replaceAllStoredTracksFromBackup(payload.localSubtitles)
         } catch (e: Throwable) {
             try {
                 playlistStore.replaceAllPlaylistsAndItems(toDatabaseEntries(previousSnapshot.playlists))
@@ -294,6 +307,7 @@ class BackupManager internal constructor(
                 subtitleRepository.updatePrimaryFontSize(previousSnapshot.subtitles.primaryFontSizeSp)
                 subtitleRepository.updateSecondaryFontSize(previousSnapshot.subtitles.secondaryFontSizeSp)
                 vaultSecurityStore.setAutoLockTimeout(previousSnapshot.vaultSecurity.autoLockTimeout)
+                subtitleStore?.replaceAllStoredTracksFromBackup(previousSnapshot.localSubtitles)
             } catch (rollbackError: Throwable) {
                 e.addSuppressed(rollbackError)
             }
@@ -310,7 +324,8 @@ class BackupManager internal constructor(
             playbackRepository: PlaybackPreferencesRepository,
             subtitleRepository: SubtitlePreferencesStore,
             vaultSecurityStore: VaultSecurityBackupStore,
-            playlistStore: BackupPlaylistStore
+            playlistStore: BackupPlaylistStore,
+            subtitleStore: LocalSubtitleStore? = null
         ): BackupManager {
             return BackupManager(
                 context = null,
@@ -318,7 +333,8 @@ class BackupManager internal constructor(
                 playbackRepository = playbackRepository,
                 subtitleRepository = subtitleRepository,
                 vaultSecurityStore = vaultSecurityStore,
-                playlistStore = playlistStore
+                playlistStore = playlistStore,
+                subtitleStore = subtitleStore
             )
         }
 
@@ -343,13 +359,13 @@ class BackupManager internal constructor(
                 null
             } ?: return BackupParseResult.Error("ملف النسخة الاحتياطية تالف أو ليس بصيغة JSON صالحة")
 
-            val version = (root["schemaVersion"] as? Number)?.toInt()
+            val version = asJsonNumber(root["schemaVersion"])?.toInt()
                 ?: return BackupParseResult.Error("إصدار النسخة الاحتياطية غير محدد")
             if (version !in SUPPORTED_SCHEMA_VERSIONS) {
                 return BackupParseResult.Error("إصدار النسخة الاحتياطية ($version) غير مدعوم في هذا الإصدار")
             }
 
-            val createdAt = (root["createdAtEpochMs"] as? Number)?.toLong() ?: 0L
+            val createdAt = asJsonNumber(root["createdAtEpochMs"])?.toLong() ?: 0L
             val declaredChecksum = (root["sha256Checksum"] as? String)?.trim()?.lowercase()
                 ?: return BackupParseResult.Error("البصمة الأمنية للنسخة الاحتياطية مفقودة")
 
@@ -384,11 +400,11 @@ class BackupManager internal constructor(
             val themeMode = ThemeMode.entries.firstOrNull { it.name == themeModeName }
                 ?: return BackupParseResult.Error("وضع سطوع غير معروف")
 
-            val rawSpeed = (settingsMap["playbackSpeed"] as? Number)?.toFloat()
+            val rawSpeed = asJsonNumber(settingsMap["playbackSpeed"])?.toFloat()
                 ?: return BackupParseResult.Error("سرعة التشغيل مفقودة")
             val playbackSpeed = VideoPlayerManager.clampPlaybackSpeed(rawSpeed)
 
-            val rawResize = (settingsMap["resizeMode"] as? Number)?.toInt()
+            val rawResize = asJsonNumber(settingsMap["resizeMode"])?.toInt()
                 ?: return BackupParseResult.Error("نمط أبعاد الشاشة مفقود")
             val resizeMode = VideoResizeMode.fromCode(rawResize).storageCode
 
@@ -402,19 +418,26 @@ class BackupManager internal constructor(
             val resumeMode = ResumeMode.entries.firstOrNull { it.name == resumeModeName }
                 ?: return BackupParseResult.Error("وضع استئناف غير معروف")
 
-            val rawSeekInterval = (settingsMap["seekIntervalSeconds"] as? Number)?.toInt()
+            val rawSeekInterval = asJsonNumber(settingsMap["seekIntervalSeconds"])?.toInt()
             val seekIntervalSeconds = PlaybackPreferencesRepository.sanitizeSeekIntervalSeconds(
                 rawSeekInterval ?: PlaybackPreferencesRepository.DEFAULT_SEEK_INTERVAL_SECONDS
             )
 
-            val primarySubSize = (subtitlesMap["primaryFontSizeSp"] as? Number)?.toFloat()?.coerceIn(12f, 36f)
-                ?: 18f
-            val secondarySubSize = (subtitlesMap["secondaryFontSizeSp"] as? Number)?.toFloat()?.coerceIn(10f, 32f)
-                ?: 15f
+            val rawPrimarySub = asJsonNumber(subtitlesMap["primaryFontSizeSp"])?.toFloat() ?: 18f
+            val rawSecondarySub = asJsonNumber(subtitlesMap["secondaryFontSizeSp"])?.toFloat() ?: 15f
+            val primarySubSize = rawPrimarySub.coerceIn(12f, 36f)
+            val secondarySubSize = rawSecondarySub.coerceIn(10f, 32f)
 
             val autoLockName = vaultMap["autoLockTimeout"] as? String ?: VaultAutoLockTimeout.IMMEDIATE.name
             val autoLock = VaultAutoLockTimeout.entries.firstOrNull { it.name == autoLockName }
                 ?: VaultAutoLockTimeout.IMMEDIATE
+
+            val numberLexemes = HashMap<String, String>()
+            asJsonLexeme(settingsMap["playbackSpeed"])?.let { numberLexemes["settings.playbackSpeed"] = it }
+            asJsonLexeme(settingsMap["resizeMode"])?.let { numberLexemes["settings.resizeMode"] = it }
+            asJsonLexeme(settingsMap["seekIntervalSeconds"])?.let { numberLexemes["settings.seekIntervalSeconds"] = it }
+            asJsonLexeme(subtitlesMap["primaryFontSizeSp"])?.let { numberLexemes["subtitles.primaryFontSizeSp"] = it }
+            asJsonLexeme(subtitlesMap["secondaryFontSizeSp"])?.let { numberLexemes["subtitles.secondaryFontSizeSp"] = it }
 
             val playlists = playlistsRaw.mapIndexed { idx, entry ->
                 val plMap = entry as? Map<*, *>
@@ -423,18 +446,25 @@ class BackupManager internal constructor(
                 if (title.isBlank()) {
                     return BackupParseResult.Error("اسم قائمة التشغيل فارغ عند الموضع $idx")
                 }
-                val pCreatedAt = (plMap["createdAt"] as? Number)?.toLong() ?: 0L
-                val pUpdatedAt = (plMap["updatedAt"] as? Number)?.toLong() ?: 0L
+                val pCreatedAt = asJsonNumber(plMap["createdAt"])?.toLong() ?: 0L
+                val pUpdatedAt = asJsonNumber(plMap["updatedAt"])?.toLong() ?: 0L
+                asJsonLexeme(plMap["createdAt"])?.let { numberLexemes["playlists.$idx.createdAt"] = it }
+                asJsonLexeme(plMap["updatedAt"])?.let { numberLexemes["playlists.$idx.updatedAt"] = it }
+
                 val itemsRaw = plMap["items"] as? List<*> ?: emptyList<Any>()
-                val items = itemsRaw.map { itemAny ->
+                val items = itemsRaw.mapIndexed { itemIdx, itemAny ->
                     val itemMap = itemAny as? Map<*, *>
                         ?: return BackupParseResult.Error("عنصر فيديو غير صالح داخل القائمة $title")
+                    asJsonLexeme(itemMap["videoId"])?.let { numberLexemes["playlists.$idx.items.$itemIdx.videoId"] = it }
+                    asJsonLexeme(itemMap["durationMs"])?.let { numberLexemes["playlists.$idx.items.$itemIdx.durationMs"] = it }
+                    asJsonLexeme(itemMap["sizeBytes"])?.let { numberLexemes["playlists.$idx.items.$itemIdx.sizeBytes"] = it }
+                    asJsonLexeme(itemMap["dateAddedSec"])?.let { numberLexemes["playlists.$idx.items.$itemIdx.dateAddedSec"] = it }
                     BackupPlaylistItemData(
-                        videoId = (itemMap["videoId"] as? Number)?.toLong() ?: 0L,
+                        videoId = asJsonNumber(itemMap["videoId"])?.toLong() ?: 0L,
                         videoTitle = (itemMap["videoTitle"] as? String).orEmpty(),
-                        durationMs = (itemMap["durationMs"] as? Number)?.toLong() ?: 0L,
-                        sizeBytes = (itemMap["sizeBytes"] as? Number)?.toLong() ?: 0L,
-                        dateAddedSec = (itemMap["dateAddedSec"] as? Number)?.toLong() ?: 0L,
+                        durationMs = asJsonNumber(itemMap["durationMs"])?.toLong() ?: 0L,
+                        sizeBytes = asJsonNumber(itemMap["sizeBytes"])?.toLong() ?: 0L,
+                        dateAddedSec = asJsonNumber(itemMap["dateAddedSec"])?.toLong() ?: 0L,
                         contentUri = (itemMap["contentUri"] as? String).orEmpty(),
                         isAvailable = (itemMap["isAvailable"] as? Boolean) ?: true
                     )
@@ -452,10 +482,40 @@ class BackupManager internal constructor(
             if (rawPositions != null) {
                 for ((k, v) in rawPositions) {
                     val keyStr = k?.toString()?.trim().orEmpty()
-                    val posMs = (v as? Number)?.toLong() ?: -1L
+                    val posMs = asJsonNumber(v)?.toLong() ?: -1L
                     if (keyStr.isNotBlank() && posMs > 0L) {
                         resumePositions[keyStr] = posMs
+                        asJsonLexeme(v)?.let { numberLexemes["resumePositions.$keyStr"] = it }
                     }
+                }
+            }
+
+            val rawLocalSubtitles = bodyMap["localSubtitles"] as? List<*>
+            val localSubtitles = mutableListOf<LocalSubtitleStore.BackupStoredSubtitleTrack>()
+            rawLocalSubtitles?.forEach { entry ->
+                val map = entry as? Map<*, *> ?: return@forEach
+                val hash = (map["videoKeyHash"] as? String).orEmpty()
+                val trackId = (map["trackId"] as? String).orEmpty()
+                val trackName = (map["trackName"] as? String).orEmpty()
+                val language = (map["language"] as? String)?.takeIf { it.isNotBlank() }
+                val formatName = (map["format"] as? String) ?: SubtitleFormat.SRT.name
+                val format = SubtitleFormat.entries.firstOrNull { it.name == formatName } ?: SubtitleFormat.SRT
+                val content = (map["content"] as? String).orEmpty()
+                val updatedAtMs = asJsonNumber(map["updatedAtMs"])?.toLong() ?: 0L
+                if (hash.isNotBlank() && trackId.isNotBlank() && content.isNotBlank()) {
+                    val sIdx = localSubtitles.size
+                    asJsonLexeme(map["updatedAtMs"])?.let { numberLexemes["localSubtitles.$sIdx.updatedAtMs"] = it }
+                    localSubtitles.add(
+                        LocalSubtitleStore.BackupStoredSubtitleTrack(
+                            videoKeyHash = hash,
+                            trackId = trackId,
+                            trackName = trackName,
+                            language = language,
+                            format = format,
+                            content = content,
+                            updatedAtMs = updatedAtMs
+                        )
+                    )
                 }
             }
 
@@ -472,15 +532,16 @@ class BackupManager internal constructor(
                     seekIntervalSeconds = rawSeekInterval ?: PlaybackPreferencesRepository.DEFAULT_SEEK_INTERVAL_SECONDS
                 ),
                 subtitles = BackupSubtitleData(
-                    primaryFontSizeSp = (subtitlesMap["primaryFontSizeSp"] as? Number)?.toFloat() ?: 18f,
-                    secondaryFontSizeSp = (subtitlesMap["secondaryFontSizeSp"] as? Number)?.toFloat() ?: 15f
+                    primaryFontSizeSp = rawPrimarySub,
+                    secondaryFontSizeSp = rawSecondarySub
                 ),
                 vaultSecurity = BackupVaultSecurityData(autoLockTimeout = autoLock),
                 playlists = playlists,
-                resumePositions = resumePositions
+                resumePositions = resumePositions,
+                localSubtitles = localSubtitles
             )
 
-            val expectedChecksum = sha256Hex(buildCanonicalBodyJson(candidate))
+            val expectedChecksum = sha256Hex(buildCanonicalBodyJson(candidate, numberLexemes))
             if (!MessageDigest.isEqual(
                     expectedChecksum.toByteArray(Charsets.UTF_8),
                     declaredChecksum.toByteArray(Charsets.UTF_8)
@@ -505,23 +566,38 @@ class BackupManager internal constructor(
             )
         }
 
-        private fun buildCanonicalBodyJson(payload: BackupPayload): String {
+        private fun asJsonNumber(value: Any?): Number? = when (value) {
+            is JsonRawNumber -> value.number
+            is Number -> value
+            else -> null
+        }
+
+        private fun asJsonLexeme(value: Any?): String? = when (value) {
+            is JsonRawNumber -> value.rawLexeme
+            else -> null
+        }
+
+        private fun buildCanonicalBodyJson(
+            payload: BackupPayload,
+            numberLexemes: Map<String, String> = emptyMap()
+        ): String {
+            fun numToken(path: String, fallback: Any): String = numberLexemes[path] ?: fallback.toString()
             return buildString {
                 append("{")
                 append("\"settings\":{")
                 append("\"selectedTheme\":").append(quoteJson(payload.settings.selectedTheme.name)).append(",")
                 append("\"themeMode\":").append(quoteJson(payload.settings.themeMode.name)).append(",")
-                append("\"playbackSpeed\":").append(payload.settings.playbackSpeed).append(",")
-                append("\"resizeMode\":").append(payload.settings.resizeMode).append(",")
+                append("\"playbackSpeed\":").append(numToken("settings.playbackSpeed", payload.settings.playbackSpeed)).append(",")
+                append("\"resizeMode\":").append(numToken("settings.resizeMode", payload.settings.resizeMode)).append(",")
                 append("\"playbackMode\":").append(quoteJson(payload.settings.playbackMode.name)).append(",")
                 append("\"resumeMode\":").append(quoteJson(payload.settings.resumeMode.name))
                 if (payload.schemaVersion >= 3 || payload.settings.seekIntervalSeconds != PlaybackPreferencesRepository.DEFAULT_SEEK_INTERVAL_SECONDS) {
-                    append(",\"seekIntervalSeconds\":").append(payload.settings.seekIntervalSeconds)
+                    append(",\"seekIntervalSeconds\":").append(numToken("settings.seekIntervalSeconds", payload.settings.seekIntervalSeconds))
                 }
                 append("},")
                 append("\"subtitles\":{")
-                append("\"primaryFontSizeSp\":").append(payload.subtitles.primaryFontSizeSp).append(",")
-                append("\"secondaryFontSizeSp\":").append(payload.subtitles.secondaryFontSizeSp)
+                append("\"primaryFontSizeSp\":").append(numToken("subtitles.primaryFontSizeSp", payload.subtitles.primaryFontSizeSp)).append(",")
+                append("\"secondaryFontSizeSp\":").append(numToken("subtitles.secondaryFontSizeSp", payload.subtitles.secondaryFontSizeSp))
                 append("},")
                 append("\"vaultSecurity\":{")
                 append("\"autoLockTimeout\":").append(quoteJson(payload.vaultSecurity.autoLockTimeout.name))
@@ -531,17 +607,17 @@ class BackupManager internal constructor(
                     if (pIdx > 0) append(",")
                     append("{")
                     append("\"title\":").append(quoteJson(pl.title)).append(",")
-                    append("\"createdAt\":").append(pl.createdAt).append(",")
-                    append("\"updatedAt\":").append(pl.updatedAt).append(",")
+                    append("\"createdAt\":").append(numToken("playlists.$pIdx.createdAt", pl.createdAt)).append(",")
+                    append("\"updatedAt\":").append(numToken("playlists.$pIdx.updatedAt", pl.updatedAt)).append(",")
                     append("\"items\":[")
                     pl.items.forEachIndexed { iIdx, item ->
                         if (iIdx > 0) append(",")
                         append("{")
-                        append("\"videoId\":").append(item.videoId).append(",")
+                        append("\"videoId\":").append(numToken("playlists.$pIdx.items.$iIdx.videoId", item.videoId)).append(",")
                         append("\"videoTitle\":").append(quoteJson(item.videoTitle)).append(",")
-                        append("\"durationMs\":").append(item.durationMs).append(",")
-                        append("\"sizeBytes\":").append(item.sizeBytes).append(",")
-                        append("\"dateAddedSec\":").append(item.dateAddedSec).append(",")
+                        append("\"durationMs\":").append(numToken("playlists.$pIdx.items.$iIdx.durationMs", item.durationMs)).append(",")
+                        append("\"sizeBytes\":").append(numToken("playlists.$pIdx.items.$iIdx.sizeBytes", item.sizeBytes)).append(",")
+                        append("\"dateAddedSec\":").append(numToken("playlists.$pIdx.items.$iIdx.dateAddedSec", item.dateAddedSec)).append(",")
                         append("\"contentUri\":").append(quoteJson(item.contentUri)).append(",")
                         append("\"isAvailable\":").append(item.isAvailable)
                         append("}")
@@ -555,9 +631,25 @@ class BackupManager internal constructor(
                     val sortedEntries = payload.resumePositions.entries.sortedBy { it.key }
                     sortedEntries.forEachIndexed { idx, (key, value) ->
                         if (idx > 0) append(",")
-                        append(quoteJson(key)).append(":").append(value)
+                        append(quoteJson(key)).append(":").append(numToken("resumePositions.$key", value))
                     }
                     append("}")
+                }
+                if (payload.localSubtitles.isNotEmpty()) {
+                    append(",\"localSubtitles\":[")
+                    payload.localSubtitles.forEachIndexed { sIdx, track ->
+                        if (sIdx > 0) append(",")
+                        append("{")
+                        append("\"videoKeyHash\":").append(quoteJson(track.videoKeyHash)).append(",")
+                        append("\"trackId\":").append(quoteJson(track.trackId)).append(",")
+                        append("\"trackName\":").append(quoteJson(track.trackName)).append(",")
+                        append("\"language\":").append(quoteJson(track.language ?: "")).append(",")
+                        append("\"format\":").append(quoteJson(track.format.name)).append(",")
+                        append("\"content\":").append(quoteJson(track.content)).append(",")
+                        append("\"updatedAtMs\":").append(numToken("localSubtitles.$sIdx.updatedAtMs", track.updatedAtMs))
+                        append("}")
+                    }
+                    append("]")
                 }
                 append("}")
             }
@@ -697,7 +789,7 @@ private class MiniJsonParser(private val src: String) {
         throw IllegalArgumentException("Unterminated string")
     }
 
-    private fun parseNumber(): Number {
+    private fun parseNumber(): JsonRawNumber {
         val start = pos
         if (src[pos] == '-') pos++
         while (pos < src.length && src[pos] in '0'..'9') pos++
@@ -714,7 +806,8 @@ private class MiniJsonParser(private val src: String) {
             while (pos < src.length && src[pos] in '0'..'9') pos++
         }
         val token = src.substring(start, pos)
-        return if (isFloat) token.toDouble() else token.toLong()
+        val parsed: Number = if (isFloat) token.toDouble() else token.toLong()
+        return JsonRawNumber(parsed, token)
     }
 
     private fun <T> expectLiteral(lit: String, result: T): T {
@@ -727,3 +820,8 @@ private class MiniJsonParser(private val src: String) {
         while (pos < src.length && src[pos].isWhitespace()) pos++
     }
 }
+
+private data class JsonRawNumber(
+    val number: Number,
+    val rawLexeme: String
+)

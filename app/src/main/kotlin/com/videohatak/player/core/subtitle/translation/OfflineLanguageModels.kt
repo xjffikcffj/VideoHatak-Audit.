@@ -20,13 +20,24 @@ data class VoskSpeechModelSpec(
     val approximateDiskExtractedMb: Int,
     val licenseName: String,
     val architectureNoteArabic: String,
-    val accuracyCaveatArabic: String? = null
+    val accuracyCaveatArabic: String? = null,
+    val expectedSha256: String? = null
 ) {
     val expectedZipBytes: Long
         get() = approximateZipMb.toLong() * 1024L * 1024L
 
     val requiredFreeBytesWithMargin: Long
         get() = (approximateZipMb.toLong() + approximateDiskExtractedMb.toLong() + 120L) * 1024L * 1024L
+
+    val hasCryptographicChecksum: Boolean
+        get() = !expectedSha256.isNullOrBlank()
+
+    val checksumStatusArabic: String
+        get() = if (hasCryptographicChecksum) {
+            "تحقق بصمة SHA-256 مفعّل"
+        } else {
+            "تحقق البنية والأرشيف فقط (بصمة SHA-256 الرسمية غير متوفرة في هذا الإصدار)"
+        }
 }
 
 object VoskModelCatalog {
@@ -144,6 +155,7 @@ data class LanguageModelResourceState(
     val isBuiltInTranslationLanguage: Boolean = (language == SubtitleTranslationLanguage.ENGLISH),
     val translationApproximateMb: Int = if (language == SubtitleTranslationLanguage.ENGLISH) 0 else 30,
     val translationErrorMessage: String? = null,
+    val translationStatusNote: String? = null,
     val isTranslationInUse: Boolean = false
 ) {
     val formattedSpeechSizeLabel: String

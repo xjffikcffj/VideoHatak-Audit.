@@ -11,18 +11,15 @@ class PipActionReceiver : BroadcastReceiver() {
         const val ACTION_PAUSE = "com.videohatak.player.PIP_PAUSE"
     }
 
-    override fun onReceive(context: Context, intent: Intent) {
-        val manager = VideoPlayerManager.getInstance(context)
-        when (intent.action) {
-            PipHelper.ACTION_PIP_PLAY_PAUSE, ACTION_PLAY, ACTION_PAUSE -> {
-                manager.togglePlayPause()
-            }
-            PipHelper.ACTION_PIP_FORWARD -> {
-                manager.seekForward()
-            }
-            PipHelper.ACTION_PIP_REPLAY -> {
-                manager.seekBackward()
-            }
+    override fun onReceive(context: Context, intent: Intent?) {
+        val action = intent?.action ?: return
+        val manager = VideoPlayerManager.getInstance(context.applicationContext)
+        when (action) {
+            PipHelper.ACTION_PIP_PLAY_PAUSE -> manager.togglePlayPause()
+            ACTION_PLAY -> manager.play()
+            ACTION_PAUSE -> manager.pause()
+            PipHelper.ACTION_PIP_FORWARD -> manager.seekForward()
+            PipHelper.ACTION_PIP_REPLAY -> manager.seekBackward()
         }
     }
 }

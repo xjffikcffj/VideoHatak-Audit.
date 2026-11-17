@@ -10,7 +10,9 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -28,6 +30,7 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
+import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import java.util.zip.ZipInputStream
 import kotlin.coroutines.coroutineContext
@@ -74,11 +77,13 @@ data class ModelOperationResult(
 class OfflineModelManager private constructor(
     private val rootDir: File,
     private val mlKitBridge: MlKitModelBridge,
+    private val isTestMode: Boolean,
     private val streamDownloader: ((url: String, destFile: File, expectedBytes: Long, onProgress: suspend (Long, Long) -> Unit) -> Unit)? = null
 ) {
     constructor(context: Context) : this(
         rootDir = File(context.applicationContext.filesDir, "offline_models"),
-        mlKitBridge = DefaultMlKitModelBridge()
+        mlKitBridge = DefaultMlKitModelBridge(),
+        isTestMode = false
     )
 
     internal constructor(
@@ -88,6 +93,7 @@ class OfflineModelManager private constructor(
     ) : this(
         rootDir = testRootDir,
         mlKitBridge = mlKitBridge,
+        isTestMode = true,
         streamDownloader = streamDownloader
     )
 
@@ -95,6 +101,8 @@ class OfflineModelManager private constructor(
         private const val CATALOG_FILE_NAME = "catalog.json"
         private const val VOSK_DIR_NAME = "vosk"
         private const val TMP_DIR_NAME = "tmp"
+        private const val MAX_ZIP_ENTRIES = 2_000
+        private const val MAX_SINGLE_ENTRY_BYTES = 750L * 1024L * 1024L
 
         @Volatile
         private var instance: OfflineModelManager? = null
@@ -105,15 +113,77 @@ class OfflineModelManager private constructor(
             }
         }
 
-        internal fun hasValidVoskStructure(dir: File): Boolean {
+        private val VALID_FST_NAMES = setOf("hclg.fst", "hclr.fst", "gr.fst")
+
+        internal fun hasValidVoskStructure(dir: File, minExpectedBytes: Long = 0L): Boolean {
             if (!dir.exists() || !dir.isDirectory) return false
             val amFinalMdl = File(dir, "am/final.mdl")
+            if (!amFinalMdl.exists() || !amFinalMdl.isFile || amFinalMdl.length() <= 0L) {
+                return false
+            }
+            if (minExpectedBytes > 0L && amFinalMdl.length() < 100_000L) {
+                return false
+            }
+
             val confDir = File(dir, "conf")
+            if (!confDir.exists() || !confDir.isDirectory) return false
             val mfccConf = File(confDir, "mfcc.conf")
             val modelConf = File(confDir, "model.conf")
-            return amFinalMdl.exists() && amFinalMdl.length() > 0L &&
-                confDir.exists() && confDir.isDirectory &&
-                (mfccConf.exists() || modelConf.exists())
+            val hasValidConf = isValidKaldiConfigFile(mfccConf) || isValidKaldiConfigFile(modelConf)
+            if (!hasValidConf) return false
+
+            val graphDir = File(dir, "graph")
+            if (!graphDir.exists() || !graphDir.isDirectory) return false
+            val graphFiles = graphDir.walkTopDown().filter { it.isFile && it.length() > 0L }.toList()
+            val hasDecodingFst = graphFiles.any { it.name.lowercase() in VALID_FST_NAMES }
+            val hasVocabularyOrPhones = graphFiles.any { f ->
+                when (f.name.lowercase()) {
+                    "words.txt", "phones.txt" -> isValidPlainTextFile(f)
+                    "word_boundary.int", "disambig.int" -> true
+                    else -> false
+                }
+            }
+            if (!hasDecodingFst || !hasVocabularyOrPhones) return false
+
+            val ivectorDir = File(dir, "ivector")
+            val hasValidIvector = !ivectorDir.exists() ||
+                (ivectorDir.isDirectory && ivectorDir.walkTopDown().any { it.isFile && it.length() > 0L })
+            if (!hasValidIvector) return false
+
+            if (minExpectedBytes > 0L && calculateDirectoryBytes(dir) < minExpectedBytes) {
+                return false
+            }
+            return true
+        }
+
+        private fun isValidKaldiConfigFile(file: File): Boolean {
+            if (!file.exists() || !file.isFile || file.length() <= 0L || file.length() > 1024L * 1024L) {
+                return false
+            }
+            return runCatching {
+                val bytes = file.readBytes()
+                if (bytes.any { it == 0.toByte() }) return false
+                val text = bytes.toString(Charsets.UTF_8)
+                text.lineSequence().any { line ->
+                    val trimmed = line.trim()
+                    trimmed.isNotEmpty() && !trimmed.startsWith("#") && (trimmed.contains("--") || trimmed.contains("="))
+                }
+            }.getOrDefault(false)
+        }
+
+        private fun isValidPlainTextFile(file: File): Boolean {
+            if (!file.exists() || !file.isFile || file.length() <= 0L) return false
+            return runCatching {
+                FileInputStream(file).use { fis ->
+                    val sample = ByteArray(minOf(4096, file.length().toInt().coerceAtLeast(1)))
+                    val read = fis.read(sample)
+                    if (read <= 0) return false
+                    for (i in 0 until read) {
+                        if (sample[i] == 0.toByte()) return false
+                    }
+                }
+                true
+            }.getOrDefault(false)
         }
 
         internal fun calculateDirectoryBytes(dir: File): Long {
@@ -125,12 +195,43 @@ class OfflineModelManager private constructor(
             }
             return total
         }
+
+        internal fun verifyZipSignature(file: File): Boolean {
+            if (!file.exists() || !file.isFile || file.length() < 22L) return false
+            return runCatching {
+                FileInputStream(file).use { fis ->
+                    val header = ByteArray(4)
+                    if (fis.read(header) != 4) return false
+                    header[0] == 0x50.toByte() &&
+                        header[1] == 0x4B.toByte() &&
+                        ((header[2] == 0x03.toByte() && header[3] == 0x04.toByte()) ||
+                            (header[2] == 0x05.toByte() && header[3] == 0x06.toByte()))
+                }
+            }.getOrDefault(false)
+        }
+
+        internal fun computeFileSha256(file: File): String {
+            val digest = MessageDigest.getInstance("SHA-256")
+            FileInputStream(file).use { fis ->
+                val buffer = ByteArray(32 * 1024)
+                while (true) {
+                    val read = fis.read(buffer)
+                    if (read == -1) break
+                    digest.update(buffer, 0, read)
+                }
+            }
+            return digest.digest().joinToString("") { "%02x".format(it) }
+        }
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val catalogMutex = Mutex()
     private val speechDownloadMutex = Mutex()
-    private val mlKitDownloadMutex = Mutex()
+    private val mlKitMutexes = ConcurrentHashMap<SubtitleTranslationLanguage, Mutex>()
+    private val inFlightMlKitOps = ConcurrentHashMap<SubtitleTranslationLanguage, kotlinx.coroutines.Deferred<Unit>>()
+
+    private fun mlKitMutexFor(language: SubtitleTranslationLanguage): Mutex =
+        mlKitMutexes.computeIfAbsent(language) { Mutex() }
 
     private val activeSpeechJobs = ConcurrentHashMap<SubtitleTranslationLanguage, Job>()
     private val activeMlKitJobs = ConcurrentHashMap<SubtitleTranslationLanguage, Job>()
@@ -161,8 +262,9 @@ class OfflineModelManager private constructor(
     suspend fun refreshAllStates() = withContext(Dispatchers.IO) {
         ensureDirectories()
         val persistedRecords = readCatalogRecords()
-        val downloadedMlKitCodes = runCatching { mlKitBridge.getDownloadedLanguageCodes() }
-            .getOrDefault(emptySet())
+        val mlKitQueryResult = runCatching { mlKitBridge.getDownloadedLanguageCodes() }
+        val mlKitQueryFailed = mlKitQueryResult.isFailure
+        val downloadedMlKitCodes = mlKitQueryResult.getOrNull().orEmpty()
 
         val nextMap = SubtitleTranslationLanguage.TARGET_LANGUAGES.associateWith { lang ->
             val current = _languageStates.value[lang] ?: LanguageModelResourceState(language = lang)
@@ -185,9 +287,16 @@ class OfflineModelManager private constructor(
             val mlKitStatus = when {
                 isMlKitDownloading -> OfflineModelDownloadStatus.DOWNLOADING
                 lang == SubtitleTranslationLanguage.ENGLISH -> OfflineModelDownloadStatus.READY
+                mlKitQueryFailed -> OfflineModelDownloadStatus.ERROR
                 lang.mlKitCode != null && lang.mlKitCode in downloadedMlKitCodes -> OfflineModelDownloadStatus.READY
                 current.translationStatus == OfflineModelDownloadStatus.ERROR -> OfflineModelDownloadStatus.ERROR
                 else -> OfflineModelDownloadStatus.NOT_DOWNLOADED
+            }
+            val mlKitErrorMsg = when {
+                lang == SubtitleTranslationLanguage.ENGLISH -> null
+                mlKitQueryFailed && !isMlKitDownloading -> "تعذر الاستعلام عن حزم الترجمة المثبتة من خدمة Google Play"
+                mlKitStatus == OfflineModelDownloadStatus.READY || mlKitStatus == OfflineModelDownloadStatus.NOT_DOWNLOADED -> null
+                else -> current.translationErrorMessage
             }
 
             current.copy(
@@ -198,6 +307,8 @@ class OfflineModelManager private constructor(
                 speechDownloadProgress = if (speechStatus == OfflineModelDownloadStatus.READY) 1f else if (isSpeechDownloading) current.speechDownloadProgress else 0f,
                 isSpeechInUse = (speechUseCounts[lang] ?: 0) > 0,
                 translationStatus = mlKitStatus,
+                translationErrorMessage = mlKitErrorMsg,
+                translationStatusNote = if (mlKitStatus == OfflineModelDownloadStatus.READY) null else current.translationStatusNote,
                 isTranslationInUse = (translationUseCounts[lang] ?: 0) > 0
             )
         }
@@ -210,13 +321,21 @@ class OfflineModelManager private constructor(
         val bytes: Long
     )
 
+    private fun productionMinExpectedBytes(spec: VoskSpeechModelSpec): Long {
+        return if (isTestMode) {
+            0L
+        } else {
+            maxOf(1024L * 1024L, spec.approximateDiskExtractedMb.toLong() * 1024L * 1024L / 3L)
+        }
+    }
+
     private fun inspectVoskModelOnDisk(
         spec: VoskSpeechModelSpec,
         record: JSONObject?
     ): SpeechDiskInspection {
         val modelDir = File(voskBaseDir, spec.modelId)
         val hasDir = modelDir.exists() && modelDir.isDirectory
-        val validStructure = hasDir && hasValidVoskStructure(modelDir)
+        val validStructure = hasDir && hasValidVoskStructure(modelDir, productionMinExpectedBytes(spec))
         val recordedVer = record?.optString("version")?.takeIf { it.isNotBlank() }
 
         return when {
@@ -236,7 +355,7 @@ class OfflineModelManager private constructor(
             }
             hasDir || record != null -> {
                 SpeechDiskInspection(
-                    status = OfflineModelDownloadStatus.NEEDS_UPDATE,
+                    status = OfflineModelDownloadStatus.ERROR,
                     version = recordedVer,
                     bytes = if (hasDir) calculateDirectoryBytes(modelDir) else 0L
                 )
@@ -254,7 +373,7 @@ class OfflineModelManager private constructor(
     suspend fun getVerifiedSpeechModelDirectory(language: SubtitleTranslationLanguage): File? {
         val spec = VoskModelCatalog.specFor(language) ?: return null
         val modelDir = File(voskBaseDir, spec.modelId)
-        if (hasValidVoskStructure(modelDir)) {
+        if (hasValidVoskStructure(modelDir, productionMinExpectedBytes(spec))) {
             return modelDir
         }
         refreshAllStates()
@@ -280,7 +399,10 @@ class OfflineModelManager private constructor(
             speechDownloadMutex.withLock {
                 ensureDirectories()
                 val modelDir = File(voskBaseDir, spec.modelId)
-                if (hasValidVoskStructure(modelDir)) {
+                val backupDir = File(voskBaseDir, "${spec.modelId}.bak")
+                val minExpectedBytes = productionMinExpectedBytes(spec)
+
+                if (hasValidVoskStructure(modelDir, minExpectedBytes)) {
                     persistSpeechRecord(language.code, spec)
                     refreshAllStates()
                     return@withContext ModelOperationResult(true, "نموذج ${language.arabicName} الصوتي جاهز بالفعل")
@@ -309,6 +431,7 @@ class OfflineModelManager private constructor(
                 val stagingDir = File(tmpBaseDir, "${spec.modelId}_staging")
                 tempZip.delete()
                 stagingDir.deleteRecursively()
+                backupDir.deleteRecursively()
 
                 updateLanguageState(language) {
                     it.copy(
@@ -320,7 +443,9 @@ class OfflineModelManager private constructor(
                     )
                 }
 
+                var movedExistingToBackup = false
                 try {
+                    val maxDownloadBytes = maxOf(spec.expectedZipBytes * 3L, 640L * 1024L * 1024L)
                     if (streamDownloader != null) {
                         streamDownloader.invoke(spec.downloadUrl, tempZip, spec.expectedZipBytes) { read, total ->
                             coroutineContext.ensureActive()
@@ -339,7 +464,8 @@ class OfflineModelManager private constructor(
                         downloadFileWithRedirects(
                             urlString = spec.downloadUrl,
                             destFile = tempZip,
-                            fallbackTotalBytes = spec.expectedZipBytes
+                            fallbackTotalBytes = spec.expectedZipBytes,
+                            maxDownloadBytes = maxDownloadBytes
                         ) { read, total ->
                             val dlFraction = (read.toFloat() / total.toFloat()).coerceIn(0f, 1f) * 0.85f
                             updateLanguageState(language) {
@@ -354,6 +480,17 @@ class OfflineModelManager private constructor(
                     }
 
                     coroutineContext.ensureActive()
+                    if (!verifyZipSignature(tempZip)) {
+                        throw IOException("الملف المنزّل ليس أرشيف ZIP صالحًا لنموذج ${language.arabicName}")
+                    }
+                    val expectedHash = spec.expectedSha256?.trim()
+                    if (!expectedHash.isNullOrEmpty()) {
+                        val actualHash = computeFileSha256(tempZip)
+                        if (!actualHash.equals(expectedHash, ignoreCase = true)) {
+                            throw SecurityException("فشل التحقق من بصمة SHA-256 لأرشيف نموذج ${language.arabicName}")
+                        }
+                    }
+
                     updateLanguageState(language) {
                         it.copy(
                             speechStatus = OfflineModelDownloadStatus.DOWNLOADING,
@@ -362,22 +499,34 @@ class OfflineModelManager private constructor(
                     }
 
                     stagingDir.mkdirs()
-                    extractZipSafely(tempZip, stagingDir)
-                    val locatedModelRoot = locateVoskRootInExtracted(stagingDir)
-                        ?: throw IOException("أرشيف النموذج الصوتي غير مكتمل أو تالف (ملفات الصوت am/conf غير موجودة)")
+                    val maxExtractedBytes = maxOf(1_500L * 1024L * 1024L, spec.requiredFreeBytesWithMargin * 2L)
+                    extractZipSafely(tempZip, stagingDir, maxExtractedBytes = maxExtractedBytes)
+                    val locatedModelRoot = locateVoskRootInExtracted(stagingDir, minExpectedBytes)
+                        ?: throw IOException("أرشيف النموذج الصوتي غير مكتمل أو تالف (ملفات الصوت am/conf/graph غير مكتملة)")
 
-                    if (!hasValidVoskStructure(locatedModelRoot)) {
+                    if (!hasValidVoskStructure(locatedModelRoot, minExpectedBytes)) {
                         throw IOException("فشل التحقق من سلامة ملفات نموذج ${language.arabicName}")
                     }
 
-                    modelDir.deleteRecursively()
+                    if (modelDir.exists()) {
+                        movedExistingToBackup = modelDir.renameTo(backupDir) || run {
+                            locatedModelRoot.let {
+                                modelDir.copyRecursively(backupDir, overwrite = true) && modelDir.deleteRecursively()
+                            }
+                        }
+                        if (!movedExistingToBackup) {
+                            throw IOException("تعذر تجهيز النسخة السابقة للاستبدال الآمن لنموذج ${language.arabicName}")
+                        }
+                    }
+
                     if (!locatedModelRoot.renameTo(modelDir)) {
                         locatedModelRoot.copyRecursively(modelDir, overwrite = true)
                     }
-                    if (!hasValidVoskStructure(modelDir)) {
+                    if (!hasValidVoskStructure(modelDir, minExpectedBytes)) {
                         throw IOException("تعذر تثبيت ملفات نموذج ${language.arabicName} داخل ذاكرة التطبيق")
                     }
 
+                    backupDir.deleteRecursively()
                     persistSpeechRecord(language.code, spec)
                     val finalBytes = calculateDirectoryBytes(modelDir)
                     updateLanguageState(language) {
@@ -391,18 +540,34 @@ class OfflineModelManager private constructor(
                     }
                     ModelOperationResult(true, "تم تنزيل وتثبيت نموذج التفريغ الصوتي لـ ${language.arabicName} بنجاح")
                 } catch (ce: CancellationException) {
-                    modelDir.deleteRecursively()
-                    updateLanguageState(language) {
-                        it.copy(
-                            speechStatus = OfflineModelDownloadStatus.NOT_DOWNLOADED,
-                            speechDownloadProgress = 0f,
-                            speechDownloadedBytes = 0L,
-                            speechErrorMessage = null
-                        )
+                    withContext(NonCancellable) {
+                        modelDir.deleteRecursively()
+                        if (movedExistingToBackup && backupDir.exists()) {
+                            if (!backupDir.renameTo(modelDir)) {
+                                backupDir.copyRecursively(modelDir, overwrite = true)
+                                backupDir.deleteRecursively()
+                            }
+                            refreshAllStates()
+                        } else {
+                            updateLanguageState(language) {
+                                it.copy(
+                                    speechStatus = OfflineModelDownloadStatus.NOT_DOWNLOADED,
+                                    speechDownloadProgress = 0f,
+                                    speechDownloadedBytes = 0L,
+                                    speechErrorMessage = null
+                                )
+                            }
+                        }
                     }
                     throw ce
                 } catch (e: Exception) {
                     modelDir.deleteRecursively()
+                    if (movedExistingToBackup && backupDir.exists()) {
+                        if (!backupDir.renameTo(modelDir)) {
+                            backupDir.copyRecursively(modelDir, overwrite = true)
+                            backupDir.deleteRecursively()
+                        }
+                    }
                     val msg = "تعذر تنزيل نموذج ${language.arabicName}: ${e.localizedMessage ?: "خطأ في الشبكة"}"
                     updateLanguageState(language) {
                         it.copy(
@@ -415,6 +580,7 @@ class OfflineModelManager private constructor(
                 } finally {
                     tempZip.delete()
                     stagingDir.deleteRecursively()
+                    backupDir.deleteRecursively()
                     activeSpeechJobs.remove(language)
                 }
             }
@@ -462,36 +628,130 @@ class OfflineModelManager private constructor(
         return job
     }
 
+    fun cancelTranslationModelDownload(language: SubtitleTranslationLanguage) {
+        activeMlKitJobs.remove(language)?.cancel()
+        val hasBackgroundOp = inFlightMlKitOps[language]?.isActive == true
+        updateLanguageState(language) { current ->
+            if (current.translationStatus == OfflineModelDownloadStatus.READY) {
+                current
+            } else {
+                current.copy(
+                    translationStatus = OfflineModelDownloadStatus.NOT_DOWNLOADED,
+                    translationErrorMessage = null,
+                    translationStatusNote = if (hasBackgroundOp) {
+                        "تم إيقاف متابعة التنزيل داخل التطبيق؛ قد تواصل خدمة Google Play التنزيل في الخلفية وسيتم تحديث الحالة تلقائيًا."
+                    } else {
+                        null
+                    }
+                )
+            }
+        }
+    }
+
     suspend fun downloadTranslationModelBlocking(language: SubtitleTranslationLanguage): ModelOperationResult =
         withContext(Dispatchers.IO) {
             if (language == SubtitleTranslationLanguage.ENGLISH) {
                 updateLanguageState(language) {
-                    it.copy(translationStatus = OfflineModelDownloadStatus.READY, translationErrorMessage = null)
+                    it.copy(
+                        translationStatus = OfflineModelDownloadStatus.READY,
+                        translationErrorMessage = null,
+                        translationStatusNote = null
+                    )
                 }
                 return@withContext ModelOperationResult(true, "نموذج الإنجليزية مدمج وجاهز دائمًا")
             }
             val mlKitCode = language.mlKitCode
                 ?: return@withContext ModelOperationResult(false, "هذه اللغة غير مدعومة في الترجمة النصية المحلية")
 
-            mlKitDownloadMutex.withLock {
-                updateLanguageState(language) {
-                    it.copy(
-                        translationStatus = OfflineModelDownloadStatus.DOWNLOADING,
-                        translationErrorMessage = null
-                    )
-                }
-                try {
-                    mlKitBridge.downloadLanguageModel(mlKitCode)
+            mlKitMutexFor(language).withLock {
+                val checkResult = runCatching { mlKitBridge.getDownloadedLanguageCodes() }
+                val alreadyDownloaded = checkResult.getOrNull().orEmpty()
+                if (mlKitCode in alreadyDownloaded) {
                     updateLanguageState(language) {
                         it.copy(
                             translationStatus = OfflineModelDownloadStatus.READY,
-                            translationErrorMessage = null
+                            translationErrorMessage = null,
+                            translationStatusNote = null
+                        )
+                    }
+                    return@withContext ModelOperationResult(true, "حزمة ترجمة ${language.arabicName} جاهزة بالفعل محليًا")
+                }
+
+                updateLanguageState(language) {
+                    it.copy(
+                        translationStatus = OfflineModelDownloadStatus.DOWNLOADING,
+                        translationErrorMessage = null,
+                        translationStatusNote = null
+                    )
+                }
+
+                val existingOp = inFlightMlKitOps[language]?.takeIf { it.isActive }
+                val downloadOp = existingOp ?: scope.async {
+                    mlKitBridge.downloadLanguageModel(mlKitCode)
+                }.also { createdOp ->
+                    inFlightMlKitOps[language] = createdOp
+                    createdOp.invokeOnCompletion { throwable ->
+                        inFlightMlKitOps.remove(language, createdOp)
+                        if (throwable == null) {
+                            scope.launch {
+                                val confirmed = runCatching { mlKitBridge.getDownloadedLanguageCodes() }
+                                    .getOrNull()
+                                    ?.contains(mlKitCode) ?: true
+                                if (confirmed) {
+                                    updateLanguageState(language) { state ->
+                                        state.copy(
+                                            translationStatus = OfflineModelDownloadStatus.READY,
+                                            translationErrorMessage = null,
+                                            translationStatusNote = null
+                                        )
+                                    }
+                                }
+                            }
+                        } else if (activeMlKitJobs[language] == null && throwable !is CancellationException) {
+                            updateLanguageState(language) { state ->
+                                if (state.translationStatus == OfflineModelDownloadStatus.READY) state else {
+                                    state.copy(
+                                        translationStatus = OfflineModelDownloadStatus.NOT_DOWNLOADED,
+                                        translationStatusNote = null
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                try {
+                    downloadOp.await()
+                    updateLanguageState(language) {
+                        it.copy(
+                            translationStatus = OfflineModelDownloadStatus.READY,
+                            translationErrorMessage = null,
+                            translationStatusNote = null
                         )
                     }
                     ModelOperationResult(true, "تم تنزيل حزمة ترجمة ${language.arabicName} للعمل دون إنترنت")
                 } catch (ce: CancellationException) {
-                    updateLanguageState(language) {
-                        it.copy(translationStatus = OfflineModelDownloadStatus.NOT_DOWNLOADED)
+                    withContext(NonCancellable) {
+                        val downloadedAfterCancel = runCatching { mlKitBridge.getDownloadedLanguageCodes() }
+                            .getOrNull()
+                            .orEmpty()
+                        val stillInFlight = inFlightMlKitOps[language]?.isActive == true
+                        val resolvedStatus = if (mlKitCode in downloadedAfterCancel) {
+                            OfflineModelDownloadStatus.READY
+                        } else {
+                            OfflineModelDownloadStatus.NOT_DOWNLOADED
+                        }
+                        updateLanguageState(language) {
+                            it.copy(
+                                translationStatus = resolvedStatus,
+                                translationErrorMessage = null,
+                                translationStatusNote = if (resolvedStatus != OfflineModelDownloadStatus.READY && stillInFlight) {
+                                    "تم إيقاف متابعة التنزيل داخل التطبيق؛ قد تواصل خدمة Google Play التنزيل في الخلفية وسيتم تحديث الحالة تلقائيًا."
+                                } else {
+                                    null
+                                }
+                            )
+                        }
                     }
                     throw ce
                 } catch (e: Exception) {
@@ -499,7 +759,8 @@ class OfflineModelManager private constructor(
                     updateLanguageState(language) {
                         it.copy(
                             translationStatus = OfflineModelDownloadStatus.ERROR,
-                            translationErrorMessage = msg
+                            translationErrorMessage = msg,
+                            translationStatusNote = null
                         )
                     }
                     ModelOperationResult(false, msg)
@@ -641,6 +902,7 @@ class OfflineModelManager private constructor(
         urlString: String,
         destFile: File,
         fallbackTotalBytes: Long,
+        maxDownloadBytes: Long,
         onProgress: suspend (bytesRead: Long, totalBytes: Long) -> Unit
     ) {
         var currentUrl = urlString
@@ -649,7 +911,11 @@ class OfflineModelManager private constructor(
 
         while (true) {
             coroutineContext.ensureActive()
-            val connection = (URL(currentUrl).openConnection() as HttpURLConnection).apply {
+            val parsedUrl = URL(currentUrl)
+            if (!parsedUrl.protocol.equals("https", ignoreCase = true)) {
+                throw SecurityException("تم حظر التنزيل: يُسمح بروابط HTTPS المشفرة فقط")
+            }
+            val connection = (parsedUrl.openConnection() as HttpURLConnection).apply {
                 instanceFollowRedirects = false
                 connectTimeout = 20_000
                 readTimeout = 45_000
@@ -664,7 +930,11 @@ class OfflineModelManager private constructor(
                 if (location.isNullOrBlank() || redirects >= 5) {
                     throw IOException("فشل تتبع رابط التنزيل (رمز $code)")
                 }
-                currentUrl = URL(URL(currentUrl), location).toString()
+                val redirectedUrl = URL(parsedUrl, location)
+                if (!redirectedUrl.protocol.equals("https", ignoreCase = true)) {
+                    throw SecurityException("تم رفض إعادة توجيه غير آمنة (غير HTTPS) أثناء التنزيل")
+                }
+                currentUrl = redirectedUrl.toString()
                 redirects++
                 continue
             }
@@ -673,7 +943,12 @@ class OfflineModelManager private constructor(
                 throw IOException("استجابة خادم التنزيل غير صالحة (رمز الحالة: $code)")
             }
 
-            val totalBytes = connection.contentLengthLong.takeIf { it > 0L } ?: fallbackTotalBytes
+            val reportedBytes = connection.contentLengthLong
+            if (reportedBytes > maxDownloadBytes) {
+                connection.disconnect()
+                throw SecurityException("حجم الملف المُبلغ من الخادم يتجاوز الحد الأقصى الآمن المسموح به")
+            }
+            val totalBytes = reportedBytes.takeIf { it > 0L } ?: fallbackTotalBytes
             try {
                 BufferedInputStream(connection.inputStream).use { input ->
                     FileOutputStream(destFile).use { output ->
@@ -684,8 +959,11 @@ class OfflineModelManager private constructor(
                             coroutineContext.ensureActive()
                             val read = input.read(buffer)
                             if (read == -1) break
-                            output.write(buffer, 0, read)
                             copied += read
+                            if (copied > maxDownloadBytes) {
+                                throw SecurityException("تجاوز حجم التنزيل الحد الأقصى المسموح به للنموذج")
+                            }
+                            output.write(buffer, 0, read)
                             if (copied - lastUiUpdateBytes >= 256 * 1024 || copied >= totalBytes) {
                                 lastUiUpdateBytes = copied
                                 onProgress(copied, totalBytes)
@@ -701,13 +979,24 @@ class OfflineModelManager private constructor(
         }
     }
 
-    private suspend fun extractZipSafely(zipFile: File, targetDir: File) {
+    private suspend fun extractZipSafely(
+        zipFile: File,
+        targetDir: File,
+        maxExtractedBytes: Long
+    ) {
         val canonicalTarget = targetDir.canonicalPath
+        var entryCount = 0
+        var totalExtractedBytes = 0L
+
         ZipInputStream(BufferedInputStream(FileInputStream(zipFile))).use { zis ->
             val buffer = ByteArray(32 * 1024)
             var entry = zis.nextEntry
             while (entry != null) {
                 coroutineContext.ensureActive()
+                entryCount++
+                if (entryCount > MAX_ZIP_ENTRIES) {
+                    throw SecurityException("تجاوز عدد الملفات داخل الأرشيف الحد الأقصى المسموح به ($MAX_ZIP_ENTRIES)")
+                }
                 val outFile = File(targetDir, entry.name)
                 val canonicalOut = outFile.canonicalPath
                 if (!canonicalOut.startsWith(canonicalTarget + File.separator)) {
@@ -717,11 +1006,17 @@ class OfflineModelManager private constructor(
                     outFile.mkdirs()
                 } else {
                     outFile.parentFile?.mkdirs()
+                    var entryBytes = 0L
                     FileOutputStream(outFile).use { fos ->
                         while (true) {
                             coroutineContext.ensureActive()
                             val count = zis.read(buffer)
                             if (count == -1) break
+                            entryBytes += count
+                            totalExtractedBytes += count
+                            if (entryBytes > MAX_SINGLE_ENTRY_BYTES || totalExtractedBytes > maxExtractedBytes) {
+                                throw SecurityException("تجاوز حجم فك ضغط الأرشيف الحد الآمن المسموح به")
+                            }
                             fos.write(buffer, 0, count)
                         }
                     }
@@ -732,10 +1027,10 @@ class OfflineModelManager private constructor(
         }
     }
 
-    private fun locateVoskRootInExtracted(stagingDir: File): File? {
-        if (hasValidVoskStructure(stagingDir)) return stagingDir
+    private fun locateVoskRootInExtracted(stagingDir: File, minExpectedBytes: Long): File? {
+        if (hasValidVoskStructure(stagingDir, minExpectedBytes)) return stagingDir
         stagingDir.listFiles()?.forEach { child ->
-            if (child.isDirectory && hasValidVoskStructure(child)) {
+            if (child.isDirectory && hasValidVoskStructure(child, minExpectedBytes)) {
                 return child
             }
         }

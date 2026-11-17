@@ -235,8 +235,9 @@ class MlKitOfflineSubtitleTranslator(
                 .build()
             translator = Translation.getClient(options)
 
-            // Guarantee model pair is initialized inside ML Kit runtime before offline translation loop
-            translator.downloadModelIfNeeded(DownloadConditions.Builder().build()).awaitTaskResult()
+            if (downloadMissingModels) {
+                translator.downloadModelIfNeeded(DownloadConditions.Builder().build()).awaitTaskResult()
+            }
 
             val activeTranslator = translator
             val results = ArrayList<TranslatedCuePair>(cues.size)

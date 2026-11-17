@@ -152,6 +152,142 @@ class LocalSubtitleStore(
         }
     }
 
+    data class BackupStoredSubtitleTrack(
+        val videoKeyHash: String,
+        val trackId: String,
+        val trackName: String,
+        val language: String?,
+        val format: SubtitleFormat,
+        val content: String,
+        val updatedAtMs: Long
+    )
+
+    suspend fun exportAllStoredTracksForBackup(): List<BackupStoredSubtitleTrack> = withContext(Dispatchers.IO) {
+        mutex.withLock {
+            if (!subtitlesRootDir.exists() || !subtitlesRootDir.isDirectory) return@withLock emptyList()
+            val collected = mutableListOf<BackupStoredSubtitleTrack>()
+            subtitlesRootDir.listFiles()?.forEach { dir ->
+                if (!dir.isDirectory || dir.name.endsWith(".tmp")) return@forEach
+                val entries = readIndex(dir)
+                for (entry in entries) {
+                    val file = File(dir, entry.fileName)
+                    if (!file.exists() || !file.isFile || file.length() > 2L * 1024L * 1024L) continue
+                    val content = runCatching { file.readText(Charsets.UTF_8) }.getOrNull() ?: continue
+                    if (content.isBlank()) continue
+                    collected.add(
+                        BackupStoredSubtitleTrack(
+                            videoKeyHash = dir.name,
+                            trackId = entry.id,
+                            trackName = entry.name,
+                            language = entry.language,
+                            format = entry.format,
+                            content = content,
+                            updatedAtMs = entry.updatedAtMs
+                        )
+                    )
+                }
+            }
+            collected.sortedWith(compareBy({ it.videoKeyHash }, { it.trackId }))
+        }
+    }
+
+    internal var beforeCommitWriteHook: (() -> Unit)? = null
+
+    suspend fun replaceAllStoredTracksFromBackup(tracks: List<BackupStoredSubtitleTrack>) = withContext(Dispatchers.IO) {
+        mutex.withLock {
+            val safeHexRegex = Regex("^[a-fA-F0-9]{16,64}$")
+            val safeIdRegex = Regex("^[a-zA-Z0-9._-]{1,80}$")
+
+            val validTracks = tracks.filter { track ->
+                safeHexRegex.matches(track.videoKeyHash) &&
+                    safeIdRegex.matches(track.trackId) &&
+                    track.content.isNotBlank()
+            }
+
+            if (!subtitlesRootDir.exists()) {
+                subtitlesRootDir.mkdirs()
+            }
+
+            // Snapshot existing stored subtitle directories so mid-restore failure rolls back cleanly
+            val snapshot = LinkedHashMap<String, List<Pair<String, ByteArray>>>()
+            subtitlesRootDir.listFiles()?.forEach { dir ->
+                if (dir.isDirectory && !dir.name.endsWith(".tmp")) {
+                    val fileBytes = dir.listFiles()
+                        ?.filter { it.isFile }
+                        ?.map { it.name to it.readBytes() }
+                        .orEmpty()
+                    snapshot[dir.name] = fileBytes
+                }
+            }
+
+            try {
+                // Wipe all existing stored subtitle directories before restoring payload tracks
+                subtitlesRootDir.listFiles()?.forEach { child ->
+                    if (child.isDirectory && !child.name.endsWith(".tmp")) {
+                        if (!child.deleteRecursively()) {
+                            throw IllegalStateException("تعذر مسح مجلد الترجمات السابق: ${child.name}")
+                        }
+                    }
+                }
+
+                beforeCommitWriteHook?.invoke()
+
+                validTracks.groupBy { it.videoKeyHash }.forEach { (hash, group) ->
+                    val dir = File(subtitlesRootDir, hash)
+                    if (!dir.exists() && !dir.mkdirs()) {
+                        throw IllegalStateException("تعذر إنشاء مجلد استعادة الترجمات: $hash")
+                    }
+                    val entries = mutableListOf<StoredTrackEntry>()
+                    group.forEach { track ->
+                        val targetFormat = if (track.format == SubtitleFormat.WEBVTT) SubtitleFormat.WEBVTT else SubtitleFormat.SRT
+                        val ext = if (targetFormat == SubtitleFormat.WEBVTT) "vtt" else "srt"
+                        val fileName = "${track.trackId}.$ext"
+                        val outFile = File(dir, fileName)
+                        val tmpFile = File(dir, "$fileName.tmp")
+                        tmpFile.writeText(track.content, Charsets.UTF_8)
+                        if (!tmpFile.renameTo(outFile)) {
+                            outFile.writeText(track.content, Charsets.UTF_8)
+                            tmpFile.delete()
+                        }
+                        entries.removeAll { it.id == track.trackId }
+                        entries.add(
+                            StoredTrackEntry(
+                                id = track.trackId,
+                                name = track.trackName.ifBlank { "ترجمة محفوظة" },
+                                language = track.language,
+                                format = targetFormat,
+                                fileName = fileName,
+                                updatedAtMs = track.updatedAtMs
+                            )
+                        )
+                    }
+                    writeIndex(dir, entries)
+                }
+            } catch (t: Throwable) {
+                try {
+                    subtitlesRootDir.listFiles()?.forEach { child ->
+                        if (child.isDirectory && !child.name.endsWith(".tmp")) {
+                            child.deleteRecursively()
+                        }
+                    }
+                    snapshot.forEach { (dirName, files) ->
+                        val dir = File(subtitlesRootDir, dirName)
+                        dir.mkdirs()
+                        files.forEach { (fileName, bytes) ->
+                            File(dir, fileName).writeBytes(bytes)
+                        }
+                    }
+                } catch (rollbackErr: Throwable) {
+                    t.addSuppressed(rollbackErr)
+                }
+                throw t
+            }
+        }
+    }
+
+    suspend fun restoreStoredTracksFromBackup(tracks: List<BackupStoredSubtitleTrack>) =
+        replaceAllStoredTracksFromBackup(tracks)
+
     private data class StoredTrackEntry(
         val id: String,
         val name: String,

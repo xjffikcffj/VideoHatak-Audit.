@@ -505,7 +505,7 @@ fun LibraryScreen(
                                     modifier = Modifier.weight(1f)
                                 )
                                 Button(
-                                    onClick = { onPlayPlaylist(playlist.id, null, false) },
+                                    onClick = { onPlayPlaylist(playlist.id, null, playbackMode.shuffleEnabled) },
                                     colors = ButtonDefaults.buttonColors(
                                         containerColor = palette.accent,
                                         contentColor = MaterialTheme.colorScheme.onPrimary
@@ -527,7 +527,7 @@ fun LibraryScreen(
                                     Card(
                                         modifier = Modifier
                                             .fillMaxWidth()
-                                            .clickable { onPlayPlaylist(playlist.id, item.videoId, false) },
+                                            .clickable { onPlayPlaylist(playlist.id, item.videoId, playbackMode.shuffleEnabled) },
                                         shape = RoundedCornerShape(12.dp),
                                         colors = CardDefaults.cardColors(containerColor = palette.surface),
                                         border = BorderStroke(0.75.dp, palette.border.copy(alpha = 0.6f))

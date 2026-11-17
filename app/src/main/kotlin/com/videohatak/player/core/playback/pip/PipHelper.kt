@@ -150,14 +150,40 @@ class PipHelper(private val context: Context) {
     fun updatePipActions(
         activity: Activity,
         isPlaying: Boolean,
-        seekIntervalSeconds: Int = 10
+        seekIntervalSeconds: Int = 10,
+        videoWidth: Int = 16,
+        videoHeight: Int = 9
     ) {
-        if (!isPipSupported() || Build.VERSION.SDK_INT < Build.VERSION_CODES.O || activity.isFinishing) return
+        if (!isPipSupported() ||
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.O ||
+            activity.isFinishing ||
+            (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1 && activity.isDestroyed)
+        ) {
+            return
+        }
         try {
-            val params = PictureInPictureParams.Builder()
-                .setActions(buildActions(context, isPlaying, seekIntervalSeconds))
-                .build()
+            val params = buildUpdatePipParams(
+                activity = activity,
+                isPlaying = isPlaying,
+                seekIntervalSeconds = seekIntervalSeconds,
+                videoWidth = videoWidth,
+                videoHeight = videoHeight
+            )
             activity.setPictureInPictureParams(params)
         } catch (_: Exception) {}
+    }
+
+    internal fun buildUpdatePipParams(
+        activity: Activity,
+        isPlaying: Boolean,
+        seekIntervalSeconds: Int = 10,
+        videoWidth: Int = 16,
+        videoHeight: Int = 9
+    ): PictureInPictureParams {
+        val ratio = getValidAspectRatio(videoWidth, videoHeight)
+        return PictureInPictureParams.Builder()
+            .setAspectRatio(ratio)
+            .setActions(buildActions(activity, isPlaying, seekIntervalSeconds))
+            .build()
     }
 }

@@ -178,7 +178,11 @@ class EncryptedVaultDataSource(
         }
 
         val bytesToCopy = minOf(requestedLength.toLong(), header.plaintextSizeBytes - currentPosition).toInt()
-        val chunkIndex = (currentPosition / header.chunkSize).toInt()
+        val rawChunkIndex = currentPosition / header.chunkSize
+        if (rawChunkIndex < 0L || rawChunkIndex > Int.MAX_VALUE.toLong()) {
+            throw IOException("Encrypted position exceeds supported chunk index bounds")
+        }
+        val chunkIndex = rawChunkIndex.toInt()
         val offsetInChunk = (currentPosition % header.chunkSize).toInt()
 
         val plainChunk: ByteArray = if (chunkIndex == cachedChunkIndex && cachedChunk != null) {
@@ -192,8 +196,14 @@ class EncryptedVaultDataSource(
             decrypted
         }
 
+        if (offsetInChunk !in plainChunk.indices) {
+            return -1
+        }
         val availableInChunk = plainChunk.size - offsetInChunk
         val actualCopy = minOf(bytesToCopy, availableInChunk)
+        if (actualCopy <= 0) {
+            return -1
+        }
 
         System.arraycopy(plainChunk, offsetInChunk, outBuffer, outOffset, actualCopy)
         currentPosition += actualCopy

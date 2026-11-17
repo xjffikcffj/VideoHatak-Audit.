@@ -119,7 +119,6 @@ fun PlayerControlsOverlay(
     onSpeedClick: () -> Unit,
     onSelectSpeed: (Float) -> Unit = {},
     onSelectPlaybackMode: (PlaybackMode) -> Unit = {},
-    onCycleRepeatMode: () -> Unit = {},
     isFavorite: Boolean = false,
     onAddToPlaylist: () -> Unit = {},
     onToggleFavorite: () -> Unit = {},

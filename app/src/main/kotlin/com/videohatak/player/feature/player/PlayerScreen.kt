@@ -145,6 +145,9 @@ fun PlayerScreen(
     val translationEngineMode by viewModel.translationEngineMode.collectAsStateWithLifecycle()
     val offlineModelStates by viewModel.offlineModelStates.collectAsStateWithLifecycle()
     val detectedAudioLanguage by viewModel.detectedVideoAudioLanguage.collectAsStateWithLifecycle()
+    val availableAudioTracks by viewModel.availableAudioTracks.collectAsStateWithLifecycle()
+    val selectedAudioTrackIndex by viewModel.selectedAudioTrackIndex.collectAsStateWithLifecycle()
+    val isPlaylistLoadPending by viewModel.isPlaylistLoadPending.collectAsStateWithLifecycle()
 
     var isSubtitlesDialogVisible by remember { mutableStateOf(false) }
     var trackForLocalEdit by remember { mutableStateOf<SubtitleTrack?>(null) }
@@ -277,7 +280,7 @@ fun PlayerScreen(
     }
 
     LaunchedEffect(video.contentUri) {
-        if (uiState.mediaUri != video.contentUri) {
+        if (!isPlaylistLoadPending && uiState.mediaUri != video.contentUri) {
             if (contextVideos.size > 1) {
                 viewModel.playVideoInContext(video, contextVideos)
             } else {
@@ -784,7 +787,6 @@ fun PlayerScreen(
                     statusBannerText = "السرعة ${VideoPlayerManager.formatSpeedLabel(speed)}"
                 },
                 onSelectPlaybackMode = viewModel::setPlaybackMode,
-                onCycleRepeatMode = viewModel::cycleRepeatMode,
                 isFavorite = isFavorite,
                 onAddToPlaylist = {
                     if (isVaultVideo) {
@@ -1018,10 +1020,14 @@ fun PlayerScreen(
                 onEngineModeChange = viewModel::setTranslationEngineMode,
                 offlineModelStates = offlineModelStates,
                 detectedAudioLanguage = detectedAudioLanguage,
+                availableAudioTracks = availableAudioTracks,
+                selectedAudioTrackIndex = selectedAudioTrackIndex,
+                onSelectAudioTrack = viewModel::selectAudioTrackIndex,
                 onDownloadSpeechModel = viewModel::downloadSpeechModel,
                 onCancelSpeechDownload = viewModel::cancelSpeechModelDownload,
                 onDeleteSpeechModel = viewModel::deleteSpeechModel,
                 onDownloadTranslationModel = viewModel::downloadTranslationModel,
+                onCancelTranslationDownload = viewModel::cancelTranslationModelDownload,
                 onDeleteTranslationModel = viewModel::deleteTranslationModel,
                 onDownloadRequiredPair = viewModel::downloadRequiredModelsForPair
             )

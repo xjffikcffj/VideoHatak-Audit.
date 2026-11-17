@@ -266,6 +266,11 @@ class VideoPlayerManager internal constructor(
                     _uiState.value.playbackMode == PlaybackMode.STOP_AFTER_CURRENT
                 ) {
                     exoPlayer.pause()
+                    val currentIndex = exoPlayer.currentMediaItemIndex
+                    val baseId = if (!mediaItem.mediaId.isNullOrEmpty()) mediaItem.mediaId else mediaItem.localConfiguration?.uri?.toString() ?: ""
+                    val transitionKey = "${baseId}_#${currentIndex}"
+                    restorationCoordinator.onMediaItemTransition(transitionKey, isRepeat = false)
+                    lastReportedPositionMs = 0L
                     val stoppedUri = mediaItem.localConfiguration?.uri
                     val stoppedTitle = internalTitlesByMediaKey[mediaItem.mediaId]
                         ?: internalTitlesByMediaKey[stoppedUri?.toString().orEmpty()]
@@ -281,6 +286,7 @@ class VideoPlayerManager internal constructor(
                             hasPreviousMediaItem = exoPlayer.hasPreviousMediaItem()
                         )
                     }
+                    onMediaTransition?.invoke(mediaItem.mediaId)
                     return
                 }
 
@@ -474,13 +480,6 @@ class VideoPlayerManager internal constructor(
                 .build()
         }
 
-        setRepeatMode(repeatMode)
-        exoPlayer.shuffleModeEnabled = shuffle
-        try {
-            exoPlayer.pauseAtEndOfMediaItems = _uiState.value.playbackMode.stopAfterCurrent
-        } catch (_: Throwable) {
-        }
-
         lastReportedPositionMs = startPositionMs
 
         setAudioOnlyMode(false)
@@ -498,7 +497,25 @@ class VideoPlayerManager internal constructor(
             )
         }
 
+        // Apply media items first so ExoPlayer does not reset ShuffleOrder afterward
         exoPlayer.setMediaItems(mediaItems, validStartIndex, startPositionMs)
+        setRepeatMode(repeatMode)
+        exoPlayer.shuffleModeEnabled = shuffle
+        if (shuffle && mediaItems.size > 1) {
+            runCatching {
+                exoPlayer.setShuffleOrder(
+                    androidx.media3.exoplayer.source.ShuffleOrder.DefaultShuffleOrder(
+                        mediaItems.size,
+                        System.nanoTime()
+                    )
+                )
+            }
+        }
+        try {
+            exoPlayer.pauseAtEndOfMediaItems = _uiState.value.playbackMode.stopAfterCurrent
+        } catch (_: Throwable) {
+        }
+
         _uiState.update {
             it.copy(
                 hasNextMediaItem = exoPlayer.hasNextMediaItem(),
@@ -532,6 +549,16 @@ class VideoPlayerManager internal constructor(
             PlaylistRepeatMode.ALL -> Player.REPEAT_MODE_ALL
         }
         exoPlayer.shuffleModeEnabled = mode.shuffleEnabled
+        if (mode.shuffleEnabled && exoPlayer.mediaItemCount > 1) {
+            runCatching {
+                exoPlayer.setShuffleOrder(
+                    androidx.media3.exoplayer.source.ShuffleOrder.DefaultShuffleOrder(
+                        exoPlayer.mediaItemCount,
+                        System.nanoTime()
+                    )
+                )
+            }
+        }
         try {
             exoPlayer.pauseAtEndOfMediaItems = mode.stopAfterCurrent
         } catch (_: Throwable) {
@@ -549,6 +576,22 @@ class VideoPlayerManager internal constructor(
 
     fun setShuffle(shuffle: Boolean) {
         exoPlayer.shuffleModeEnabled = shuffle
+        if (shuffle && exoPlayer.mediaItemCount > 1) {
+            runCatching {
+                exoPlayer.setShuffleOrder(
+                    androidx.media3.exoplayer.source.ShuffleOrder.DefaultShuffleOrder(
+                        exoPlayer.mediaItemCount,
+                        System.nanoTime()
+                    )
+                )
+            }
+        }
+        _uiState.update {
+            it.copy(
+                hasNextMediaItem = exoPlayer.hasNextMediaItem(),
+                hasPreviousMediaItem = exoPlayer.hasPreviousMediaItem()
+            )
+        }
     }
 
     fun setResumeModeUi(mode: ResumeMode) {

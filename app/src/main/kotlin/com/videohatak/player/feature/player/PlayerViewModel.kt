@@ -29,6 +29,7 @@ import com.videohatak.player.core.subtitle.parser.SubtitleParser
 import com.videohatak.player.core.subtitle.repository.LocalSubtitleStore
 import com.videohatak.player.core.subtitle.repository.SubtitlePreferencesRepository
 import com.videohatak.player.core.subtitle.speech.VideoAudioPcmDecoder
+import com.videohatak.player.core.subtitle.speech.VideoAudioTrackOption
 import com.videohatak.player.core.subtitle.speech.VoskRecognitionException
 import com.videohatak.player.core.subtitle.speech.VoskSpeechToSubtitleEngine
 import com.videohatak.player.core.subtitle.translation.AudioTrackExtractor
@@ -84,8 +85,14 @@ class PlayerViewModel(
     private val safeOfflineModelManager: OfflineModelManager? =
         offlineModelManager ?: try { OfflineModelManager.getInstance(application) } catch (_: Throwable) { null }
 
-    var currentVideo: VideoItem? = null
-        private set
+    private val _currentVideo = MutableStateFlow<VideoItem?>(null)
+    val currentVideoFlow: StateFlow<VideoItem?> = _currentVideo.asStateFlow()
+
+    var currentVideo: VideoItem?
+        get() = _currentVideo.value
+        private set(value) {
+            _currentVideo.value = value
+        }
 
     private val playlistRepository by lazy { PlaylistRepositoryImpl(getApplication()) }
     private var playlistVideos: List<VideoItem> = emptyList()
@@ -111,6 +118,18 @@ class PlayerViewModel(
     private val _detectedVideoAudioLanguage = MutableStateFlow<SubtitleTranslationLanguage?>(null)
     val detectedVideoAudioLanguage: StateFlow<SubtitleTranslationLanguage?> =
         _detectedVideoAudioLanguage.asStateFlow()
+
+    private val _availableAudioTracks = MutableStateFlow<List<VideoAudioTrackOption>>(emptyList())
+    val availableAudioTracks: StateFlow<List<VideoAudioTrackOption>> =
+        _availableAudioTracks.asStateFlow()
+
+    private val _selectedAudioTrackIndex = MutableStateFlow<Int?>(null)
+    val selectedAudioTrackIndex: StateFlow<Int?> =
+        _selectedAudioTrackIndex.asStateFlow()
+
+    private val _isPlaylistLoadPending = MutableStateFlow(false)
+    val isPlaylistLoadPending: StateFlow<Boolean> =
+        _isPlaylistLoadPending.asStateFlow()
 
     private val _subtitleFeedbackMessage = MutableStateFlow<String?>(null)
     val subtitleFeedbackMessage: StateFlow<String?> = _subtitleFeedbackMessage.asStateFlow()
@@ -355,46 +374,68 @@ class PlayerViewModel(
         }
     }
 
-    fun playPlaylist(playlistId: Long, startVideoId: Long?, shuffle: Boolean) {
+    fun playPlaylist(
+        playlistId: Long,
+        startVideoId: Long?,
+        shuffle: Boolean = playerManager.uiState.value.playbackMode.shuffleEnabled,
+        onPlaylistStarted: ((VideoItem) -> Unit)? = null
+    ) {
         viewModelScope.launch {
-            val rawItems = playlistRepository.getPlaylistItems(playlistId).filter { it.isAvailable }
-            if (rawItems.isEmpty()) return@launch
-            val videoItems = rawItems.map { it.toVideoItem() }
-            playlistVideos = videoItems
+            _isPlaylistLoadPending.value = true
+            try {
+                val rawItems = playlistRepository.getPlaylistItems(playlistId).filter { it.isAvailable }
+                if (rawItems.isEmpty()) return@launch
+                val videoItems = rawItems.map { it.toVideoItem() }
+                playlistVideos = videoItems
 
-            val startIndex = if (startVideoId != null) {
-                videoItems.indexOfFirst { it.id == startVideoId }.coerceAtLeast(0)
-            } else 0
+                val activeMode = playerManager.uiState.value.playbackMode
+                val effectiveShuffle = shuffle || activeMode.shuffleEnabled
+                val effectiveMode = if (shuffle && !activeMode.shuffleEnabled) {
+                    PlaybackMode.SHUFFLE_ALL.also { setPlaybackMode(it) }
+                } else {
+                    activeMode
+                }
 
-            val startVideo = videoItems[startIndex]
-            currentVideo = startVideo
-            _pendingResumePrompt.value = null
-            safeThumbnailManager?.setVideoUri(startVideo.contentUri)
+                val startIndex = if (startVideoId != null) {
+                    videoItems.indexOfFirst { it.id == startVideoId }.coerceAtLeast(0)
+                } else if (effectiveShuffle && videoItems.size > 1) {
+                    kotlin.random.Random.nextInt(videoItems.size)
+                } else {
+                    0
+                }
 
-            val targetUri = startVideo.contentUri.toString()
-            val activeMode = playerManager.uiState.value.playbackMode
-            val effectiveRepeatMode = if (shuffle && activeMode.repeatModeEquivalent == PlaylistRepeatMode.OFF) {
-                PlaylistRepeatMode.ALL
-            } else {
-                activeMode.repeatModeEquivalent
+                val startVideo = videoItems[startIndex]
+                currentVideo = startVideo
+                _pendingResumePrompt.value = null
+                safeThumbnailManager?.setVideoUri(startVideo.contentUri)
+
+                val targetUri = startVideo.contentUri.toString()
+                val effectiveRepeatMode = if (effectiveShuffle && effectiveMode.repeatModeEquivalent == PlaylistRepeatMode.OFF) {
+                    PlaylistRepeatMode.ALL
+                } else {
+                    effectiveMode.repeatModeEquivalent
+                }
+                playerManager.playPlaylist(
+                    items = videoItems,
+                    startIndex = startIndex,
+                    shuffle = effectiveShuffle,
+                    repeatMode = effectiveRepeatMode,
+                    startPositionMs = 0L
+                )
+                onPlaylistStarted?.invoke(startVideo)
+                val targetGen = playerManager.getCurrentPlaybackGeneration()
+
+                loadSavedSubtitlesForVideo(targetUri)
+                handlePositionRestorationForMode(
+                    videoTitle = startVideo.safeTitle,
+                    targetUri = targetUri,
+                    targetGeneration = targetGen,
+                    durationMs = startVideo.durationMs,
+                    legacyVideoId = startVideo.id
+                )
+            } finally {
+                _isPlaylistLoadPending.value = false
             }
-            playerManager.playPlaylist(
-                items = videoItems,
-                startIndex = startIndex,
-                shuffle = shuffle,
-                repeatMode = effectiveRepeatMode,
-                startPositionMs = 0L
-            )
-            val targetGen = playerManager.getCurrentPlaybackGeneration()
-
-            loadSavedSubtitlesForVideo(targetUri)
-            handlePositionRestorationForMode(
-                videoTitle = startVideo.safeTitle,
-                targetUri = targetUri,
-                targetGeneration = targetGen,
-                durationMs = startVideo.durationMs,
-                legacyVideoId = startVideo.id
-            )
         }
     }
 
@@ -714,11 +755,21 @@ class PlayerViewModel(
 
     fun inspectVideoAudioLanguage(context: Context, videoUri: Uri) {
         viewModelScope.launch {
-            val detected = runCatching {
-                VideoAudioPcmDecoder.inspectAudioTrack(context, videoUri).detectedTrackLanguage
-            }.getOrNull()
-            _detectedVideoAudioLanguage.value = detected
+            val tracks = runCatching {
+                VideoAudioPcmDecoder.inspectAudioTracks(context, videoUri)
+            }.getOrDefault(emptyList())
+            _availableAudioTracks.value = tracks
+            val currentIdx = _selectedAudioTrackIndex.value
+            val chosen = tracks.firstOrNull { it.trackIndex == currentIdx } ?: tracks.firstOrNull()
+            _selectedAudioTrackIndex.value = chosen?.trackIndex
+            _detectedVideoAudioLanguage.value = chosen?.detectedLanguage
         }
+    }
+
+    fun selectAudioTrackIndex(trackIndex: Int) {
+        _selectedAudioTrackIndex.value = trackIndex
+        val matching = _availableAudioTracks.value.firstOrNull { it.trackIndex == trackIndex }
+        _detectedVideoAudioLanguage.value = matching?.detectedLanguage
     }
 
     fun computeOfflinePairReadiness(
@@ -749,6 +800,10 @@ class PlayerViewModel(
     fun downloadTranslationModel(language: SubtitleTranslationLanguage) {
         val manager = safeOfflineModelManager ?: return
         manager.startTranslationModelDownload(language)
+    }
+
+    fun cancelTranslationModelDownload(language: SubtitleTranslationLanguage) {
+        safeOfflineModelManager?.cancelTranslationModelDownload(language)
     }
 
     fun deleteTranslationModel(language: SubtitleTranslationLanguage) {
@@ -947,7 +1002,7 @@ class PlayerViewModel(
                     sourceLanguage = sourceLanguage,
                     targetLanguage = targetLanguage,
                     glossary = glossary,
-                    downloadMissingModels = true
+                    downloadMissingModels = false
                 ) { done, total, label ->
                     val fraction = if (total > 0) (done.toFloat() / total.toFloat()).coerceIn(0.05f, 1f) else 1f
                     _translationStatus.value = TranslationJobStatus.Running(
@@ -970,6 +1025,7 @@ class PlayerViewModel(
             }
 
             SubtitleSourceMode.VIDEO_AUDIO_EXTRACTION -> {
+                val selectedAudioTrackIdx = _selectedAudioTrackIndex.value
                 val resolvedAudioLang = if (sourceLanguage != SubtitleTranslationLanguage.AUTO) {
                     sourceLanguage
                 } else {
@@ -979,7 +1035,11 @@ class PlayerViewModel(
                         totalBatches = 100,
                         phaseLabel = "جاري فحص بيانات المسار الصوتي لاكتشاف لغة الفيديو..."
                     )
-                    val meta = VideoAudioPcmDecoder.inspectAudioTrack(context, videoUri)
+                    val meta = VideoAudioPcmDecoder.inspectAudioTrack(
+                        context = context,
+                        videoUri = videoUri,
+                        selectedTrackIndex = selectedAudioTrackIdx
+                    )
                     _detectedVideoAudioLanguage.value = meta.detectedTrackLanguage
                     meta.detectedTrackLanguage
                 }
@@ -991,17 +1051,24 @@ class PlayerViewModel(
                     return
                 }
 
-                // Automatically download Vosk speech model if user has not downloaded it yet
                 if (modelManager.getVerifiedSpeechModelDirectory(resolvedAudioLang) == null) {
-                    _translationStatus.value = TranslationJobStatus.Running(
-                        progress = 0.06f,
-                        completedBatches = 0,
-                        totalBatches = 100,
-                        phaseLabel = "جاري تنزيل نموذج التفريغ الصوتي لـ ${resolvedAudioLang.arabicName} داخل ذاكرة التطبيق..."
+                    _translationStatus.value = TranslationJobStatus.Error(
+                        "نموذج التفريغ الصوتي للغة ${resolvedAudioLang.arabicName} غير محمّل في ذاكرة التطبيق. يرجى تأكيد تنزيله أولًا دون أي تنزيل صامت."
                     )
-                    val dlRes = modelManager.downloadSpeechModelBlocking(resolvedAudioLang)
-                    if (!dlRes.success) {
-                        _translationStatus.value = TranslationJobStatus.Error(dlRes.message)
+                    return
+                }
+
+                if (resolvedAudioLang != targetLanguage) {
+                    val mlKitReadiness = modelManager.computePairReadiness(
+                        sourceMode = SubtitleSourceMode.EXISTING_SUBTITLE,
+                        sourceLanguage = resolvedAudioLang,
+                        targetLanguage = targetLanguage
+                    )
+                    if (mlKitReadiness.missingMlKitLanguages.isNotEmpty()) {
+                        val missingNames = mlKitReadiness.missingMlKitLanguages.joinToString("، ") { it.arabicName }
+                        _translationStatus.value = TranslationJobStatus.Error(
+                            "يلزم تنزيل حزمة الترجمة النصية للغة ($missingNames) بموافقتك قبل بدء التفريغ والترجمة دون إنترنت."
+                        )
                         return
                     }
                 }
@@ -1010,7 +1077,8 @@ class PlayerViewModel(
                 val transcribedCues = voskEngine.transcribeVideoAudioToCues(
                     context = context,
                     videoUri = videoUri,
-                    sourceLanguage = resolvedAudioLang
+                    sourceLanguage = resolvedAudioLang,
+                    selectedAudioTrackIndex = selectedAudioTrackIdx
                 ) { fraction, label ->
                     val scaled = (0.08f + fraction * 0.52f).coerceIn(0.08f, 0.60f)
                     _translationStatus.value = TranslationJobStatus.Running(
@@ -1033,7 +1101,7 @@ class PlayerViewModel(
                     sourceLanguage = resolvedAudioLang,
                     targetLanguage = targetLanguage,
                     glossary = glossary,
-                    downloadMissingModels = true
+                    downloadMissingModels = false
                 ) { done, total, label ->
                     val subFrac = if (total > 0) done.toFloat() / total.toFloat() else 1f
                     val scaled = (0.62f + subFrac * 0.38f).coerceIn(0.62f, 1f)
@@ -1115,7 +1183,11 @@ class PlayerViewModel(
                     totalBatches = 3,
                     phaseLabel = "جاري استخراج مسار الصوت محليًا من الفيديو..."
                 )
-                val extractedAudio = AudioTrackExtractor.extractAudioWithMetadataToTempM4a(context, videoUri)
+                val extractedAudio = AudioTrackExtractor.extractAudioWithMetadataToTempM4a(
+                    context = context,
+                    videoUri = videoUri,
+                    selectedTrackIndex = _selectedAudioTrackIndex.value
+                )
                 val tempAudio = extractedAudio.file
                 try {
                     _translationStatus.value = TranslationJobStatus.Running(

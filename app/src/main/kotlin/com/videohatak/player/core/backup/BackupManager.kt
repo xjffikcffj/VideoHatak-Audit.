@@ -2,6 +2,8 @@ package com.videohatak.player.core.backup
 
 import android.content.Context
 import android.net.Uri
+import android.provider.DocumentsContract
+import android.provider.OpenableColumns
 import com.videohatak.player.core.designsystem.theme.AppThemeId
 import com.videohatak.player.core.designsystem.theme.ThemeMode
 import com.videohatak.player.core.designsystem.theme.ThemePreferencesRepository
@@ -26,7 +28,12 @@ import com.videohatak.player.core.vault.security.VaultSecurityPreferences
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
+import java.io.BufferedOutputStream
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.security.MessageDigest
+import java.util.Locale
 
 data class BackupSettingsData(
     val selectedTheme: AppThemeId,
@@ -140,20 +147,135 @@ class BackupManager internal constructor(
         runCatching {
             val nonNullContext = requireNotNull(context) { "Context is required for exportToUri" }
             val payload = captureCurrentPayload()
+            val stagingDir = File(nonNullContext.cacheDir, "backup_staging")
+            try {
+                exportPayloadViaTempFile(payload, stagingDir) { tempFile, _ ->
+                    nonNullContext.contentResolver.openOutputStream(uri, "wt")?.use { out ->
+                        FileInputStream(tempFile).use { input ->
+                            input.copyTo(out)
+                        }
+                        out.flush()
+                    } ?: throw IllegalStateException("تعذر فتح ملف التصدير للكتابة")
+                }
+            } catch (t: Throwable) {
+                cleanupEmptyExportUriOnFailure(nonNullContext, uri)
+                throw t
+            }
+        }
+    }
+
+    suspend fun exportToFile(
+        targetFile: File,
+        tempDir: File = File(targetFile.parentFile ?: File("."), ".backup_staging")
+    ): Result<BackupExportSummary> = withContext(Dispatchers.IO) {
+        runCatching {
+            val payload = captureCurrentPayload()
+            exportPayloadToFileInternal(payload, targetFile, tempDir)
+        }
+    }
+
+    internal suspend fun exportPayloadToFile(
+        payload: BackupPayload,
+        targetFile: File,
+        tempDir: File = File(targetFile.parentFile ?: File("."), ".backup_staging")
+    ): Result<BackupExportSummary> = withContext(Dispatchers.IO) {
+        runCatching {
+            exportPayloadToFileInternal(payload, targetFile, tempDir)
+        }
+    }
+
+    private fun exportPayloadToFileInternal(
+        payload: BackupPayload,
+        targetFile: File,
+        tempDir: File
+    ): BackupExportSummary {
+        return exportPayloadViaTempFile(payload, tempDir) { tempFile, _ ->
+            targetFile.parentFile?.mkdirs()
+            val stageDest = File(targetFile.parentFile ?: tempDir, "${targetFile.name}.partial")
+            try {
+                FileInputStream(tempFile).use { input ->
+                    FileOutputStream(stageDest).use { output ->
+                        input.copyTo(output)
+                        output.flush()
+                    }
+                }
+                if (!stageDest.renameTo(targetFile)) {
+                    FileInputStream(stageDest).use { input ->
+                        FileOutputStream(targetFile).use { output ->
+                            input.copyTo(output)
+                            output.flush()
+                        }
+                    }
+                }
+            } finally {
+                runCatching { stageDest.delete() }
+            }
+        }
+    }
+
+    private fun exportPayloadViaTempFile(
+        payload: BackupPayload,
+        tempDir: File,
+        commitTempFile: (tempFile: File, byteCount: Long) -> Unit
+    ): BackupExportSummary {
+        if (!tempDir.exists() && !tempDir.mkdirs()) {
+            throw IllegalStateException("تعذر إنشاء مجلد التحضير المؤقت للنسخة الاحتياطية")
+        }
+        val tempFile = File.createTempFile("videohatak_backup_", ".json.tmp", tempDir)
+        try {
             val json = serializeBackupJson(payload)
             val bytes = json.toByteArray(Charsets.UTF_8)
-            nonNullContext.contentResolver.openOutputStream(uri, "wt")?.use { out ->
-                out.write(bytes)
-                out.flush()
-            } ?: throw IllegalStateException("تعذر فتح ملف التصدير للكتابة")
-
-            BackupExportSummary(
+            BufferedOutputStream(FileOutputStream(tempFile)).use { bos ->
+                bos.write(bytes)
+                bos.flush()
+            }
+            val actualBytes = tempFile.length()
+            if (actualBytes > MAX_BACKUP_BYTES.toLong()) {
+                throw IllegalArgumentException(formatBackupSizeExceededMessage(actualBytes))
+            }
+            commitTempFile(tempFile, actualBytes)
+            return BackupExportSummary(
                 playlistCount = payload.playlists.size,
                 playlistItemCount = payload.playlists.sumOf { it.items.size },
-                byteSize = bytes.size,
+                byteSize = actualBytes.toInt(),
                 resumePositionCount = payload.resumePositions.size,
                 localSubtitleTrackCount = payload.localSubtitles.size
             )
+        } finally {
+            runCatching { tempFile.delete() }
+        }
+    }
+
+    private fun cleanupEmptyExportUriOnFailure(context: Context, uri: Uri) {
+        runCatching {
+            when (uri.scheme?.lowercase()) {
+                "file" -> {
+                    val file = uri.path?.let(::File)
+                    if (file != null && file.exists() && file.length() == 0L) {
+                        file.delete()
+                    }
+                }
+                "content" -> {
+                    var docSize: Long? = null
+                    context.contentResolver.query(
+                        uri,
+                        arrayOf(OpenableColumns.SIZE),
+                        null,
+                        null,
+                        null
+                    )?.use { cursor ->
+                        if (cursor.moveToFirst()) {
+                            val idx = cursor.getColumnIndex(OpenableColumns.SIZE)
+                            if (idx != -1 && !cursor.isNull(idx)) {
+                                docSize = cursor.getLong(idx)
+                            }
+                        }
+                    }
+                    if (docSize == 0L) {
+                        DocumentsContract.deleteDocument(context.contentResolver, uri)
+                    }
+                }
+            }
         }
     }
 
@@ -164,6 +286,27 @@ class BackupManager internal constructor(
                 readBoundedUtf8Stream(input, MAX_BACKUP_BYTES)
             } ?: throw IllegalStateException("تعذر قراءة ملف النسخة الاحتياطية")
 
+            when (val parsed = parseAndValidateBackupJson(rawJson)) {
+                is BackupParseResult.Error -> throw IllegalArgumentException(parsed.message)
+                is BackupParseResult.Success -> {
+                    applyPayload(parsed.payload)
+                    BackupRestoreSummary(
+                        playlistCount = parsed.payload.playlists.size,
+                        playlistItemCount = parsed.payload.playlists.sumOf { it.items.size },
+                        themeRestored = parsed.payload.settings.selectedTheme,
+                        resumePositionCount = parsed.payload.resumePositions.size,
+                        localSubtitleTrackCount = parsed.payload.localSubtitles.size
+                    )
+                }
+            }
+        }
+    }
+
+    suspend fun importFromFile(sourceFile: File): Result<BackupRestoreSummary> = withContext(Dispatchers.IO) {
+        runCatching {
+            val rawJson = FileInputStream(sourceFile).use { input ->
+                readBoundedUtf8Stream(input, MAX_BACKUP_BYTES)
+            }
             when (val parsed = parseAndValidateBackupJson(rawJson)) {
                 is BackupParseResult.Error -> throw IllegalArgumentException(parsed.message)
                 is BackupParseResult.Success -> {
@@ -319,10 +462,25 @@ class BackupManager internal constructor(
         const val SCHEMA_VERSION = 3
         val SUPPORTED_SCHEMA_VERSIONS = setOf(1, 2, 3)
         const val MAX_BACKUP_BYTES = 16 * 1024 * 1024
+        private const val MAX_BACKUP_MB = MAX_BACKUP_BYTES / (1024 * 1024)
         private const val MAX_PLAYLISTS = 200
         private const val MAX_ITEMS_PER_PLAYLIST = 2_000
         private const val MAX_RESUME_POSITIONS = 5_000
         private const val MAX_SUBTITLE_TRACKS = 500
+
+        internal fun formatBackupSizeExceededMessage(actualBytes: Long? = null): String {
+            return if (actualBytes != null && actualBytes > MAX_BACKUP_BYTES.toLong()) {
+                val actualMb = String.format(Locale.US, "%.2f", actualBytes / (1024.0 * 1024.0))
+                val sizeLabel = if (actualMb == "$MAX_BACKUP_MB.00") {
+                    "$actualBytes بايت"
+                } else {
+                    "$actualMb MB"
+                }
+                "حجم ملف النسخة الاحتياطية ($sizeLabel) يتجاوز الحد الأقصى المسموح به ($MAX_BACKUP_MB MB). يُرجى تقليل عدد مسارات الترجمة أو قوائم التشغيل والمحاولة مجددًا."
+            } else {
+                "حجم ملف النسخة الاحتياطية يتجاوز الحد الأقصى المسموح به ($MAX_BACKUP_MB MB)"
+            }
+        }
 
         private fun readBoundedUtf8Stream(input: java.io.InputStream, maxBytes: Int): String {
             val buffer = ByteArray(8 * 1024)
@@ -333,9 +491,7 @@ class BackupManager internal constructor(
                 if (read == -1) break
                 total += read
                 if (total > maxBytes) {
-                    throw IllegalArgumentException(
-                        "حجم ملف النسخة الاحتياطية يتجاوز الحد المسموح (${maxBytes / (1024 * 1024)} MB)"
-                    )
+                    throw IllegalArgumentException(formatBackupSizeExceededMessage(total.toLong()))
                 }
                 baos.write(buffer, 0, read)
             }
@@ -348,10 +504,11 @@ class BackupManager internal constructor(
             subtitleRepository: SubtitlePreferencesStore,
             vaultSecurityStore: VaultSecurityBackupStore,
             playlistStore: BackupPlaylistStore,
-            subtitleStore: LocalSubtitleStore? = null
+            subtitleStore: LocalSubtitleStore? = null,
+            context: Context? = null
         ): BackupManager {
             return BackupManager(
-                context = null,
+                context = context,
                 themeRepository = themeRepository,
                 playbackRepository = playbackRepository,
                 subtitleRepository = subtitleRepository,
@@ -377,7 +534,7 @@ class BackupManager internal constructor(
 
         fun parseAndValidateBackupJson(rawJson: String): BackupParseResult {
             if (rawJson.length > MAX_BACKUP_BYTES) {
-                return BackupParseResult.Error("حجم ملف النسخة الاحتياطية يتجاوز الحد المسموح")
+                return BackupParseResult.Error(formatBackupSizeExceededMessage())
             }
             val root = try {
                 MiniJsonParser(rawJson).parseValue() as? Map<*, *>

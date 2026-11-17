@@ -1126,8 +1126,8 @@ class OfflineModelManager private constructor(
             val modelId = entry.name.removeSuffix(".bak")
             if (modelId.isBlank()) continue
             val targetDir = File(voskBaseDir, modelId)
-            val matchingSpec = VoskModelCatalog.ALL_MODELS.firstOrNull { it.modelId == modelId }
-            val minBytes = matchingSpec?.let { productionMinExpectedBytes(it) } ?: 0L
+            val matchingSpec: VoskSpeechModelSpec? = VoskModelCatalog.officialModels.values.firstOrNull { it.modelId == modelId }
+            val minBytes: Long = matchingSpec?.let { productionMinExpectedBytes(it) } ?: 0L
             val targetValid = targetDir.exists() && hasValidVoskStructure(targetDir, minBytes)
             if (targetValid) {
                 entry.deleteRecursively()

@@ -186,7 +186,7 @@ jobs:
 
           BADGING_LINE=$("$AAPT2_BIN" dump badging "$RELEASE_APK" | awk '/^package:/ && !found { line = $0; found = 1 } END { if (!found) exit 1; print line }')
           echo "$BADGING_LINE"
-          ACTUAL_APP_ID=$(printf '%s' "$BADGING_LINE" | sed -n "s/.*name='\([^']*\)'.*/\1/p")
+          ACTUAL_APP_ID=$(printf '%s\n' "$BADGING_LINE" | awk '/^package:/ && match($0, /[[:space:]]name=\047[^\047]+\047/) { val = substr($0, RSTART, RLENGTH); sub(/^[[:space:]]name=\047/, "", val); sub(/\047$/, "", val); print val }')
           if [ "$ACTUAL_APP_ID" != "$EXPECTED_APP_ID" ]; then
             echo "::error::applicationId mismatch: expected '$EXPECTED_APP_ID' but got '$ACTUAL_APP_ID'."
             exit 1

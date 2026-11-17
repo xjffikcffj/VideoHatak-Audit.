@@ -70,3 +70,147 @@ jobs:
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
           retention-days: 14
+
+      - name: Validate and decode release keystore
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.VIDEOHATAK_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.VIDEOHATAK_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.VIDEOHATAK_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.VIDEOHATAK_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for var_name in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            if [ -z "${!var_name:-}" ]; then
+              echo "::error::Missing required GitHub Secret for release signing ($var_name)."
+              exit 1
+            fi
+          done
+          KEYSTORE_FILE="${{ runner.temp }}/videohatak-release.jks"
+          printf '%s' "$KEYSTORE_BASE64" | tr -d '\r\n ' | base64 --decode > "$KEYSTORE_FILE"
+          if [ ! -s "$KEYSTORE_FILE" ]; then
+            echo "::error::Decoded release keystore file is empty or invalid."
+            exit 1
+          fi
+
+      - name: Build signed release APK
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        env:
+          VIDEOHATAK_KEYSTORE_PATH: ${{ runner.temp }}/videohatak-release.jks
+          VIDEOHATAK_KEYSTORE_PASSWORD: ${{ secrets.VIDEOHATAK_KEYSTORE_PASSWORD }}
+          VIDEOHATAK_KEY_ALIAS: ${{ secrets.VIDEOHATAK_KEY_ALIAS }}
+          VIDEOHATAK_KEY_PASSWORD: ${{ secrets.VIDEOHATAK_KEY_PASSWORD }}
+        run: ./gradlew --no-daemon assembleRelease --stacktrace
+
+      - name: Verify release APK applicationId and signing certificate SHA-256
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXPECTED_APP_ID="com.videohatak.player"
+          EXPECTED_SHA256="6a8161f96fcce9fcdaa882e633ee82dad4ac9a4c790ae17a97c38de475a845de"
+          RELEASE_APK="app/build/outputs/apk/release/app-release.apk"
+          if [ ! -f "$RELEASE_APK" ]; then
+            echo "::error::Expected signed APK not found at $RELEASE_APK (unsigned APKs are rejected)."
+            exit 1
+          fi
+
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          AAPT2_BIN=""
+          APKSIGNER_BIN=""
+
+          resolve_build_tools() {
+            local candidate
+            if [ -n "$SDK_ROOT" ] && [ -d "$SDK_ROOT/build-tools" ]; then
+              while IFS= read -r candidate; do
+                if [ -x "$candidate/aapt2" ] && [ -x "$candidate/apksigner" ]; then
+                  AAPT2_BIN="$candidate/aapt2"
+                  APKSIGNER_BIN="$candidate/apksigner"
+                  echo "Using Android Build Tools: $candidate"
+                  return 0
+                fi
+              done < <(find "$SDK_ROOT/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -Vr)
+            fi
+            return 1
+          }
+
+          if ! resolve_build_tools; then
+            AAPT2_BIN=$(command -v aapt2 || true)
+            APKSIGNER_BIN=$(command -v apksigner || true)
+            if [ -z "$AAPT2_BIN" ] || [ -z "$APKSIGNER_BIN" ]; then
+              SDKMANAGER_BIN=$(command -v sdkmanager || true)
+              if [ -z "$SDKMANAGER_BIN" ] && [ -n "$SDK_ROOT" ] && [ -d "$SDK_ROOT/cmdline-tools" ]; then
+                SDKMANAGER_BIN=$(find "$SDK_ROOT/cmdline-tools" -name sdkmanager -type f 2>/dev/null | sort -Vr | head -n1 || true)
+              fi
+              if [ -n "$SDKMANAGER_BIN" ] && [ -x "$SDKMANAGER_BIN" ]; then
+                echo "No compatible Build Tools found; installing build-tools;35.0.0..."
+                SDKMANAGER_LOG=$(mktemp)
+                SDKMANAGER_STATUS=0
+                if [ -n "$SDK_ROOT" ]; then
+                  (yes || true) | "$SDKMANAGER_BIN" --sdk_root="$SDK_ROOT" "build-tools;35.0.0" >"$SDKMANAGER_LOG" 2>&1 || SDKMANAGER_STATUS=$?
+                else
+                  (yes || true) | "$SDKMANAGER_BIN" "build-tools;35.0.0" >"$SDKMANAGER_LOG" 2>&1 || SDKMANAGER_STATUS=$?
+                  RESOLVED_SM=$(readlink -f "$SDKMANAGER_BIN" 2>/dev/null || printf '%s' "$SDKMANAGER_BIN")
+                  for rel in "../.." "../../.."; do
+                    CANDIDATE_SDK=$(cd "$(dirname "$RESOLVED_SM")/$rel" 2>/dev/null && pwd || true)
+                    if [ -n "$CANDIDATE_SDK" ] && [ -d "$CANDIDATE_SDK/build-tools" ]; then
+                      SDK_ROOT="$CANDIDATE_SDK"
+                      break
+                    fi
+                  done
+                fi
+                if [ "$SDKMANAGER_STATUS" -ne 0 ]; then
+                  cat "$SDKMANAGER_LOG" || true
+                  SDKMANAGER_ERR=$(grep -v '^[[:space:]]*$' "$SDKMANAGER_LOG" | tail -n 5 | tr '\r\n' '  ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//' || true)
+                  echo "::warning::sdkmanager failed to install build-tools;35.0.0 (exit code $SDKMANAGER_STATUS)${SDKMANAGER_ERR:+: $SDKMANAGER_ERR}"
+                fi
+                rm -f "$SDKMANAGER_LOG"
+                resolve_build_tools || true
+                if [ -z "$AAPT2_BIN" ] || [ -z "$APKSIGNER_BIN" ]; then
+                  AAPT2_BIN=$(command -v aapt2 || true)
+                  APKSIGNER_BIN=$(command -v apksigner || true)
+                fi
+              fi
+            fi
+          fi
+
+          if [ -z "$AAPT2_BIN" ] || [ -z "$APKSIGNER_BIN" ]; then
+            echo "::error::aapt2 or apksigner not found in Android SDK build-tools."
+            exit 1
+          fi
+          if ls app/build/outputs/apk/release/*unsigned*.apk >/dev/null 2>&1; then
+            echo "::error::Unsigned release APK detected; unsigned builds are disallowed."
+            exit 1
+          fi
+
+          BADGING_LINE=$("$AAPT2_BIN" dump badging "$RELEASE_APK" | awk '/^package:/ && !found { line = $0; found = 1 } END { if (!found) exit 1; print line }')
+          echo "$BADGING_LINE"
+          ACTUAL_APP_ID=$(printf '%s' "$BADGING_LINE" | sed -n "s/.*name='\([^']*\)'.*/\1/p")
+          if [ "$ACTUAL_APP_ID" != "$EXPECTED_APP_ID" ]; then
+            echo "::error::applicationId mismatch: expected '$EXPECTED_APP_ID' but got '$ACTUAL_APP_ID'."
+            exit 1
+          fi
+
+          CERT_OUTPUT=$("$APKSIGNER_BIN" verify --print-certs --verbose "$RELEASE_APK")
+          echo "$CERT_OUTPUT"
+          ACTUAL_SHA256=$(printf '%s\n' "$CERT_OUTPUT" | awk '/Signer #1 certificate SHA-256 digest:/ && !found { digest = $NF; found = 1 } END { if (!found) exit 1; print digest }' | tr '[:upper:]' '[:lower:]' | tr -d ':')
+          if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+            echo "::error::Signing certificate SHA-256 mismatch: expected '$EXPECTED_SHA256' but got '$ACTUAL_SHA256'."
+            exit 1
+          fi
+          echo "Verified signed release APK: applicationId=$ACTUAL_APP_ID, SHA-256=$ACTUAL_SHA256"
+
+      - name: Clean up temporary release keystore
+        if: always()
+        shell: bash
+        run: rm -f "${{ runner.temp }}/videohatak-release.jks"
+
+      - name: Upload signed release APK
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: videohatak-release-apk
+          path: app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+          retention-days: 14

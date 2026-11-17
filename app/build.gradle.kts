@@ -8,6 +8,22 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+val releaseKeystorePath = (project.findProperty("VIDEOHATAK_KEYSTORE_PATH") as? String)
+    ?: System.getenv("VIDEOHATAK_KEYSTORE_PATH")
+val releaseKeystorePassword = (project.findProperty("VIDEOHATAK_KEYSTORE_PASSWORD") as? String)
+    ?: System.getenv("VIDEOHATAK_KEYSTORE_PASSWORD")
+val releaseKeyAlias = (project.findProperty("VIDEOHATAK_KEY_ALIAS") as? String)
+    ?: System.getenv("VIDEOHATAK_KEY_ALIAS")
+val releaseKeyPassword = (project.findProperty("VIDEOHATAK_KEY_PASSWORD") as? String)
+    ?: System.getenv("VIDEOHATAK_KEY_PASSWORD")
+val releaseKeystoreFile = releaseKeystorePath?.takeIf { it.isNotBlank() }?.let { file(it) }
+val isReleaseSigningValid = releaseKeystoreFile != null &&
+    releaseKeystoreFile.isFile &&
+    releaseKeystoreFile.length() > 0L &&
+    !releaseKeystorePassword.isNullOrBlank() &&
+    !releaseKeyAlias.isNullOrBlank() &&
+    !releaseKeyPassword.isNullOrBlank()
+
 android {
     namespace = "com.videohatak.player"
     compileSdk = 36
@@ -28,24 +44,11 @@ android {
 
     signingConfigs {
         create("release") {
-            val keystorePath = (project.findProperty("VIDEOHATAK_KEYSTORE_PATH") as? String)
-                ?: System.getenv("VIDEOHATAK_KEYSTORE_PATH")
-            val keystorePassword = (project.findProperty("VIDEOHATAK_KEYSTORE_PASSWORD") as? String)
-                ?: System.getenv("VIDEOHATAK_KEYSTORE_PASSWORD")
-            val keyAliasValue = (project.findProperty("VIDEOHATAK_KEY_ALIAS") as? String)
-                ?: System.getenv("VIDEOHATAK_KEY_ALIAS")
-            val keyPasswordValue = (project.findProperty("VIDEOHATAK_KEY_PASSWORD") as? String)
-                ?: System.getenv("VIDEOHATAK_KEY_PASSWORD")
-
-            if (!keystorePath.isNullOrBlank() &&
-                !keystorePassword.isNullOrBlank() &&
-                !keyAliasValue.isNullOrBlank() &&
-                !keyPasswordValue.isNullOrBlank()
-            ) {
-                storeFile = file(keystorePath)
-                storePassword = keystorePassword
-                keyAlias = keyAliasValue
-                keyPassword = keyPasswordValue
+            if (isReleaseSigningValid) {
+                storeFile = releaseKeystoreFile
+                storePassword = releaseKeystorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
             }
         }
     }
@@ -143,4 +146,36 @@ dependencies {
     androidTestImplementation(libs.androidx.ui.test.junit4)
     debugImplementation(libs.androidx.ui.tooling)
     debugImplementation(libs.androidx.ui.test.manifest)
+}
+
+val releaseSigningValidationError = buildString {
+    if (releaseKeystorePath.isNullOrBlank()) {
+        append("Missing VIDEOHATAK_KEYSTORE_PATH. ")
+    } else if (releaseKeystoreFile == null || !releaseKeystoreFile.isFile || releaseKeystoreFile.length() <= 0L) {
+        append("Invalid or missing release keystore file at '$releaseKeystorePath'. ")
+    }
+    if (releaseKeystorePassword.isNullOrBlank()) append("Missing VIDEOHATAK_KEYSTORE_PASSWORD. ")
+    if (releaseKeyAlias.isNullOrBlank()) append("Missing VIDEOHATAK_KEY_ALIAS. ")
+    if (releaseKeyPassword.isNullOrBlank()) append("Missing VIDEOHATAK_KEY_PASSWORD. ")
+}.trim()
+
+val validateReleaseSigningConfig = tasks.register("validateReleaseSigningConfig") {
+    val valid = isReleaseSigningValid
+    val reason = releaseSigningValidationError
+    doLast {
+        if (!valid) {
+            throw GradleException(
+                "Release build aborted: $reason Unsigned Release APKs are disallowed."
+            )
+        }
+    }
+}
+
+tasks.matching {
+    it.name == "assembleRelease" ||
+        it.name == "packageRelease" ||
+        it.name == "bundleRelease" ||
+        it.name == "validateSigningRelease"
+}.configureEach {
+    dependsOn(validateReleaseSigningConfig)
 }

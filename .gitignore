@@ -6,3 +6,11 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Android signing keys and credentials (never commit to repository)
+*.jks
+*.keystore
+*.p12
+*.pk8
+*.pem
+keystore.properties

@@ -687,7 +687,13 @@ class TrueVaultAndStabilityVerificationTest {
         assertFalse(repo.renamePlaylist(1L, "NewName"))
         assertTrue(repo.getPlaylistItems(1L).isEmpty())
         assertNull(repo.getPlaylistWithItems(1L))
-        assertFalse(repo.isFavorite(1L, "content://media/external/video/media/1"))
+        val sampleVideo = VideoItem(
+            id = 1L,
+            contentUri = Uri.parse("content://media/external/video/media/1"),
+            title = "Sample Video",
+            displayName = "sample_video.mp4"
+        )
+        assertFalse(repo.isFavorite(sampleVideo))
         assertEquals(Pair(emptySet<Long>(), emptySet<String>()), repo.getFavoriteVideoKeys())
         repo.moveItem(1L, 0, 1)
     }

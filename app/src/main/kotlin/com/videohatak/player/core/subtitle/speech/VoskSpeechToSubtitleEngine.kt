@@ -259,6 +259,7 @@ class VoskSpeechToSubtitleEngine(
                     VideoAudioPcmDecoder.TARGET_SAMPLE_RATE_HZ.toFloat()
                 ).apply {
                     setWords(true)
+                    setPartialWords(true)
                 }
 
                 val collectedWords = mutableListOf<VoskWordToken>()

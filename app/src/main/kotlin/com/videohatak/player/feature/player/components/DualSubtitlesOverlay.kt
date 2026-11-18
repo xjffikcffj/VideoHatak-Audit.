@@ -38,38 +38,50 @@ fun DualSubtitlesOverlay(
         ) {
             // Secondary Subtitle (above primary)
             if (secondaryCues.isNotEmpty()) {
-                val secondaryText = secondaryCues.joinToString("\n") { it.text }
-                Box(
+                val secondaryLines = secondaryCues
+                    .flatMap { it.text.lines() }
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() }
+                Column(
                     modifier = Modifier
                         .background(secondaryStyle.backgroundColor, RoundedCornerShape(4.dp))
-                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    Text(
-                        text = secondaryText,
-                        fontSize = secondaryStyle.fontSizeSp.sp,
-                        color = secondaryStyle.textColor,
-                        textAlign = TextAlign.Center,
-                        style = TextStyle(textDirection = TextDirection.Content)
-                    )
+                    secondaryLines.forEach { line ->
+                        Text(
+                            text = line,
+                            fontSize = secondaryStyle.fontSizeSp.sp,
+                            color = secondaryStyle.textColor,
+                            textAlign = TextAlign.Center,
+                            style = TextStyle(textDirection = TextDirection.Content)
+                        )
+                    }
                 }
             }
 
             // Primary Subtitle (bottom)
             if (primaryCues.isNotEmpty()) {
-                val primaryText = primaryCues.joinToString("\n") { it.text }
-                Box(
+                val primaryLines = primaryCues
+                    .flatMap { it.text.lines() }
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() }
+                Column(
                     modifier = Modifier
                         .padding(top = 4.dp)
                         .background(primaryStyle.backgroundColor, RoundedCornerShape(4.dp))
-                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    Text(
-                        text = primaryText,
-                        fontSize = primaryStyle.fontSizeSp.sp,
-                        color = primaryStyle.textColor,
-                        textAlign = TextAlign.Center,
-                        style = TextStyle(textDirection = TextDirection.Content)
-                    )
+                    primaryLines.forEach { line ->
+                        Text(
+                            text = line,
+                            fontSize = primaryStyle.fontSizeSp.sp,
+                            color = primaryStyle.textColor,
+                            textAlign = TextAlign.Center,
+                            style = TextStyle(textDirection = TextDirection.Content)
+                        )
+                    }
                 }
             }
         }

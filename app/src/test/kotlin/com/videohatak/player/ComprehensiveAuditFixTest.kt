@@ -277,20 +277,36 @@ class ComprehensiveAuditFixTest {
         assertTrue(api29StrongCap.requiresNegativeButton)
         assertEquals(BiometricManager.Authenticators.BIOMETRIC_STRONG, api29StrongCap.allowedAuthenticators)
 
-        // API 30+ prefers BIOMETRIC_STRONG or DEVICE_CREDENTIAL without negative button
+        // API 30+ MUST NEVER fall back to DEVICE_CREDENTIAL (always requires independent Vault PIN negative button)
+        val requestedAuthenticatorsApi30 = mutableListOf<Int>()
         val api30Cap = VaultBiometricSupport.resolveCapability(sdkInt = 30) { auth ->
-            if (auth == (BiometricManager.Authenticators.BIOMETRIC_STRONG or BiometricManager.Authenticators.DEVICE_CREDENTIAL)) {
+            requestedAuthenticatorsApi30.add(auth)
+            if (auth == BiometricManager.Authenticators.BIOMETRIC_STRONG) {
                 BiometricManager.BIOMETRIC_SUCCESS
             } else {
                 BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE
             }
         }
         assertTrue(api30Cap.isAvailable)
-        assertFalse(api30Cap.requiresNegativeButton)
-        assertEquals(
-            BiometricManager.Authenticators.BIOMETRIC_STRONG or BiometricManager.Authenticators.DEVICE_CREDENTIAL,
-            api30Cap.allowedAuthenticators
+        assertTrue(api30Cap.requiresNegativeButton)
+        assertEquals(BiometricManager.Authenticators.BIOMETRIC_STRONG, api30Cap.allowedAuthenticators)
+        assertFalse(
+            requestedAuthenticatorsApi30.any {
+                (it and BiometricManager.Authenticators.DEVICE_CREDENTIAL) != 0
+            }
         )
+
+        // API 30+ falls back to BIOMETRIC_WEAK when BIOMETRIC_STRONG is unavailable, still without DEVICE_CREDENTIAL
+        val api30WeakCap = VaultBiometricSupport.resolveCapability(sdkInt = 30) { auth ->
+            when (auth) {
+                BiometricManager.Authenticators.BIOMETRIC_STRONG -> BiometricManager.BIOMETRIC_ERROR_HW_UNAVAILABLE
+                BiometricManager.Authenticators.BIOMETRIC_WEAK -> BiometricManager.BIOMETRIC_SUCCESS
+                else -> BiometricManager.BIOMETRIC_ERROR_UNSUPPORTED
+            }
+        }
+        assertTrue(api30WeakCap.isAvailable)
+        assertTrue(api30WeakCap.requiresNegativeButton)
+        assertEquals(BiometricManager.Authenticators.BIOMETRIC_WEAK, api30WeakCap.allowedAuthenticators)
 
         // No biometrics enrolled gives clear Arabic PIN fallback message
         val noEnrolled = VaultBiometricSupport.resolveCapability(sdkInt = 29) {

@@ -41,6 +41,18 @@ class PlaylistViewModel(
     private val _favoriteVideoUris = MutableStateFlow<Set<String>>(emptySet())
     val favoriteVideoUris: StateFlow<Set<String>> = _favoriteVideoUris.asStateFlow()
 
+    private val _favoritesPlaylistWithItems = MutableStateFlow<Pair<Playlist, List<PlaylistItem>>?>(null)
+    val favoritesPlaylistWithItems: StateFlow<Pair<Playlist, List<PlaylistItem>>?> =
+        _favoritesPlaylistWithItems.asStateFlow()
+
+    val favoriteItems: StateFlow<List<PlaylistItem>> = _favoritesPlaylistWithItems
+        .map { it?.second ?: emptyList() }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val favoritesPlaylistId: StateFlow<Long?> = _favoritesPlaylistWithItems
+        .map { it?.first?.id }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
+
     init {
         refresh()
     }
@@ -59,6 +71,7 @@ class PlaylistViewModel(
         val (ids, uris) = repository.getFavoriteVideoKeys()
         _favoriteVideoIds.value = ids
         _favoriteVideoUris.value = uris
+        _favoritesPlaylistWithItems.value = repository.getFavoritesPlaylistWithItems()
     }
 
     fun isFavorite(video: VideoItem): Boolean {
@@ -149,11 +162,89 @@ class PlaylistViewModel(
         }
     }
 
+    fun addVideosToPlaylists(
+        videos: List<VideoItem>,
+        playlistIds: List<Long>,
+        onComplete: (Int) -> Unit = {}
+    ) {
+        if (videos.isEmpty() || playlistIds.isEmpty()) {
+            onComplete(0)
+            return
+        }
+        viewModelScope.launch {
+            val added = repository.addVideosToPlaylists(videos, playlistIds)
+            refreshFavoritesState()
+            _selectedPlaylistWithItems.value?.first?.id?.let {
+                if (it in playlistIds) loadPlaylistWithItems(it)
+            }
+            onComplete(added)
+        }
+    }
+
+    fun addVideosToFavorites(
+        videos: List<VideoItem>,
+        onComplete: (Int) -> Unit = {}
+    ) {
+        if (videos.isEmpty()) {
+            onComplete(0)
+            return
+        }
+        viewModelScope.launch {
+            val added = repository.addVideosToFavorites(videos)
+            refreshFavoritesState()
+            _selectedPlaylistWithItems.value?.first?.let { selected ->
+                if (PlaylistRepository.isProtectedFavoritesTitle(selected.title)) {
+                    loadPlaylistWithItems(selected.id)
+                }
+            }
+            onComplete(added)
+        }
+    }
+
+    fun removeVideosFromFavorites(
+        videos: List<VideoItem>,
+        onComplete: (Int) -> Unit = {}
+    ) {
+        if (videos.isEmpty()) {
+            onComplete(0)
+            return
+        }
+        viewModelScope.launch {
+            val removed = repository.removeVideosFromFavorites(videos)
+            refreshFavoritesState()
+            _selectedPlaylistWithItems.value?.first?.let { selected ->
+                if (PlaylistRepository.isProtectedFavoritesTitle(selected.title)) {
+                    loadPlaylistWithItems(selected.id)
+                }
+            }
+            onComplete(removed)
+        }
+    }
+
     fun removeItemFromPlaylist(itemId: Long, playlistId: Long) {
         viewModelScope.launch {
             repository.removeVideoFromPlaylist(itemId, playlistId)
             refreshFavoritesState()
             loadPlaylistWithItems(playlistId)
+        }
+    }
+
+    fun removeItemsFromPlaylist(
+        itemIds: Set<Long>,
+        playlistId: Long,
+        onComplete: (Int) -> Unit = {}
+    ) {
+        if (itemIds.isEmpty()) {
+            onComplete(0)
+            return
+        }
+        viewModelScope.launch {
+            val removed = repository.removeVideosFromPlaylist(itemIds.toList(), playlistId)
+            refreshFavoritesState()
+            if (_selectedPlaylistWithItems.value?.first?.id == playlistId) {
+                loadPlaylistWithItems(playlistId)
+            }
+            onComplete(removed)
         }
     }
 

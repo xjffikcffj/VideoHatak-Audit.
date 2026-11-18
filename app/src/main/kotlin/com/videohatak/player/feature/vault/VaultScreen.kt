@@ -1,8 +1,11 @@
 package com.videohatak.player.feature.vault
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -19,15 +22,23 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Pin
 import androidx.compose.material.icons.filled.Security
+import androidx.compose.material.icons.filled.SelectAll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -38,6 +49,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.windowsizeclass.WindowWidthSizeClass
@@ -54,6 +66,8 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -62,6 +76,8 @@ import com.videohatak.player.core.designsystem.theme.LocalVideoHatakPalette
 import com.videohatak.player.core.designsystem.theme.LocalWindowSizeClass
 import com.videohatak.player.core.vault.model.VaultVideo
 import com.videohatak.player.core.vault.security.VaultAutoLockTimeout
+import com.videohatak.player.core.vault.security.VaultPinHasher
+import com.videohatak.player.feature.vault.components.BatchDeleteVaultVideosDialog
 import com.videohatak.player.feature.vault.components.DeleteVaultVideoConfirmationDialog
 import com.videohatak.player.feature.vault.components.ImportVideoProgressDialog
 import com.videohatak.player.feature.vault.components.RenameVaultVideoDialog
@@ -82,7 +98,14 @@ fun VaultScreen(
     autoLockTimeout: VaultAutoLockTimeout = VaultAutoLockTimeout.IMMEDIATE,
     onAuthenticateClick: () -> Unit,
     onUnlockWithPin: (String) -> Unit = {},
+    onSetupInitialPin: (pin: String, onResult: (Boolean, String) -> Unit) -> Unit = { _, cb ->
+        cb(false, "تعذر إعداد رمز الخزنة")
+    },
     onSetPin: (String) -> Unit = {},
+    onChangePin: (currentPin: String, newPin: String, onResult: (Boolean, String) -> Unit) -> Unit = { _, newPin, cb ->
+        onSetPin(newPin)
+        cb(true, "تم حفظ رمز PIN بنجاح")
+    },
     onRemovePin: () -> Unit = {},
     onSelectAutoLockTimeout: (VaultAutoLockTimeout) -> Unit = {},
     onLockClick: () -> Unit,
@@ -93,6 +116,7 @@ fun VaultScreen(
     onVideoClick: (VaultVideo) -> Unit,
     onRenameVideo: (Long, String) -> Unit,
     onDeleteVideo: (Long) -> Unit,
+    onDeleteVideos: (Set<Long>) -> Unit = { ids -> ids.forEach(onDeleteVideo) },
     onUserInteraction: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
@@ -102,11 +126,28 @@ fun VaultScreen(
     var showSecurityInfo by remember { mutableStateOf(false) }
     var showPinUnlockDialog by remember { mutableStateOf(false) }
     var showSecuritySettingsDialog by remember { mutableStateOf(false) }
+    var selectedVideoIds by remember { mutableStateOf<Set<Long>>(emptySet()) }
+    var showBatchDeleteConfirm by remember { mutableStateOf(false) }
+    val isSelectionMode = selectedVideoIds.isNotEmpty()
 
     LaunchedEffect(isUnlocked) {
         if (isUnlocked) {
             showPinUnlockDialog = false
+        } else {
+            selectedVideoIds = emptySet()
+            showBatchDeleteConfirm = false
         }
+    }
+
+    LaunchedEffect(videos) {
+        val liveIds = videos.map { it.id }.toSet()
+        if (selectedVideoIds.any { it !in liveIds }) {
+            selectedVideoIds = selectedVideoIds.intersect(liveIds)
+        }
+    }
+
+    BackHandler(enabled = isUnlocked && isSelectionMode) {
+        selectedVideoIds = emptySet()
     }
 
     val windowSizeClass = LocalWindowSizeClass.current
@@ -140,6 +181,19 @@ fun VaultScreen(
         )
     }
 
+    if (showBatchDeleteConfirm && isSelectionMode) {
+        BatchDeleteVaultVideosDialog(
+            selectedCount = selectedVideoIds.size,
+            onDismiss = { showBatchDeleteConfirm = false },
+            onConfirm = {
+                val toRemove = selectedVideoIds
+                showBatchDeleteConfirm = false
+                selectedVideoIds = emptySet()
+                onDeleteVideos(toRemove)
+            }
+        )
+    }
+
     if (showSecurityInfo) {
         VaultSecurityInfoDialog(onDismiss = { showSecurityInfo = false })
     }
@@ -159,6 +213,7 @@ fun VaultScreen(
             hasPin = hasPinConfigured,
             currentTimeout = autoLockTimeout,
             onSetPin = onSetPin,
+            onChangePin = onChangePin,
             onRemovePin = onRemovePin,
             onSelectTimeout = onSelectAutoLockTimeout,
             onDismiss = { showSecuritySettingsDialog = false }
@@ -188,15 +243,20 @@ fun VaultScreen(
             }
     ) {
         if (!isUnlocked) {
+            var initialPin by remember { mutableStateOf("") }
+            var confirmInitialPin by remember { mutableStateOf("") }
+            var setupPinError by remember { mutableStateOf<String?>(null) }
+
             Column(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(32.dp),
+                    .verticalScroll(rememberScrollState())
+                    .padding(28.dp),
                 verticalArrangement = Arrangement.Center,
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Surface(
-                    modifier = Modifier.size(84.dp),
+                    modifier = Modifier.size(80.dp),
                     shape = RoundedCornerShape(24.dp),
                     color = palette.accent.copy(alpha = 0.14f),
                     border = BorderStroke(1.dp, palette.border)
@@ -206,12 +266,12 @@ fun VaultScreen(
                             imageVector = Icons.Default.Lock,
                             contentDescription = null,
                             tint = palette.accent,
-                            modifier = Modifier.size(40.dp)
+                            modifier = Modifier.size(38.dp)
                         )
                     }
                 }
 
-                Spacer(modifier = Modifier.height(20.dp))
+                Spacer(modifier = Modifier.height(18.dp))
 
                 Text(
                     text = "الخزنة الخاصة المشفرة",
@@ -223,22 +283,27 @@ fun VaultScreen(
                 Spacer(modifier = Modifier.height(8.dp))
 
                 Text(
-                    text = "مساحة آمنة ومعزولة لحفظ فيديوهاتك الحساسة بتشفير AES-256-GCM وحماية مفاتيح Android Keystore.",
+                    text = if (!hasPinConfigured) {
+                        "أنشئ رمز PIN مستقلًا لحماية الخزنة الخاصة. هذا الرمز خاص بالتطبيق ولا يعتمد على قفل شاشة الهاتف."
+                    } else {
+                        "مساحة آمنة ومعزولة لحفظ فيديوهاتك الحساسة بتشفير AES-256-GCM وحماية مفاتيح Android Keystore."
+                    },
                     style = MaterialTheme.typography.bodyMedium,
                     color = palette.onSurfaceMuted,
                     textAlign = TextAlign.Center,
                     lineHeight = 22.sp
                 )
 
-                if (biometricError != null) {
-                    Spacer(modifier = Modifier.height(16.dp))
+                val displayError = setupPinError ?: biometricError
+                if (displayError != null) {
+                    Spacer(modifier = Modifier.height(14.dp))
                     Surface(
                         shape = RoundedCornerShape(8.dp),
                         color = MaterialTheme.colorScheme.error.copy(alpha = 0.15f),
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Text(
-                            text = biometricError,
+                            text = displayError,
                             color = MaterialTheme.colorScheme.error,
                             style = MaterialTheme.typography.bodySmall,
                             textAlign = TextAlign.Center,
@@ -247,25 +312,68 @@ fun VaultScreen(
                     }
                 }
 
-                Spacer(modifier = Modifier.height(28.dp))
+                Spacer(modifier = Modifier.height(22.dp))
 
-                if (!canUseBiometrics) {
-                    Text(
-                        text = if (hasPinConfigured) {
-                            "التحقق الحيوي غير متاح على هذا الجهاز حاليًا — يمكنك الفتح برمز PIN."
-                        } else {
-                            "يرجى تفعيل البصمة أو قفل الشاشة في إعدادات الجهاز أو فتح الخزنة وتعيين رمز PIN."
+                if (!hasPinConfigured) {
+                    OutlinedTextField(
+                        value = initialPin,
+                        onValueChange = { input ->
+                            if (input.length <= 12 && input.all { it.isDigit() }) {
+                                initialPin = input
+                                setupPinError = null
+                            }
                         },
-                        style = MaterialTheme.typography.bodySmall,
-                        color = palette.onSurfaceMuted,
-                        textAlign = TextAlign.Center
+                        label = { Text("إنشاء رمز PIN للخزنة (4 إلى 12 رقمًا)") },
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(0.9f)
                     )
-                    Spacer(modifier = Modifier.height(12.dp))
-                }
-
-                if (canUseBiometrics || !hasPinConfigured) {
+                    Spacer(modifier = Modifier.height(10.dp))
+                    OutlinedTextField(
+                        value = confirmInitialPin,
+                        onValueChange = { input ->
+                            if (input.length <= 12 && input.all { it.isDigit() }) {
+                                confirmInitialPin = input
+                                setupPinError = null
+                            }
+                        },
+                        label = { Text("تأكيد رمز PIN") },
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(0.9f)
+                    )
+                    Spacer(modifier = Modifier.height(16.dp))
                     Button(
-                        onClick = onAuthenticateClick,
+                        onClick = {
+                            when {
+                                !VaultPinHasher.isValidPinFormat(initialPin) ->
+                                    setupPinError = "يجب أن يتكون الرمز من 4 إلى 12 رقمًا"
+                                initialPin != confirmInitialPin ->
+                                    setupPinError = "الرمزان غير متطابقين"
+                                else -> {
+                                    onSetupInitialPin(initialPin) { ok, msg ->
+                                        if (!ok) setupPinError = msg
+                                    }
+                                }
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = palette.accent,
+                            contentColor = MaterialTheme.colorScheme.onPrimary
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth(0.9f)
+                            .height(48.dp)
+                    ) {
+                        Icon(Icons.Default.LockOpen, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("إنشاء الرمز وفتح الخزنة", fontWeight = FontWeight.Bold)
+                    }
+                } else {
+                    Button(
+                        onClick = { showPinUnlockDialog = true },
                         colors = ButtonDefaults.buttonColors(
                             containerColor = palette.accent,
                             contentColor = MaterialTheme.colorScheme.onPrimary
@@ -274,40 +382,23 @@ fun VaultScreen(
                             .fillMaxWidth(0.85f)
                             .height(48.dp)
                     ) {
-                        Icon(Icons.Default.LockOpen, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Icon(Icons.Default.Pin, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text("فتح الخزنة بالبصمة أو القفل", fontWeight = FontWeight.Bold)
+                        Text("فتح الخزنة برمز PIN", fontWeight = FontWeight.Bold)
                     }
-                }
 
-                if (hasPinConfigured) {
                     if (canUseBiometrics) {
                         Spacer(modifier = Modifier.height(10.dp))
                         OutlinedButton(
-                            onClick = { showPinUnlockDialog = true },
+                            onClick = onAuthenticateClick,
                             border = BorderStroke(1.dp, palette.accent),
                             modifier = Modifier
                                 .fillMaxWidth(0.85f)
                                 .height(46.dp)
                         ) {
-                            Icon(Icons.Default.Pin, contentDescription = null, tint = palette.accent, modifier = Modifier.size(18.dp))
+                            Icon(Icons.Default.Fingerprint, contentDescription = null, tint = palette.accent, modifier = Modifier.size(18.dp))
                             Spacer(modifier = Modifier.width(8.dp))
-                            Text("فتح برمز PIN", color = palette.accent, fontWeight = FontWeight.Bold)
-                        }
-                    } else {
-                        Button(
-                            onClick = { showPinUnlockDialog = true },
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = palette.accent,
-                                contentColor = MaterialTheme.colorScheme.onPrimary
-                            ),
-                            modifier = Modifier
-                                .fillMaxWidth(0.85f)
-                                .height(48.dp)
-                        ) {
-                            Icon(Icons.Default.Pin, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("فتح الخزنة برمز PIN", fontWeight = FontWeight.Bold)
+                            Text("فتح بالبصمة (اختياري)", color = palette.accent, fontWeight = FontWeight.Bold)
                         }
                     }
                 }
@@ -333,79 +424,130 @@ fun VaultScreen(
                     color = palette.surface,
                     border = BorderStroke(0.5.dp, palette.border.copy(alpha = 0.5f))
                 ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 12.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
+                    if (isSelectionMode) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                IconButton(onClick = { selectedVideoIds = emptySet() }) {
+                                    Icon(Icons.Default.Close, contentDescription = "إلغاء التحديد", tint = palette.onSurface)
+                                }
+                                Text(
+                                    text = "${selectedVideoIds.size} محدد",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = palette.accent
+                                )
+                            }
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(6.dp)
                             ) {
-                                Text(
-                                    text = "الخزنة الخاصة",
-                                    style = MaterialTheme.typography.titleMedium,
-                                    fontWeight = FontWeight.Bold,
-                                    color = palette.onSurface
-                                )
-                                Surface(
-                                    shape = RoundedCornerShape(4.dp),
-                                    color = palette.accent.copy(alpha = 0.18f)
+                                IconButton(
+                                    onClick = {
+                                        selectedVideoIds = if (selectedVideoIds.size == videos.size) {
+                                            emptySet()
+                                        } else {
+                                            videos.map { it.id }.toSet()
+                                        }
+                                    }
                                 ) {
-                                    Text(
-                                        text = "AES-256",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = palette.accent,
-                                        fontWeight = FontWeight.Bold,
-                                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp)
+                                    Icon(Icons.Default.SelectAll, contentDescription = "تحديد الكل", tint = palette.accent)
+                                }
+                                OutlinedButton(
+                                    onClick = { showBatchDeleteConfirm = true },
+                                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.65f))
+                                ) {
+                                    Icon(
+                                        Icons.Default.Delete,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.error,
+                                        modifier = Modifier.size(16.dp)
                                     )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("حذف المحدد", color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
                                 }
                             }
-                            val totalBytes = videos.sumOf { it.encryptedSizeBytes }
-                            val totalMb = totalBytes / (1024.0 * 1024.0)
-                            Text(
-                                text = String.format(Locale.US, "%d فيديو • %.1f ميجابايت مشفرة", videos.size, totalMb),
-                                style = MaterialTheme.typography.labelMedium,
-                                color = palette.onSurfaceMuted
-                            )
                         }
-
+                    } else {
                         Row(
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                            verticalAlignment = Alignment.CenterVertically
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            IconButton(onClick = { showSecuritySettingsDialog = true }) {
-                                Icon(
-                                    imageVector = Icons.Default.Security,
-                                    contentDescription = "إعدادات أمان الخزنة و PIN",
-                                    tint = palette.accent
+                            Column(modifier = Modifier.weight(1f)) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Text(
+                                        text = "الخزنة الخاصة",
+                                        style = MaterialTheme.typography.titleMedium,
+                                        fontWeight = FontWeight.Bold,
+                                        color = palette.onSurface
+                                    )
+                                    Surface(
+                                        shape = RoundedCornerShape(4.dp),
+                                        color = palette.accent.copy(alpha = 0.18f)
+                                    ) {
+                                        Text(
+                                            text = "AES-256",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = palette.accent,
+                                            fontWeight = FontWeight.Bold,
+                                            modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp)
+                                        )
+                                    }
+                                }
+                                val totalBytes = videos.sumOf { it.encryptedSizeBytes }
+                                val totalMb = totalBytes / (1024.0 * 1024.0)
+                                Text(
+                                    text = String.format(Locale.US, "%d فيديو • %.1f ميجابايت مشفرة", videos.size, totalMb),
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = palette.onSurfaceMuted
                                 )
                             }
 
-                            OutlinedButton(
-                                onClick = onLockClick,
-                                border = BorderStroke(1.dp, palette.border),
-                                shape = MaterialTheme.shapes.small
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Icon(Icons.Default.Lock, contentDescription = null, tint = palette.onSurface, modifier = Modifier.size(16.dp))
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("قفل", color = palette.onSurface, fontSize = 12.sp)
-                            }
+                                IconButton(onClick = { showSecuritySettingsDialog = true }) {
+                                    Icon(
+                                        imageVector = Icons.Default.Security,
+                                        contentDescription = "إعدادات أمان الخزنة و PIN",
+                                        tint = palette.accent
+                                    )
+                                }
 
-                            Button(
-                                onClick = onImportClick,
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = palette.accent,
-                                    contentColor = MaterialTheme.colorScheme.onPrimary
-                                ),
-                                shape = MaterialTheme.shapes.small
-                            ) {
-                                Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("استيراد", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                OutlinedButton(
+                                    onClick = onLockClick,
+                                    border = BorderStroke(1.dp, palette.border),
+                                    shape = MaterialTheme.shapes.small
+                                ) {
+                                    Icon(Icons.Default.Lock, contentDescription = null, tint = palette.onSurface, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("قفل", color = palette.onSurface, fontSize = 12.sp)
+                                }
+
+                                Button(
+                                    onClick = onImportClick,
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = palette.accent,
+                                        contentColor = MaterialTheme.colorScheme.onPrimary
+                                    ),
+                                    shape = MaterialTheme.shapes.small
+                                ) {
+                                    Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("نقل إلى الخزنة", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                }
                             }
                         }
                     }
@@ -491,7 +633,7 @@ fun VaultScreen(
                         )
                         Spacer(modifier = Modifier.height(6.dp))
                         Text(
-                            text = "اضغط على «استيراد» لتشفير فيديو وحفظه بأمان مع الإبقاء على النسخة الأصلية دون حذفها.",
+                            text = "اضغط على «نقل إلى الخزنة» لتشفير الفيديو والتحقق منه ثم حذف النسخة الأصلية من الجهاز بأمان.",
                             style = MaterialTheme.typography.bodySmall,
                             color = palette.onSurfaceMuted,
                             textAlign = TextAlign.Center,
@@ -507,7 +649,7 @@ fun VaultScreen(
                         ) {
                             Icon(Icons.Default.Add, contentDescription = null)
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("استيراد فيديو الآن", fontWeight = FontWeight.Bold)
+                            Text("نقل فيديو إلى الخزنة الآن", fontWeight = FontWeight.Bold)
                         }
                     }
                 } else {
@@ -519,9 +661,29 @@ fun VaultScreen(
                         modifier = Modifier.fillMaxSize()
                     ) {
                         items(videos, key = { it.id }) { video ->
+                            val isSelected = video.id in selectedVideoIds
                             VaultVideoCard(
                                 video = video,
-                                onClick = { onVideoClick(video) },
+                                isSelectionMode = isSelectionMode,
+                                isSelected = isSelected,
+                                onClick = {
+                                    if (isSelectionMode) {
+                                        selectedVideoIds = if (isSelected) {
+                                            selectedVideoIds - video.id
+                                        } else {
+                                            selectedVideoIds + video.id
+                                        }
+                                    } else {
+                                        onVideoClick(video)
+                                    }
+                                },
+                                onLongClick = {
+                                    selectedVideoIds = if (isSelected) {
+                                        selectedVideoIds - video.id
+                                    } else {
+                                        selectedVideoIds + video.id
+                                    }
+                                },
                                 onRename = { videoToRename = video },
                                 onDelete = { videoToDelete = video }
                             )
@@ -533,10 +695,14 @@ fun VaultScreen(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun VaultVideoCard(
     video: VaultVideo,
+    isSelectionMode: Boolean = false,
+    isSelected: Boolean = false,
     onClick: () -> Unit,
+    onLongClick: () -> Unit = {},
     onRename: () -> Unit,
     onDelete: () -> Unit,
     modifier: Modifier = Modifier
@@ -548,10 +714,18 @@ fun VaultVideoCard(
         modifier = modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(14.dp))
-            .clickable(onClick = onClick),
+            .combinedClickable(
+                onClick = onClick,
+                onLongClick = onLongClick
+            ),
         shape = RoundedCornerShape(14.dp),
-        colors = CardDefaults.cardColors(containerColor = palette.surface),
-        border = BorderStroke(0.75.dp, palette.border.copy(alpha = 0.7f)),
+        colors = CardDefaults.cardColors(
+            containerColor = if (isSelected) palette.accent.copy(alpha = 0.14f) else palette.surface
+        ),
+        border = BorderStroke(
+            width = if (isSelected) 1.5.dp else 0.75.dp,
+            color = if (isSelected) palette.accent else palette.border.copy(alpha = 0.7f)
+        ),
         elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
     ) {
         Column(modifier = Modifier.fillMaxWidth()) {
@@ -580,6 +754,29 @@ fun VaultVideoCard(
                             color = palette.accent,
                             fontWeight = FontWeight.Bold
                         )
+                    }
+                }
+
+                if (isSelectionMode) {
+                    Surface(
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(8.dp)
+                            .size(26.dp),
+                        shape = CircleShape,
+                        color = if (isSelected) palette.accent else palette.surface.copy(alpha = 0.85f),
+                        border = BorderStroke(1.5.dp, palette.accent)
+                    ) {
+                        if (isSelected) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    imageVector = Icons.Default.Check,
+                                    contentDescription = "محدد",
+                                    tint = MaterialTheme.colorScheme.onPrimary,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                        }
                     }
                 }
 

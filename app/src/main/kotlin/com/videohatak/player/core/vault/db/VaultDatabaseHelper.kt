@@ -18,6 +18,7 @@ interface VaultDatabaseStore {
     fun getAllVideos(): List<VaultVideo>
     fun getVideoById(id: Long): VaultVideo?
     fun deleteVideo(id: Long): Int
+    fun getVideoCount(): Int = getAllVideos().size
 }
 
 class VaultDatabaseHelper(context: Context) : SQLiteOpenHelper(
@@ -272,5 +273,13 @@ class VaultDatabaseHelper(context: Context) : SQLiteOpenHelper(
     override fun deleteVideo(id: Long): Int {
         val db = writableDatabase
         return db.delete(TABLE_VAULT, "$COLUMN_ID = ?", arrayOf(id.toString()))
+    }
+
+    override fun getVideoCount(): Int {
+        val db = readableDatabase
+        val cursor = db.rawQuery("SELECT COUNT(*) FROM $TABLE_VAULT", null)
+        return cursor.use {
+            if (it.moveToFirst()) it.getInt(0) else 0
+        }
     }
 }

@@ -11,6 +11,7 @@ import com.videohatak.player.core.model.VideoItem
 import com.videohatak.player.core.playback.PlaybackMode
 import com.videohatak.player.core.playback.PlaybackPositionManager
 import com.videohatak.player.core.playback.PlaybackPreferencesRepository
+import com.videohatak.player.core.playback.PlayerOrientationMode
 import com.videohatak.player.core.playback.PlayerUiState
 import com.videohatak.player.core.playback.PositionSavePolicy
 import com.videohatak.player.core.playback.ResumeMode
@@ -260,6 +261,18 @@ class PlayerViewModel(
                 playerManager.setSeekIntervalSeconds(seconds)
             }
         }
+        viewModelScope.launch {
+            playbackPreferences.playerOrientationMode.collect { orientationMode ->
+                playerManager.setPlayerOrientationMode(orientationMode)
+            }
+        }
+        safeSubtitlePreferences?.let { prefs ->
+            viewModelScope.launch {
+                prefs.showSourceTextWithTranslation.collect { showSource ->
+                    playerManager.setShowSourceTextWithTranslation(showSource)
+                }
+            }
+        }
     }
 
     val uiState: StateFlow<PlayerUiState> = playerManager.uiState
@@ -434,7 +447,8 @@ class PlayerViewModel(
                     startIndex = startIndex,
                     shuffle = effectiveShuffle,
                     repeatMode = effectiveRepeatMode,
-                    startPositionMs = 0L
+                    startPositionMs = 0L,
+                    activePlaylistId = playlistId
                 )
                 onPlaylistStarted?.invoke(startVideo)
                 val targetGen = playerManager.getCurrentPlaybackGeneration()
@@ -508,6 +522,39 @@ class PlayerViewModel(
     fun nextTrack(): Boolean = playerManager.nextTrack()
 
     fun previousTrack(): Boolean = playerManager.previousTrack()
+
+    fun removeCurrentVideoFromActivePlaylist(
+        onRemoved: (playlistWasEmptied: Boolean) -> Unit = {}
+    ) {
+        val state = playerManager.uiState.value
+        val activePlId = state.activePlaylistId ?: return
+        val targetVideo = currentVideo
+        val targetUri = state.mediaUri ?: targetVideo?.contentUri
+        val targetVideoId = targetVideo?.id
+
+        viewModelScope.launch {
+            playlistRepository.removeVideoByIdOrUriFromPlaylist(
+                playlistId = activePlId,
+                videoId = targetVideoId,
+                contentUri = targetUri?.toString()
+            )
+            playlistVideos = playlistVideos.filterNot { item ->
+                (targetVideoId != null && item.id == targetVideoId) ||
+                    (targetUri != null && item.contentUri == targetUri)
+            }
+            val stillPlaying = playerManager.removePlaylistMediaItem(targetVideoId, targetUri)
+            if (!stillPlaying || playlistVideos.isEmpty()) {
+                stopPlaybackCompletely()
+                onRemoved(true)
+            } else {
+                val newActiveUri = playerManager.uiState.value.mediaUri
+                currentVideo = playlistVideos.firstOrNull { it.contentUri == newActiveUri }
+                    ?: playlistVideos.firstOrNull()
+                currentVideo?.let { safeThumbnailManager?.setVideoUri(it.contentUri) }
+                onRemoved(false)
+            }
+        }
+    }
 
     fun setTemporaryPlaybackSpeed(speed: Float = 2.0f) {
         playerManager.setTemporaryPlaybackSpeed(speed)
@@ -611,6 +658,26 @@ class PlayerViewModel(
         val next = playerManager.uiState.value.resizeModeEnum.next()
         setVideoResizeMode(next)
         return next
+    }
+
+    fun setPlayerOrientationMode(mode: PlayerOrientationMode) {
+        playerManager.setPlayerOrientationMode(mode)
+        viewModelScope.launch {
+            playbackPreferences.setPlayerOrientationMode(mode)
+        }
+    }
+
+    fun cycleOrientationMode(): PlayerOrientationMode {
+        val next = playerManager.uiState.value.playerOrientationMode.next()
+        setPlayerOrientationMode(next)
+        return next
+    }
+
+    fun setShowSourceTextWithTranslation(show: Boolean) {
+        playerManager.setShowSourceTextWithTranslation(show)
+        viewModelScope.launch {
+            safeSubtitlePreferences?.setShowSourceTextWithTranslation(show)
+        }
     }
 
     fun toggleControls() = playerManager.toggleControls()
@@ -899,7 +966,8 @@ class PlayerViewModel(
         assignAsSecondary: Boolean = false
     ) {
         val completed = _translationStatus.value as? TranslationJobStatus.Completed ?: return
-        val cues = completed.pairs.map { it.toTranslatedCue() }
+        val includeSource = playerManager.uiState.value.showSourceTextWithTranslation
+        val cues = completed.pairs.map { it.toCue(includeSource) }
         if (cues.isEmpty()) return
 
         viewModelScope.launch {

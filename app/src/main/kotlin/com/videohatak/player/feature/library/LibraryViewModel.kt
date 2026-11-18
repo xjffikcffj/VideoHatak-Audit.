@@ -1,6 +1,7 @@
 package com.videohatak.player.feature.library
 
 import android.content.IntentSender
+import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -169,6 +170,123 @@ class LibraryViewModel(
         }
     }
 
+    fun moveVideosToFolder(
+        videos: List<VideoItem>,
+        targetRelativePath: String,
+        targetFolderName: String
+    ) {
+        val publicVideos = videos.filterNot {
+            it.bucketId == "secure_vault" || it.contentUri.scheme.equals("vault", ignoreCase = true)
+        }
+        if (publicVideos.isEmpty()) return
+        if (publicVideos.size == 1) {
+            moveVideoToFolder(publicVideos.first(), targetRelativePath, targetFolderName)
+            return
+        }
+        viewModelScope.launch {
+            processBatchMove(
+                PendingVideoFileOp.BatchMove(
+                    remainingVideos = publicVideos,
+                    targetRelativePath = targetRelativePath,
+                    targetFolderName = targetFolderName
+                )
+            )
+        }
+    }
+
+    private suspend fun processBatchMove(op: PendingVideoFileOp.BatchMove) {
+        val remaining = op.remainingVideos.toMutableList()
+        var moved = op.movedCount
+        var failed = op.failedCount
+
+        while (remaining.isNotEmpty()) {
+            val video = remaining.removeAt(0)
+            when (val res = videoRepository.moveVideoToFolder(video, op.targetRelativePath, op.targetFolderName)) {
+                is VideoFileOperationResult.Success -> moved++
+                is VideoFileOperationResult.RequiresPermission -> {
+                    val resumeList = listOf(video) + remaining
+                    pendingFileOp = PendingVideoFileOp.BatchMove(
+                        remainingVideos = resumeList,
+                        targetRelativePath = op.targetRelativePath,
+                        targetFolderName = op.targetFolderName,
+                        movedCount = moved,
+                        failedCount = failed
+                    )
+                    _events.tryEmit(LibraryUiEvent.LaunchWritePermission(res.intentSender))
+                    return
+                }
+                is VideoFileOperationResult.RequiresLegacyWritePermission -> {
+                    val resumeList = listOf(video) + remaining
+                    pendingFileOp = PendingVideoFileOp.BatchMove(
+                        remainingVideos = resumeList,
+                        targetRelativePath = op.targetRelativePath,
+                        targetFolderName = op.targetFolderName,
+                        movedCount = moved,
+                        failedCount = failed
+                    )
+                    _events.tryEmit(LibraryUiEvent.RequestLegacyWritePermission(res.permission))
+                    return
+                }
+                is VideoFileOperationResult.Error -> failed++
+            }
+        }
+
+        loadVideos()
+        val msg = when {
+            moved > 0 && failed == 0 -> "تم نقل $moved فيديو إلى \"${op.targetFolderName}\""
+            moved > 0 && failed > 0 -> "تم نقل $moved فيديو إلى \"${op.targetFolderName}\"، وتعذر نقل $failed"
+            else -> "تعذر نقل الفيديوهات المحددة"
+        }
+        _events.tryEmit(LibraryUiEvent.ShowMessage(msg))
+    }
+
+    fun deleteMovedVaultOriginals(
+        sourceUris: List<Uri>,
+        encryptedCount: Int,
+        encryptedFailedCount: Int = 0
+    ) {
+        if (encryptedCount <= 0 && encryptedFailedCount <= 0) return
+        viewModelScope.launch {
+            if (sourceUris.isEmpty()) {
+                loadVideos()
+                val msg = if (encryptedFailedCount > 0) {
+                    "تم تشفير وحفظ $encryptedCount في الخزنة، وتعذر استيراد $encryptedFailedCount"
+                } else {
+                    "تم حفظ $encryptedCount فيديو في الخزنة الخاصة"
+                }
+                _events.tryEmit(LibraryUiEvent.ShowMessage(msg))
+                return@launch
+            }
+            when (val res = videoRepository.deleteVaultOriginals(sourceUris, encryptedCount)) {
+                is VideoFileOperationResult.Success -> {
+                    loadVideos()
+                    val msg = if (encryptedFailedCount > 0) {
+                        "تم نقل $encryptedCount فيديو إلى الخزنة وحذف الأصل (تعذر نقل $encryptedFailedCount)"
+                    } else if (encryptedCount == 1) {
+                        "تم نقل الفيديو إلى الخزنة الخاصة وحذف الملف الأصلي"
+                    } else {
+                        "تم نقل $encryptedCount فيديو إلى الخزنة الخاصة وحذف الملفات الأصلية"
+                    }
+                    _events.tryEmit(LibraryUiEvent.ShowMessage(msg))
+                }
+                is VideoFileOperationResult.RequiresPermission -> {
+                    pendingFileOp = res.pendingOp
+                    _events.tryEmit(LibraryUiEvent.LaunchWritePermission(res.intentSender))
+                }
+                is VideoFileOperationResult.RequiresLegacyWritePermission -> {
+                    pendingFileOp = res.pendingOp
+                    _events.tryEmit(LibraryUiEvent.RequestLegacyWritePermission(res.permission))
+                }
+                is VideoFileOperationResult.Error -> {
+                    loadVideos()
+                    _events.tryEmit(
+                        LibraryUiEvent.ShowMessage("تم حفظ النسخة المشفرة في الخزنة ($encryptedCount)، لكن ${res.message}")
+                    )
+                }
+            }
+        }
+    }
+
     fun moveToTrash(video: VideoItem) {
         viewModelScope.launch {
             if (video.bucketId == "secure_vault" || video.contentUri.scheme.equals("vault", ignoreCase = true)) {
@@ -187,6 +305,46 @@ class LibraryViewModel(
                 val err = trashRepository?.trashError?.value ?: "تعذر نقل الفيديو إلى سلة المحذوفات"
                 _events.tryEmit(LibraryUiEvent.ShowMessage(err))
             }
+        }
+    }
+
+    fun trashVideos(videos: List<VideoItem>) {
+        if (videos.isEmpty()) return
+        if (videos.size == 1) {
+            moveToTrash(videos.first())
+            return
+        }
+        viewModelScope.launch {
+            var moved = 0
+            var failed = 0
+            val updates = LinkedHashMap<Long, MediaExistenceResult>()
+            val alreadyTrashed = trashedUrisFlow.value
+            for (video in videos) {
+                if (video.bucketId == "secure_vault" || video.contentUri.scheme.equals("vault", ignoreCase = true)) {
+                    failed++
+                    continue
+                }
+                if (video.contentUri.toString() in alreadyTrashed) {
+                    continue
+                }
+                val saved = trashRepository?.moveToTrash(video)
+                if (saved != null) {
+                    updates[saved.id] = MediaExistenceResult.Exists
+                    moved++
+                } else {
+                    failed++
+                }
+            }
+            if (updates.isNotEmpty()) {
+                _trashExistenceMap.value = _trashExistenceMap.value + updates
+            }
+            val msg = when {
+                moved > 0 && failed == 0 -> "تم نقل $moved فيديو إلى سلة المحذوفات"
+                moved > 0 && failed > 0 -> "تم نقل $moved فيديو إلى السلة، وتعذر نقل $failed"
+                failed > 0 -> "تعذر نقل الفيديوهات المحددة إلى سلة المحذوفات"
+                else -> "الفيديوهات المحددة موجودة بالفعل في سلة المحذوفات"
+            }
+            _events.tryEmit(LibraryUiEvent.ShowMessage(msg))
         }
     }
 
@@ -398,7 +556,28 @@ class LibraryViewModel(
             pendingBulkDeletedCount = 0
             pendingBulkFailedCount = 0
             if (!granted) {
-                _events.tryEmit(LibraryUiEvent.ShowMessage("لم يتم منح صلاحية تعديل الملف"))
+                when (op) {
+                    is PendingVideoFileOp.DeleteVaultOriginals -> {
+                        loadVideos()
+                        _events.tryEmit(
+                            LibraryUiEvent.ShowMessage(
+                                "تم حفظ النسخة المشفرة في الخزنة (${op.encryptedCount})، ولم يتم حذف الملفات الأصلية لعدم منح الإذن"
+                            )
+                        )
+                    }
+                    is PendingVideoFileOp.BatchMove -> {
+                        loadVideos()
+                        val msg = if (op.movedCount > 0) {
+                            "تم نقل ${op.movedCount} فيديو فقط، ولم يتم منح إذن لبقية الملفات"
+                        } else {
+                            "لم يتم منح صلاحية نقل الملفات المحددة"
+                        }
+                        _events.tryEmit(LibraryUiEvent.ShowMessage(msg))
+                    }
+                    else -> {
+                        _events.tryEmit(LibraryUiEvent.ShowMessage("لم يتم منح صلاحية تعديل الملف"))
+                    }
+                }
             }
             return
         }
@@ -412,6 +591,39 @@ class LibraryViewModel(
                     result = videoRepository.moveVideoToFolder(op.video, op.targetRelativePath, op.targetFolderName),
                     successMessage = "تم نقل الفيديو إلى \"${op.targetFolderName}\""
                 )
+                is PendingVideoFileOp.BatchMove -> {
+                    processBatchMove(op)
+                }
+                is PendingVideoFileOp.DeleteVaultOriginals -> {
+                    val res = videoRepository.completeVaultOriginalsDeleteAfterPermission(op)
+                    when (res) {
+                        is VideoFileOperationResult.Success -> {
+                            loadVideos()
+                            val msg = if (op.encryptedCount == 1) {
+                                "تم نقل الفيديو إلى الخزنة الخاصة وحذف الملف الأصلي"
+                            } else {
+                                "تم نقل ${op.encryptedCount} فيديو إلى الخزنة الخاصة وحذف الملفات الأصلية"
+                            }
+                            _events.tryEmit(LibraryUiEvent.ShowMessage(msg))
+                        }
+                        is VideoFileOperationResult.RequiresPermission -> {
+                            pendingFileOp = res.pendingOp
+                            _events.tryEmit(LibraryUiEvent.LaunchWritePermission(res.intentSender))
+                        }
+                        is VideoFileOperationResult.RequiresLegacyWritePermission -> {
+                            pendingFileOp = res.pendingOp
+                            _events.tryEmit(LibraryUiEvent.RequestLegacyWritePermission(res.permission))
+                        }
+                        is VideoFileOperationResult.Error -> {
+                            loadVideos()
+                            _events.tryEmit(
+                                LibraryUiEvent.ShowMessage(
+                                    "تم حفظ النسخة المشفرة (${op.encryptedCount}) في الخزنة، لكن ${res.message}"
+                                )
+                            )
+                        }
+                    }
+                }
                 is PendingVideoFileOp.DeletePermanent -> {
                     val verifyResult = videoRepository.completePermanentDeleteAfterPermission(op.video, op.trashItemId)
                     if (verifyResult is VideoFileOperationResult.Success) {

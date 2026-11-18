@@ -39,6 +39,8 @@ class VaultViewModel(
 
     val videos: StateFlow<List<VaultVideo>> = vaultVideos
 
+    val vaultCount: StateFlow<Int> = repository.vaultCount
+
     private val _isUnlocked = MutableStateFlow(false)
     val isUnlocked: StateFlow<Boolean> = _isUnlocked.asStateFlow()
 
@@ -154,25 +156,34 @@ class VaultViewModel(
         onSuccess: () -> Unit = {},
         onError: (String) -> Unit = {}
     ) {
-        biometricHelper.promptBiometric(
-            activity = activity,
-            title = "الخزنة المشفرة",
-            subtitle = "يرجى تأكيد هويتك لفتح مقاطع الفيديو المحمية",
-            onSuccess = {
-                viewModelScope.launch { securityPreferences?.resetPinLockout() }
-                val now = nowMsProvider()
-                repository.setUnlocked(true)
-                repository.recordActivity(now)
-                _isUnlocked.value = true
-                _biometricError.value = null
-                refresh()
-                onSuccess()
-            },
-            onError = { err ->
-                _biometricError.value = err
-                onError(err)
+        viewModelScope.launch {
+            val prefs = securityPreferences
+            if (prefs != null && !prefs.hasPinConfigured()) {
+                val msg = "أنشئ رمز PIN مستقل للخزنة أولًا قبل تفعيل أو استخدام البصمة"
+                _biometricError.value = msg
+                onError(msg)
+                return@launch
             }
-        )
+            biometricHelper.promptBiometric(
+                activity = activity,
+                title = "الخزنة المشفرة",
+                subtitle = "تأكيد إضافي بالبصمة (يمكنك استخدام رمز PIN الخاص بالخزنة)",
+                onSuccess = {
+                    viewModelScope.launch { securityPreferences?.resetPinLockout() }
+                    val now = nowMsProvider()
+                    repository.setUnlocked(true)
+                    repository.recordActivity(now)
+                    _isUnlocked.value = true
+                    _biometricError.value = null
+                    refresh()
+                    onSuccess()
+                },
+                onError = { err ->
+                    _biometricError.value = err
+                    onError(err)
+                }
+            )
+        }
     }
 
     fun unlockWithPin(
@@ -209,13 +220,57 @@ class VaultViewModel(
         }
     }
 
+    fun setupInitialVaultPinAndUnlock(
+        pin: String,
+        nowMs: Long = nowMsProvider(),
+        onComplete: (Boolean, String) -> Unit = { _, _ -> }
+    ) {
+        if (!VaultPinHasher.isValidPinFormat(pin)) {
+            val msg = "يجب أن يتكون رمز الخزنة من 4 إلى 12 رقمًا فقط"
+            _biometricError.value = msg
+            onComplete(false, msg)
+            return
+        }
+        viewModelScope.launch {
+            val prefs = securityPreferences
+            if (prefs == null) {
+                onComplete(false, "تعذر الوصول إلى إعدادات أمان الخزنة")
+                return@launch
+            }
+            if (prefs.hasPinConfigured()) {
+                onComplete(false, "رمز الخزنة مُعيَّن بالفعل، أدخل الرمز لفتح الخزنة")
+                return@launch
+            }
+            val saved = prefs.setPin(pin)
+            if (saved) {
+                repository.setUnlocked(true)
+                repository.recordActivity(nowMs)
+                _isUnlocked.value = true
+                _biometricError.value = null
+                refresh()
+                onComplete(true, "تم إنشاء رمز الخزنة المستقل بنجاح")
+            } else {
+                onComplete(false, "تعذر حفظ رمز الخزنة")
+            }
+        }
+    }
+
     fun setVaultPin(pin: String, onComplete: (Boolean, String) -> Unit = { _, _ -> }) {
         if (!VaultPinHasher.isValidPinFormat(pin)) {
             onComplete(false, "يجب أن يتكون الرمز من 4 إلى 12 رقمًا فقط")
             return
         }
         viewModelScope.launch {
-            val saved = securityPreferences?.setPin(pin) == true
+            val prefs = securityPreferences
+            if (prefs == null) {
+                onComplete(false, "تعذر حفظ رمز PIN")
+                return@launch
+            }
+            if (prefs.hasPinConfigured()) {
+                onComplete(false, "لتغيير الرمز يجب إدخال رمز PIN الحالي أولًا")
+                return@launch
+            }
+            val saved = prefs.setPin(pin)
             repository.recordActivity(nowMsProvider())
             if (saved) {
                 onComplete(true, "تم حفظ رمز PIN للخزنة بأمان (تشفير PBKDF2)")
@@ -225,10 +280,47 @@ class VaultViewModel(
         }
     }
 
+    fun changeVaultPin(
+        currentPin: String,
+        newPin: String,
+        onComplete: (Boolean, String) -> Unit = { _, _ -> }
+    ) {
+        if (!VaultPinHasher.isValidPinFormat(newPin)) {
+            onComplete(false, "يجب أن يتكون الرمز الجديد من 4 إلى 12 رقمًا فقط")
+            return
+        }
+        viewModelScope.launch {
+            val prefs = securityPreferences
+            if (prefs == null) {
+                onComplete(false, "تعذر الوصول إلى إعدادات أمان الخزنة")
+                return@launch
+            }
+            if (!prefs.hasPinConfigured()) {
+                val saved = prefs.setPin(newPin)
+                repository.recordActivity(nowMsProvider())
+                onComplete(saved, if (saved) "تم حفظ رمز PIN للخزنة بنجاح" else "تعذر حفظ رمز PIN")
+                return@launch
+            }
+            when (val verifyResult = prefs.verifyPinWithRateLimit(currentPin, nowMsProvider())) {
+                is PinVerifyResult.Success -> {
+                    val saved = prefs.setPin(newPin)
+                    repository.recordActivity(nowMsProvider())
+                    onComplete(saved, if (saved) "تم تحديث رمز PIN الخاص بالخزنة بنجاح" else "تعذر تحديث رمز PIN")
+                }
+                is PinVerifyResult.InvalidPin -> {
+                    onComplete(false, "رمز PIN الحالي غير صحيح (المحاولة ${verifyResult.failedAttempts})")
+                }
+                is PinVerifyResult.LockedOut -> {
+                    val waitSec = ((verifyResult.remainingMs + 999L) / 1000L).coerceAtLeast(1L)
+                    onComplete(false, "تم تعليق المحاولة مؤقتًا بعد عدة أخطاء — انتظر $waitSec ثانية")
+                }
+            }
+        }
+    }
+
     fun removeVaultPin(onComplete: () -> Unit = {}) {
         viewModelScope.launch {
-            securityPreferences?.clearPin()
-            repository.recordActivity(nowMsProvider())
+            // Vault always enforces an independent PIN; keep current PIN unless explicitly reset safely.
             onComplete()
         }
     }
@@ -343,6 +435,38 @@ class VaultViewModel(
             if (!deleted && repository.vaultError.value.isNullOrBlank()) {
                 _actionError.value = "تعذر حذف الفيديو من الخزنة"
             }
+        }
+    }
+
+    fun deleteVideos(
+        videoIds: Set<Long>,
+        onComplete: (succeededCount: Int, failedCount: Int) -> Unit = { _, _ -> }
+    ) {
+        if (videoIds.isEmpty()) {
+            onComplete(0, 0)
+            return
+        }
+        viewModelScope.launch {
+            _actionError.value = null
+            var succeeded = 0
+            var failed = 0
+            for (videoId in videoIds) {
+                try {
+                    beforeDeleteVideoHook?.invoke(videoId)
+                } catch (ce: kotlinx.coroutines.CancellationException) {
+                    throw ce
+                } catch (_: Throwable) {
+                }
+                if (repository.deleteVaultVideo(videoId)) {
+                    succeeded++
+                } else {
+                    failed++
+                }
+            }
+            if (failed > 0 && repository.vaultError.value.isNullOrBlank()) {
+                _actionError.value = "تم حذف $succeeded وتعذر حذف $failed من الخزنة"
+            }
+            onComplete(succeeded, failed)
         }
     }
 

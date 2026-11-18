@@ -31,4 +31,14 @@ interface PlaylistRepository {
     suspend fun isFavorite(video: VideoItem): Boolean = false
     suspend fun toggleFavorite(video: VideoItem): Boolean = false
     suspend fun getFavoriteVideoKeys(): Pair<Set<Long>, Set<String>> = emptySet<Long>() to emptySet()
+    suspend fun getFavoritesPlaylistWithItems(): Pair<Playlist, List<PlaylistItem>>? = null
+    suspend fun addVideosToPlaylists(videos: List<VideoItem>, playlistIds: List<Long>): Int = 0
+    suspend fun removeVideosFromPlaylist(itemIds: List<Long>, playlistId: Long): Int = 0
+    suspend fun addVideosToFavorites(videos: List<VideoItem>): Int = 0
+    suspend fun removeVideosFromFavorites(videos: List<VideoItem>): Int = 0
+    suspend fun removeVideoByIdOrUriFromPlaylist(
+        playlistId: Long,
+        videoId: Long?,
+        contentUri: String?
+    ): Boolean = false
 }

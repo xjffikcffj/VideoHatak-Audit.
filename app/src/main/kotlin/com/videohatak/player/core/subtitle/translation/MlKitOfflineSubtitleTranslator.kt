@@ -253,18 +253,27 @@ class MlKitOfflineSubtitleTranslator(
                 val translatedText = if (turns.isEmpty()) {
                     cue.text
                 } else if (turns.size == 1 && turns[0].prefix.isEmpty()) {
-                    val protected = SubtitleTurnAndGlossaryHelper.protectGlossaryTerms(turns[0].cleanText, glossary)
-                    val rawTranslated = activeTranslator.translate(protected.maskedText).awaitTaskResult()
-                    val restored = SubtitleTurnAndGlossaryHelper.restoreGlossaryTerms(rawTranslated, protected)
-                    ContextAwareDialogueTranslator.formatSubtitleLines(restored).ifBlank { cue.text }
+                    translateSingleTurnOffline(
+                        translator = activeTranslator,
+                        rawCleanText = turns[0].cleanText,
+                        sourceLanguage = resolvedSource,
+                        targetLanguage = targetLanguage,
+                        glossary = glossary,
+                        fallbackText = cue.text
+                    )
                 } else {
                     val translatedTurns = buildList(turns.size) {
                         for (segment in turns) {
                             coroutineContext.ensureActive()
-                            val protected = SubtitleTurnAndGlossaryHelper.protectGlossaryTerms(segment.cleanText, glossary)
-                            val rawTranslated = activeTranslator.translate(protected.maskedText).awaitTaskResult()
-                            val restored = SubtitleTurnAndGlossaryHelper.restoreGlossaryTerms(rawTranslated, protected)
-                            add("${segment.prefix}$restored".trim())
+                            val translatedSegment = translateSingleTurnOffline(
+                                translator = activeTranslator,
+                                rawCleanText = segment.cleanText,
+                                sourceLanguage = resolvedSource,
+                                targetLanguage = targetLanguage,
+                                glossary = glossary,
+                                fallbackText = segment.cleanText
+                            )
+                            add("${segment.prefix}$translatedSegment".trim())
                         }
                     }
                     translatedTurns.joinToString("\n")
@@ -308,5 +317,184 @@ class MlKitOfflineSubtitleTranslator(
             modelManager.markTranslationInUse(resolvedSource, false)
             modelManager.markTranslationInUse(targetLanguage, false)
         }
+    }
+
+    private suspend fun translateSingleTurnOffline(
+        translator: Translator,
+        rawCleanText: String,
+        sourceLanguage: SubtitleTranslationLanguage,
+        targetLanguage: SubtitleTranslationLanguage,
+        glossary: List<TranslationGlossaryEntry>,
+        fallbackText: String
+    ): String {
+        val protected = SubtitleTurnAndGlossaryHelper.protectGlossaryTerms(rawCleanText, glossary)
+        if (protected.tokenToTarget.isEmpty()) {
+            OfflineTranslationTextProcessor.lookupNaturalConversationalRescue(
+                sourceText = rawCleanText,
+                sourceLanguage = sourceLanguage,
+                targetLanguage = targetLanguage
+            )?.let { rescued ->
+                return ContextAwareDialogueTranslator.formatSubtitleLines(rescued).ifBlank { fallbackText }
+            }
+        }
+
+        val normalizedInput = OfflineTranslationTextProcessor.prepareSourceForTranslation(
+            text = protected.maskedText,
+            sourceLanguage = sourceLanguage
+        )
+        val rawTranslated = translator.translate(normalizedInput).awaitTaskResult()
+        val restored = SubtitleTurnAndGlossaryHelper.restoreGlossaryTerms(rawTranslated, protected)
+        val postProcessed = OfflineTranslationTextProcessor.postProcessTranslation(
+            translatedText = restored,
+            sourceText = rawCleanText,
+            sourceLanguage = sourceLanguage,
+            targetLanguage = targetLanguage
+        )
+        return ContextAwareDialogueTranslator.formatSubtitleLines(postProcessed).ifBlank { fallbackText }
+    }
+}
+
+/**
+ * Pure offline preprocessing & post-processing helper for spoken ASR / SRT dialogue.
+ * Fixes common quantized NMT failure modes (lowercase/unpunctuated Vosk phrases such as "i knew",
+ * missing apostrophes in spoken contractions, and degenerate single-token mistranslations).
+ */
+object OfflineTranslationTextProcessor {
+
+    private val STANDALONE_I_REGEX = Regex("\\bi\\b")
+    private val I_CONTRACTION_REGEX = Regex("\\bi(['’](?:m|ve|ll|d))\\b", RegexOption.IGNORE_CASE)
+    private val TERMINATES_SENTENCE_REGEX = Regex("[.!?؟…:;]$")
+    private val ENGLISH_QUESTION_PREFIX_REGEX = Regex(
+        "^(who|what|where|when|why|how|did|do|does|is|are|was|were|can|could|will|would|have|has|had|should|may|might)\\b",
+        RegexOption.IGNORE_CASE
+    )
+    private val MULTI_SPACE_REGEX = Regex("\\s+")
+    private val PUNCT_STRIP_REGEX = Regex("[\\p{Punct}؟،؛]+")
+
+    private val ASR_CONTRACTION_FIXES: List<Pair<Regex, String>> = listOf(
+        Regex("\\bim\\b", RegexOption.IGNORE_CASE) to "I'm",
+        Regex("\\bive\\b", RegexOption.IGNORE_CASE) to "I've",
+        Regex("\\bdont\\b", RegexOption.IGNORE_CASE) to "don't",
+        Regex("\\bcant\\b", RegexOption.IGNORE_CASE) to "can't",
+        Regex("\\bwont\\b", RegexOption.IGNORE_CASE) to "won't",
+        Regex("\\bdidnt\\b", RegexOption.IGNORE_CASE) to "didn't",
+        Regex("\\bdoesnt\\b", RegexOption.IGNORE_CASE) to "doesn't",
+        Regex("\\bisnt\\b", RegexOption.IGNORE_CASE) to "isn't",
+        Regex("\\barent\\b", RegexOption.IGNORE_CASE) to "aren't",
+        Regex("\\bwasnt\\b", RegexOption.IGNORE_CASE) to "wasn't",
+        Regex("\\bwerent\\b", RegexOption.IGNORE_CASE) to "weren't",
+        Regex("\\bhavent\\b", RegexOption.IGNORE_CASE) to "haven't",
+        Regex("\\bhasnt\\b", RegexOption.IGNORE_CASE) to "hasn't",
+        Regex("\\bshouldnt\\b", RegexOption.IGNORE_CASE) to "shouldn't",
+        Regex("\\bwouldnt\\b", RegexOption.IGNORE_CASE) to "wouldn't",
+        Regex("\\bcouldnt\\b", RegexOption.IGNORE_CASE) to "couldn't",
+        Regex("\\byoure\\b", RegexOption.IGNORE_CASE) to "you're",
+        Regex("\\btheyre\\b", RegexOption.IGNORE_CASE) to "they're",
+        Regex("\\bthats\\b", RegexOption.IGNORE_CASE) to "that's",
+        Regex("\\bwhats\\b", RegexOption.IGNORE_CASE) to "what's"
+    )
+
+    private val EN_TO_AR_CONVERSATIONAL_RESCUES: Map<String, String> = mapOf(
+        "i knew" to "كنت أعلم",
+        "i knew it" to "كنت أعلم ذلك",
+        "i knew that" to "كنت أعلم ذلك",
+        "i thought so" to "ظننت ذلك",
+        "i see" to "فهمت",
+        "i got it" to "فهمت الأمر",
+        "got it" to "فهمت",
+        "never mind" to "لا بأس",
+        "nevermind" to "لا بأس",
+        "of course" to "بالطبع",
+        "no way" to "مستحيل",
+        "hold on" to "انتظر لحظة",
+        "hang on" to "انتظر قليلًا",
+        "come on" to "هيا بنا",
+        "take care" to "اعتنِ بنفسك",
+        "my bad" to "خطئي، أعتذر",
+        "what's up" to "ما الأخبار؟",
+        "whats up" to "ما الأخبار؟",
+        "calm down" to "اهدأ",
+        "watch out" to "انتبه!",
+        "excuse me" to "عفوًا",
+        "you bet" to "بالتأكيد",
+        "right now" to "الآن"
+    )
+
+    fun prepareSourceForTranslation(
+        text: String,
+        sourceLanguage: SubtitleTranslationLanguage
+    ): String {
+        val collapsed = text.replace(MULTI_SPACE_REGEX, " ").trim()
+        if (collapsed.isEmpty()) return ""
+
+        if (sourceLanguage != SubtitleTranslationLanguage.ENGLISH) {
+            return collapsed
+        }
+
+        var normalized = collapsed
+        ASR_CONTRACTION_FIXES.forEach { (pattern, replacement) ->
+            normalized = pattern.replace(normalized, replacement)
+        }
+        normalized = STANDALONE_I_REGEX.replace(normalized, "I")
+        normalized = I_CONTRACTION_REGEX.replace(normalized) { match ->
+            "I" + match.groupValues[1].lowercase(java.util.Locale.US)
+        }
+
+        // Capitalize leading English character for NMT sentence-mode stability
+        val firstChar = normalized.firstOrNull()
+        if (firstChar != null && firstChar in 'a'..'z') {
+            normalized = firstChar.uppercaseChar() + normalized.substring(1)
+        }
+
+        // Add terminal punctuation if missing so short ASR clauses aren't truncated/mismapped
+        if (!TERMINATES_SENTENCE_REGEX.containsMatchIn(normalized)) {
+            val isQuestion = ENGLISH_QUESTION_PREFIX_REGEX.containsMatchIn(normalized)
+            normalized += if (isQuestion) "?" else "."
+        }
+        return normalized
+    }
+
+    fun lookupNaturalConversationalRescue(
+        sourceText: String,
+        sourceLanguage: SubtitleTranslationLanguage,
+        targetLanguage: SubtitleTranslationLanguage
+    ): String? {
+        if (sourceLanguage != SubtitleTranslationLanguage.ENGLISH ||
+            targetLanguage != SubtitleTranslationLanguage.ARABIC
+        ) {
+            return null
+        }
+        val key = sourceText
+            .replace(PUNCT_STRIP_REGEX, " ")
+            .replace(MULTI_SPACE_REGEX, " ")
+            .trim()
+            .lowercase(java.util.Locale.US)
+        return EN_TO_AR_CONVERSATIONAL_RESCUES[key]
+    }
+
+    fun postProcessTranslation(
+        translatedText: String,
+        sourceText: String,
+        sourceLanguage: SubtitleTranslationLanguage,
+        targetLanguage: SubtitleTranslationLanguage
+    ): String {
+        val clean = translatedText.replace(MULTI_SPACE_REGEX, " ").trim()
+        if (clean.isEmpty()) return sourceText
+
+        if (targetLanguage == SubtitleTranslationLanguage.ARABIC) {
+            // Check known corrupted short ML Kit artifact where past/cognitive EN line yields pure "الآن"
+            val rescued = lookupNaturalConversationalRescue(sourceText, sourceLanguage, targetLanguage)
+            if (rescued != null && (clean == "الآن" || clean == "الآن.")) {
+                return rescued
+            }
+            return clean
+                .replace(" ?", "؟")
+                .replace("?", "؟")
+                .replace(" ,", "،")
+                .replace(" .", ".")
+                .replace("..", ".")
+                .trim()
+        }
+        return clean
     }
 }

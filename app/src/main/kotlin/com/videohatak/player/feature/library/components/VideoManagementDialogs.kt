@@ -126,13 +126,18 @@ fun MoveVideoFolderDialog(
     video: VideoItem,
     existingFolders: List<VideoFolder>,
     onDismiss: () -> Unit,
-    onMoveToFolder: (relativePath: String, folderName: String) -> Unit
+    onMoveToFolder: (relativePath: String, folderName: String) -> Unit,
+    selectedCount: Int = 1
 ) {
     val palette = LocalVideoHatakPalette.current
     var customFolderName by remember { mutableStateOf("") }
 
-    val targetFolders = remember(existingFolders, video.bucketId) {
-        existingFolders.filter { it.bucketId != video.bucketId }
+    val targetFolders = remember(existingFolders, video.bucketId, selectedCount) {
+        if (selectedCount > 1) {
+            existingFolders
+        } else {
+            existingFolders.filter { it.bucketId != video.bucketId }
+        }
     }
 
     AlertDialog(
@@ -141,7 +146,10 @@ fun MoveVideoFolderDialog(
         titleContentColor = palette.onSurface,
         textContentColor = palette.onSurface,
         title = {
-            Text(text = "نقل الفيديو إلى مجلد", fontWeight = FontWeight.Bold)
+            Text(
+                text = if (selectedCount > 1) "نقل $selectedCount فيديو إلى مجلد" else "نقل الفيديو إلى مجلد",
+                fontWeight = FontWeight.Bold
+            )
         },
         text = {
             Column(
@@ -150,7 +158,7 @@ fun MoveVideoFolderDialog(
                     .verticalScroll(rememberScrollState())
             ) {
                 Text(
-                    text = video.safeTitle,
+                    text = if (selectedCount > 1) "سيتم نقل $selectedCount عنصر محدد إلى المجلد المختار" else video.safeTitle,
                     style = MaterialTheme.typography.bodySmall,
                     color = palette.onSurfaceMuted,
                     maxLines = 1,

@@ -215,7 +215,11 @@ class VideoPlayerManager internal constructor(
             if (isPlaying) {
                 startProgressPolling()
                 if (context != null && customExoPlayer == null) {
-                    VideoPlaybackService.startServiceForPlayback(context)
+                    if (isCurrentPlaybackVault()) {
+                        VideoPlaybackService.stopAndCancelNotification(context)
+                    } else {
+                        VideoPlaybackService.startServiceForPlayback(context)
+                    }
                 }
             } else {
                 stopProgressPolling()
@@ -389,6 +393,7 @@ class VideoPlayerManager internal constructor(
                 durationMs = 0L,
                 videoWidth = 0,
                 videoHeight = 0,
+                activePlaylistId = null,
                 isTemporarySpeedActive = false,
                 isPipActive = false,
                 isControlsVisible = true,
@@ -404,6 +409,9 @@ class VideoPlayerManager internal constructor(
         val publicMetadataTitle = MediaNotificationPrivacy.sanitizeMediaMetadataTitle(isVault, title)
 
         if (isVault) {
+            if (context != null && customExoPlayer == null) {
+                VideoPlaybackService.stopAndCancelNotification(context)
+            }
             val nonNullContext = checkNotNull(context) { "Context is required for vault encrypted media source" }
             val dataSourceFactory = { EncryptedVaultDataSource(nonNullContext) }
             val mediaSource = DefaultMediaSourceFactory(dataSourceFactory)
@@ -411,11 +419,7 @@ class VideoPlayerManager internal constructor(
                     MediaItem.Builder()
                         .setMediaId(uri.toString())
                         .setUri(uri)
-                        .setMediaMetadata(
-                            androidx.media3.common.MediaMetadata.Builder()
-                                .setTitle(publicMetadataTitle)
-                                .build()
-                        )
+                        .setMediaMetadata(androidx.media3.common.MediaMetadata.EMPTY)
                         .build()
                 )
             exoPlayer.setMediaSource(mediaSource, startPositionMs)
@@ -437,7 +441,11 @@ class VideoPlayerManager internal constructor(
         exoPlayer.prepare()
         exoPlayer.playWhenReady = true
         if (context != null && customExoPlayer == null) {
-            VideoPlaybackService.startServiceForPlayback(context)
+            if (isVault || isCurrentPlaybackVault()) {
+                VideoPlaybackService.stopAndCancelNotification(context)
+            } else {
+                VideoPlaybackService.startServiceForPlayback(context)
+            }
         }
     }
 
@@ -446,7 +454,8 @@ class VideoPlayerManager internal constructor(
         startIndex: Int = 0,
         shuffle: Boolean = false,
         repeatMode: PlaylistRepeatMode = PlaylistRepeatMode.OFF,
-        startPositionMs: Long = 0L
+        startPositionMs: Long = 0L,
+        activePlaylistId: Long? = null
     ) {
         if (items.isEmpty()) return
 
@@ -461,26 +470,31 @@ class VideoPlayerManager internal constructor(
         exoPlayer.clearMediaItems()
 
         internalTitlesByMediaKey.clear()
+        val validItemsHaveVault = items.any { MediaNotificationPrivacy.isVaultVideo(it) }
         val mediaItems = items.map { video ->
-            val mediaId = if (MediaNotificationPrivacy.isVaultVideo(video)) {
+            val isItemVault = MediaNotificationPrivacy.isVaultVideo(video)
+            val mediaId = if (isItemVault) {
                 video.contentUri.toString()
             } else {
                 video.id.toString()
             }
             internalTitlesByMediaKey[mediaId] = video.safeTitle
             internalTitlesByMediaKey[video.contentUri.toString()] = video.safeTitle
-            val metadataTitle = MediaNotificationPrivacy.sanitizeMediaMetadataTitle(
-                isVault = MediaNotificationPrivacy.isVaultVideo(video),
-                originalTitle = video.safeTitle
-            )
+            val metadata = if (isItemVault) {
+                androidx.media3.common.MediaMetadata.EMPTY
+            } else {
+                val metadataTitle = MediaNotificationPrivacy.sanitizeMediaMetadataTitle(
+                    isVault = false,
+                    originalTitle = video.safeTitle
+                )
+                androidx.media3.common.MediaMetadata.Builder()
+                    .setTitle(metadataTitle)
+                    .build()
+            }
             MediaItem.Builder()
                 .setMediaId(mediaId)
                 .setUri(video.contentUri)
-                .setMediaMetadata(
-                    androidx.media3.common.MediaMetadata.Builder()
-                        .setTitle(metadataTitle)
-                        .build()
-                )
+                .setMediaMetadata(metadata)
                 .build()
         }
 
@@ -495,6 +509,7 @@ class VideoPlayerManager internal constructor(
                 durationMs = startVideo.durationMs,
                 videoWidth = startVideo.width.coerceAtLeast(0),
                 videoHeight = startVideo.height.coerceAtLeast(0),
+                activePlaylistId = activePlaylistId,
                 repeatMode = repeatMode,
                 isTemporarySpeedActive = false,
                 isPipActive = false,
@@ -532,7 +547,11 @@ class VideoPlayerManager internal constructor(
         exoPlayer.prepare()
         exoPlayer.playWhenReady = true
         if (context != null && customExoPlayer == null) {
-            VideoPlaybackService.startServiceForPlayback(context)
+            if (validItemsHaveVault || isCurrentPlaybackVault()) {
+                VideoPlaybackService.stopAndCancelNotification(context)
+            } else {
+                VideoPlaybackService.startServiceForPlayback(context)
+            }
         }
     }
 
@@ -695,6 +714,59 @@ class VideoPlayerManager internal constructor(
         _uiState.update { it.copy(resizeMode = validCode) }
     }
 
+    fun setPlayerOrientationMode(mode: PlayerOrientationMode) {
+        _uiState.update { it.copy(playerOrientationMode = mode) }
+    }
+
+    fun setShowSourceTextWithTranslation(show: Boolean) {
+        _uiState.update { it.copy(showSourceTextWithTranslation = show) }
+    }
+
+    fun isCurrentPlaybackVault(): Boolean {
+        if (MediaNotificationPrivacy.isVaultUri(_uiState.value.mediaUri)) return true
+        return VideoPlaybackService.isVaultPlaybackActive(_exoPlayer)
+    }
+
+    fun removePlaylistMediaItem(videoId: Long?, contentUri: Uri?): Boolean {
+        val player = _exoPlayer ?: return false
+        val targetCount = player.mediaItemCount
+        if (targetCount <= 1) return false
+
+        var matchIdx = -1
+        val idStr = videoId?.toString()
+        val uriStr = contentUri?.toString()
+        for (i in 0 until targetCount) {
+            val item = player.getMediaItemAt(i)
+            val itemUri = item.localConfiguration?.uri?.toString()
+            if ((idStr != null && item.mediaId == idStr) ||
+                (!uriStr.isNullOrBlank() && (itemUri == uriStr || item.mediaId == uriStr))
+            ) {
+                matchIdx = i
+                break
+            }
+        }
+        if (matchIdx < 0) return false
+
+        player.removeMediaItem(matchIdx)
+        val activeItem = runCatching { player.currentMediaItem }.getOrNull()
+        val activeUri = activeItem?.localConfiguration?.uri
+        val activeTitle = activeItem?.let { item ->
+            val uriKey = activeUri?.toString().orEmpty()
+            internalTitlesByMediaKey[item.mediaId]
+                ?: internalTitlesByMediaKey[uriKey]
+                ?: item.mediaMetadata.title?.toString()
+        }.orEmpty()
+        _uiState.update {
+            it.copy(
+                mediaUri = activeUri ?: it.mediaUri,
+                title = activeTitle.ifBlank { it.title },
+                hasNextMediaItem = player.hasNextMediaItem(),
+                hasPreviousMediaItem = player.hasPreviousMediaItem()
+            )
+        }
+        return true
+    }
+
     fun toggleControls() {
         _uiState.update { it.copy(isControlsVisible = !it.isControlsVisible) }
     }
@@ -834,6 +906,9 @@ class VideoPlayerManager internal constructor(
         exoPlayer.stop()
         exoPlayer.clearMediaItems()
         stopProgressPolling()
+        if (context != null && customExoPlayer == null) {
+            VideoPlaybackService.stopAndCancelNotification(context)
+        }
         _uiState.update {
             it.copy(
                 isPlaying = false,
@@ -842,6 +917,7 @@ class VideoPlayerManager internal constructor(
                 title = "",
                 videoWidth = 0,
                 videoHeight = 0,
+                activePlaylistId = null,
                 isTemporarySpeedActive = false,
                 isPipActive = false,
                 isAudioOnlyMode = false,

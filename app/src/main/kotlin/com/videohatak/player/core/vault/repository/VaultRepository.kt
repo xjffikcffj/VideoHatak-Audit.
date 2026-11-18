@@ -29,6 +29,8 @@ import java.util.concurrent.ConcurrentHashMap
 interface VaultRepository {
     val vaultVideos: Flow<List<VaultVideo>>
     val isUnlocked: StateFlow<Boolean>
+    val vaultCount: StateFlow<Int>
+        get() = MutableStateFlow(0)
     val vaultError: StateFlow<String?>
         get() = MutableStateFlow(null)
     val lastActivityTimestampMs: Long
@@ -114,6 +116,11 @@ class VaultRepositoryImpl internal constructor(
     private val _vaultVideos = MutableStateFlow<List<VaultVideo>>(emptyList())
     override val vaultVideos: Flow<List<VaultVideo>> = _vaultVideos.asStateFlow()
 
+    private val _vaultCount = MutableStateFlow(
+        runCatching { dbHelper.getVideoCount() }.getOrDefault(0)
+    )
+    override val vaultCount: StateFlow<Int> = _vaultCount.asStateFlow()
+
     private val vaultDir: File by lazy {
         File(context.filesDir, "vault_encrypted").apply {
             if (!exists()) mkdirs()
@@ -134,6 +141,7 @@ class VaultRepositoryImpl internal constructor(
     }
 
     private fun refreshLocked() {
+        _vaultCount.value = runCatching { dbHelper.getVideoCount() }.getOrDefault(_vaultCount.value)
         if (!_isUnlocked.value) {
             _vaultVideos.value = emptyList()
             return
@@ -153,6 +161,7 @@ class VaultRepositoryImpl internal constructor(
         } else if (_vaultError.value == DECODE_ERROR_MESSAGE) {
             _vaultError.value = null
         }
+        _vaultCount.value = decoded.size
         _vaultVideos.update { decoded }
     }
 

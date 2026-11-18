@@ -31,12 +31,16 @@ interface PlaybackPreferencesRepository {
     val seekIntervalSeconds: Flow<Int>
         get() = flowOf(DEFAULT_SEEK_INTERVAL_SECONDS)
 
+    val playerOrientationMode: Flow<PlayerOrientationMode>
+        get() = flowOf(PlayerOrientationMode.DEFAULT)
+
     suspend fun setPlaybackSpeed(speed: Float)
     suspend fun setResizeMode(mode: Int)
     suspend fun setRepeatMode(mode: String)
     suspend fun setPlaybackMode(mode: PlaybackMode) {}
     suspend fun setResumeMode(mode: ResumeMode) {}
     suspend fun setSeekIntervalSeconds(seconds: Int) {}
+    suspend fun setPlayerOrientationMode(mode: PlayerOrientationMode) {}
     suspend fun saveVideoPosition(videoUri: String, positionMs: Long, durationMs: Long)
     suspend fun getSavedVideoPosition(videoUri: String, durationMs: Long = 0L, legacyVideoId: Long? = null): Long
     suspend fun exportSavedPositions(): Map<String, Long> = emptyMap()
@@ -72,6 +76,7 @@ class PlaybackPreferencesRepositoryImpl(
     private val playbackModeKey = stringPreferencesKey("playback_mode_v2")
     private val resumeModeKey = stringPreferencesKey("resume_mode_v1")
     private val seekIntervalKey = intPreferencesKey("seek_interval_seconds")
+    private val playerOrientationModeKey = stringPreferencesKey("player_orientation_mode_v1")
 
     private fun positionKey(uri: String): Preferences.Key<Long> {
         val digest = MessageDigest.getInstance("SHA-256").digest(uri.toByteArray(Charsets.UTF_8))
@@ -110,6 +115,10 @@ class PlaybackPreferencesRepositoryImpl(
         )
     }
 
+    override val playerOrientationMode: Flow<PlayerOrientationMode> = dataStore.data.map { prefs ->
+        PlayerOrientationMode.fromStorageCode(prefs[playerOrientationModeKey])
+    }
+
     override suspend fun setPlaybackSpeed(speed: Float) {
         dataStore.edit { prefs ->
             prefs[speedKey] = speed
@@ -145,6 +154,12 @@ class PlaybackPreferencesRepositoryImpl(
         val valid = PlaybackPreferencesRepository.sanitizeSeekIntervalSeconds(seconds)
         dataStore.edit { prefs ->
             prefs[seekIntervalKey] = valid
+        }
+    }
+
+    override suspend fun setPlayerOrientationMode(mode: PlayerOrientationMode) {
+        dataStore.edit { prefs ->
+            prefs[playerOrientationModeKey] = mode.storageCode
         }
     }
 

@@ -19,39 +19,36 @@ object VaultBiometricSupport {
         sdkInt: Int,
         checkAuth: (Int) -> Int
     ): BiometricCapability {
+        // Vault authentication MUST NEVER fall back to phone screen lock (DEVICE_CREDENTIAL).
+        // Biometrics are strictly an optional convenience paired with the independent Vault PIN.
         if (sdkInt >= Build.VERSION_CODES.R) {
-            val strongOrCred = BiometricManager.Authenticators.BIOMETRIC_STRONG or
-                BiometricManager.Authenticators.DEVICE_CREDENTIAL
-            val strongCredResult = safeCheckAuth(checkAuth, strongOrCred)
-            if (strongCredResult == BiometricManager.BIOMETRIC_SUCCESS) {
+            val strongResult = safeCheckAuth(checkAuth, BiometricManager.Authenticators.BIOMETRIC_STRONG)
+            if (strongResult == BiometricManager.BIOMETRIC_SUCCESS) {
                 return BiometricCapability(
                     isAvailable = true,
-                    allowedAuthenticators = strongOrCred,
-                    requiresNegativeButton = false
+                    allowedAuthenticators = BiometricManager.Authenticators.BIOMETRIC_STRONG,
+                    requiresNegativeButton = true
                 )
             }
 
-            val weakOrCred = BiometricManager.Authenticators.BIOMETRIC_WEAK or
-                BiometricManager.Authenticators.DEVICE_CREDENTIAL
-            val weakCredResult = safeCheckAuth(checkAuth, weakOrCred)
-            if (weakCredResult == BiometricManager.BIOMETRIC_SUCCESS) {
+            val weakResult = safeCheckAuth(checkAuth, BiometricManager.Authenticators.BIOMETRIC_WEAK)
+            if (weakResult == BiometricManager.BIOMETRIC_SUCCESS) {
                 return BiometricCapability(
                     isAvailable = true,
-                    allowedAuthenticators = weakOrCred,
-                    requiresNegativeButton = false
+                    allowedAuthenticators = BiometricManager.Authenticators.BIOMETRIC_WEAK,
+                    requiresNegativeButton = true
                 )
             }
 
             return BiometricCapability(
                 isAvailable = false,
                 allowedAuthenticators = 0,
-                requiresNegativeButton = false,
-                unavailableReasonArabic = mapStatusToArabicMessage(strongCredResult)
+                requiresNegativeButton = true,
+                unavailableReasonArabic = mapStatusToArabicMessage(strongResult)
             )
         }
 
         // API 24..29 (including Android 9 / API 28 and Android 10 / API 29):
-        // Avoid combining BIOMETRIC_STRONG with DEVICE_CREDENTIAL which is unsupported/throws on API 28-29.
         val weakResult = safeCheckAuth(checkAuth, BiometricManager.Authenticators.BIOMETRIC_WEAK)
         if (weakResult == BiometricManager.BIOMETRIC_SUCCESS) {
             return BiometricCapability(
@@ -89,12 +86,12 @@ object VaultBiometricSupport {
     fun mapStatusToArabicMessage(status: Int): String {
         return when (status) {
             BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED ->
-                "لا توجد بصمة مسجّلة على الجهاز حاليًا؛ يمكنك استخدام رمز PIN الاحتياطي."
+                "لا توجد بصمة مسجّلة على الجهاز حاليًا؛ استخدم رمز PIN الخاص بالخزنة."
             BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE,
             BiometricManager.BIOMETRIC_ERROR_UNSUPPORTED ->
-                "التحقق الحيوي غير مدعوم على هذا الإصدار أو الجهاز؛ استخدم رمز PIN."
+                "التحقق بالبصمة غير مدعوم على هذا الجهاز؛ استخدم رمز PIN الخاص بالخزنة."
             BiometricManager.BIOMETRIC_ERROR_HW_UNAVAILABLE ->
-                "مستشعر البصمة غير متاح حاليًا؛ حاول مجددًا أو استخدم رمز PIN."
+                "مستشعر البصمة غير متاح حاليًا؛ حاول مجددًا أو استخدم رمز PIN الخاص بالخزنة."
             else ->
                 "البصمة غير مفعّلة أو غير متاحة على هذا الجهاز حاليًا."
         }
@@ -149,16 +146,16 @@ class VaultBiometricHelper(
                             BiometricPrompt.ERROR_USER_CANCELED,
                             BiometricPrompt.ERROR_CANCELED,
                             BiometricPrompt.ERROR_NEGATIVE_BUTTON ->
-                                "تم إلغاء التحقق الحيوي. يمكنك المحاولة مجددًا أو استخدام رمز PIN."
+                                "تم إلغاء التحقق بالبصمة. يمكنك استخدام رمز PIN الخاص بالخزنة."
                             BiometricPrompt.ERROR_LOCKOUT,
                             BiometricPrompt.ERROR_LOCKOUT_PERMANENT ->
-                                "تم تقييد التحقق الحيوي مؤقتًا لكثرة المحاولات؛ استخدم رمز PIN أو قفل الجهاز."
+                                "تم تقييد التحقق بالبصمة مؤقتًا لكثرة المحاولات؛ استخدم رمز PIN الخاص بالخزنة."
                             BiometricPrompt.ERROR_NO_BIOMETRICS,
                             BiometricPrompt.ERROR_HW_NOT_PRESENT,
                             BiometricPrompt.ERROR_HW_UNAVAILABLE,
                             BiometricPrompt.ERROR_NO_DEVICE_CREDENTIAL ->
                                 "البصمة غير مفعّلة أو غير متاحة على هذا الجهاز حاليًا."
-                            else -> errString.toString().ifBlank { "تعذر إتمام التحقق الحيوي." }
+                            else -> errString.toString().ifBlank { "تعذر إتمام التحقق بالبصمة." }
                         }
                         onError(message)
                     }
@@ -176,12 +173,12 @@ class VaultBiometricHelper(
                 .setAllowedAuthenticators(capability.allowedAuthenticators)
 
             if (capability.requiresNegativeButton) {
-                promptBuilder.setNegativeButtonText("إلغاء")
+                promptBuilder.setNegativeButtonText("استخدام رمز PIN")
             }
 
             prompt.authenticate(promptBuilder.build())
         } catch (_: Exception) {
-            onError("تعذر تشغيل التحقق الحيوي على هذا الجهاز؛ استخدم رمز PIN.")
+            onError("تعذر تشغيل التحقق بالبصمة؛ استخدم رمز PIN الخاص بالخزنة.")
         }
     }
 }

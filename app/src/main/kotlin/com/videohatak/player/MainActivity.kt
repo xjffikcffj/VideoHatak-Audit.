@@ -18,6 +18,7 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -274,9 +275,12 @@ class MainActivity : FragmentActivity() {
             val selectedPlaylistWithItems by playlistViewModel.selectedPlaylistWithItems.collectAsStateWithLifecycle()
             val favoriteVideoIds by playlistViewModel.favoriteVideoIds.collectAsStateWithLifecycle()
             val favoriteVideoUris by playlistViewModel.favoriteVideoUris.collectAsStateWithLifecycle()
+            val favoritesPlaylistId by playlistViewModel.favoritesPlaylistId.collectAsStateWithLifecycle()
+            val favoriteItems by playlistViewModel.favoriteItems.collectAsStateWithLifecycle()
 
             val vaultIsUnlocked by vaultViewModel.isUnlocked.collectAsStateWithLifecycle()
             val vaultVideos by vaultViewModel.vaultVideos.collectAsStateWithLifecycle()
+            val vaultCount by vaultViewModel.vaultCount.collectAsStateWithLifecycle()
             val vaultImportState by vaultViewModel.importState.collectAsStateWithLifecycle()
             val vaultBiometricError by vaultViewModel.biometricError.collectAsStateWithLifecycle()
             val vaultError by vaultViewModel.vaultError.collectAsStateWithLifecycle()
@@ -287,6 +291,17 @@ class MainActivity : FragmentActivity() {
             val trashError by libraryViewModel.trashError.collectAsStateWithLifecycle()
             val trashExistenceMap by libraryViewModel.trashExistenceMap.collectAsStateWithLifecycle()
             val missingTrashItemPendingRemoval by libraryViewModel.missingTrashItemPendingRemoval.collectAsStateWithLifecycle()
+
+            val favoriteVideos = remember(favoriteItems, uiState.allVideos, trashItems) {
+                val trashedUriSet = trashItems.mapTo(HashSet()) { it.contentUri }
+                favoriteItems.filter { item ->
+                    item.isAvailable && item.contentUri !in trashedUriSet
+                }.map { item ->
+                    uiState.allVideos.firstOrNull {
+                        it.id == item.videoId || it.contentUri.toString() == item.contentUri
+                    } ?: item.toVideoItem()
+                }
+            }
 
             val exportBackupLauncher = rememberLauncherForActivityResult(
                 contract = ActivityResultContracts.CreateDocument("application/json")
@@ -333,8 +348,101 @@ class MainActivity : FragmentActivity() {
                     vaultViewModel.importVideoFromUri(
                         sourceUri = uri,
                         displayName = null,
-                        deleteOriginal = false
-                    )
+                        deleteOriginal = true
+                    ) { ok ->
+                        if (ok) {
+                            libraryViewModel.deleteMovedVaultOriginals(
+                                sourceUris = listOf(uri),
+                                encryptedCount = 1,
+                                encryptedFailedCount = 0
+                            )
+                        }
+                    }
+                }
+            }
+
+            fun isVaultPlaybackOngoing(): Boolean {
+                val active = activeVideoForPlayback ?: activeVideoState
+                val current = playerViewModel.currentVideo
+                val uri = playerUiState.mediaUri
+                return (active != null && MediaNotificationPrivacy.isVaultVideo(active)) ||
+                    (current != null && MediaNotificationPrivacy.isVaultVideo(current)) ||
+                    MediaNotificationPrivacy.isVaultUri(uri)
+            }
+
+            fun stopVaultPlaybackImmediatelyIfNeeded() {
+                if (isVaultPlaybackOngoing()) {
+                    activeVideoForPlayback = null
+                    activeVideoState = null
+                    playerViewModel.stopPlaybackCompletely()
+                    VideoPlaybackService.stopAndCancelNotification(this@MainActivity)
+                }
+            }
+
+            fun moveVideosToVault(videos: List<VideoItem>) {
+                val candidates = videos.filterNot { MediaNotificationPrivacy.isVaultVideo(it) }
+                if (candidates.isEmpty()) return
+                val activeUri = playerViewModel.uiState.value.mediaUri
+                    ?: activeVideoForPlayback?.contentUri
+                    ?: playerViewModel.currentVideo?.contentUri
+                val activeId = activeVideoForPlayback?.id ?: playerViewModel.currentVideo?.id
+                val movingActiveVideo = candidates.any { target ->
+                    target.contentUri == activeUri ||
+                        (activeId != null && activeId > 0L && target.id == activeId)
+                }
+                if (movingActiveVideo) {
+                    activeVideoForPlayback = null
+                    activeVideoState = null
+                    playerViewModel.stopPlaybackCompletely()
+                    VideoPlaybackService.stopAndCancelNotification(this@MainActivity)
+                }
+                val repo = VaultRepositoryImpl.getInstance(applicationContext)
+                uiScope.launch {
+                    val progressSnackbarJob = uiScope.launch {
+                        snackbarHostState.currentSnackbarData?.dismiss()
+                        snackbarHostState.showSnackbar(
+                            if (candidates.size == 1) {
+                                "جاري تشفير ونقل \"${candidates.first().safeTitle}\" إلى الخزنة الخاصة..."
+                            } else {
+                                "جاري تشفير ونقل ${candidates.size} فيديو إلى الخزنة الخاصة..."
+                            }
+                        )
+                    }
+                    val succeededUris = mutableListOf<Uri>()
+                    var failedCount = 0
+                    try {
+                        for (target in candidates) {
+                            val currentActiveUri = playerViewModel.uiState.value.mediaUri
+                            if (currentActiveUri == target.contentUri || activeVideoForPlayback?.contentUri == target.contentUri) {
+                                activeVideoForPlayback = null
+                                activeVideoState = null
+                                playerViewModel.stopPlaybackCompletely()
+                                VideoPlaybackService.stopAndCancelNotification(this@MainActivity)
+                            }
+                            val imported = repo.importVideo(
+                                sourceUri = target.contentUri,
+                                displayName = target.safeTitle
+                            )
+                            if (imported != null) {
+                                succeededUris.add(target.contentUri)
+                            } else {
+                                failedCount++
+                            }
+                        }
+                    } finally {
+                        progressSnackbarJob.cancel()
+                        snackbarHostState.currentSnackbarData?.dismiss()
+                    }
+                    vaultViewModel.refresh()
+                    if (succeededUris.isNotEmpty()) {
+                        libraryViewModel.deleteMovedVaultOriginals(
+                            sourceUris = succeededUris,
+                            encryptedCount = succeededUris.size,
+                            encryptedFailedCount = failedCount
+                        )
+                    } else if (failedCount > 0) {
+                        snackbarHostState.showSnackbar("تعذر تشفير ونقل الفيديوهات إلى الخزنة الخاصة")
+                    }
                 }
             }
 
@@ -355,19 +463,14 @@ class MainActivity : FragmentActivity() {
 
             LaunchedEffect(vaultIsUnlocked) {
                 if (!vaultIsUnlocked) {
-                    val activeIsVault = activeVideoForPlayback?.let { MediaNotificationPrivacy.isVaultVideo(it) } == true
-                    val playerIsVault = playerViewModel.currentVideo?.let { MediaNotificationPrivacy.isVaultVideo(it) } == true ||
-                        MediaNotificationPrivacy.isVaultUri(playerViewModel.uiState.value.mediaUri)
-                    if (activeIsVault || playerIsVault) {
-                        activeVideoForPlayback = null
-                        playerViewModel.stopPlaybackCompletely()
-                    }
+                    stopVaultPlaybackImmediatelyIfNeeded()
                 }
             }
 
             var previousTab by remember { mutableStateOf(currentTab) }
             LaunchedEffect(currentTab) {
                 if (previousTab == LibraryTab.VAULT && currentTab != LibraryTab.VAULT) {
+                    stopVaultPlaybackImmediatelyIfNeeded()
                     vaultViewModel.onVaultTabExited()
                 }
                 if (currentTab == LibraryTab.TRASH) {
@@ -480,11 +583,7 @@ class MainActivity : FragmentActivity() {
                                 playlistViewModel.createPlaylistAndAddVideo(name, targetVideo)
                             },
                             onAddToVault = { targetVideo ->
-                                vaultViewModel.importVideoFromUri(
-                                    sourceUri = targetVideo.contentUri,
-                                    displayName = targetVideo.safeTitle,
-                                    deleteOriginal = false
-                                )
+                                moveVideosToVault(listOf(targetVideo))
                             },
                             onRenameVideo = { targetVideo, newName ->
                                 if (MediaNotificationPrivacy.isVaultVideo(targetVideo)) {
@@ -496,12 +595,21 @@ class MainActivity : FragmentActivity() {
                                 }
                             },
                             onMoveToTrash = libraryViewModel::moveToTrash,
+                            onPlaylistMutated = {
+                                playlistViewModel.refresh()
+                            },
                             onUserInteraction = {
                                 if (activeVideo.bucketId == "secure_vault" || activeVideo.contentUri.scheme == "vault") {
                                     vaultViewModel.recordUserActivity()
                                 }
                             },
                             onBackClick = {
+                                val exitingVault = MediaNotificationPrivacy.isVaultVideo(activeVideo) ||
+                                    MediaNotificationPrivacy.isVaultUri(playerViewModel.uiState.value.mediaUri)
+                                if (exitingVault) {
+                                    playerViewModel.stopPlaybackCompletely()
+                                    VideoPlaybackService.stopAndCancelNotification(this@MainActivity)
+                                }
                                 activeVideoForPlayback = null
                             }
                         )
@@ -514,7 +622,21 @@ class MainActivity : FragmentActivity() {
                                 VideoHatakTopBar(
                                     title = stringResource(id = R.string.app_name),
                                     actions = {
-                                        // Discreet single lock action in top bar (dark mode & themes moved cleanly inside Settings)
+                                        IconButton(
+                                            onClick = {
+                                                libraryViewModel.clearFolderSelection()
+                                                libraryViewModel.onTabSelected(
+                                                    if (currentTab == LibraryTab.TRASH) LibraryTab.VIDEOS else LibraryTab.TRASH
+                                                )
+                                            }
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.DeleteOutline,
+                                                contentDescription = "سلة المهملات",
+                                                tint = if (currentTab == LibraryTab.TRASH) palette.accent else palette.onSurfaceMuted
+                                            )
+                                        }
+                                        // Discreet single lock action in top bar
                                         IconButton(
                                             onClick = {
                                                 libraryViewModel.clearFolderSelection()
@@ -548,18 +670,17 @@ class MainActivity : FragmentActivity() {
                                         height = playerUiState.videoHeight
                                     )
                                 }
-                                val isBgVault = backgroundVideo?.let { MediaNotificationPrivacy.isVaultVideo(it) } == true
+                                val isBgVault = backgroundVideo?.let { MediaNotificationPrivacy.isVaultVideo(it) } == true ||
+                                    MediaNotificationPrivacy.isVaultUri(playerUiState.mediaUri)
+                                // Never render MiniPlayerBar for Vault videos
                                 if (backgroundVideo != null &&
-                                    (!isBgVault || vaultIsUnlocked) &&
+                                    !isBgVault &&
                                     (playerUiState.isPlaying || playerUiState.currentPositionMs > 0)
                                 ) {
                                     MiniPlayerBar(
                                         video = backgroundVideo,
                                         uiState = playerUiState,
                                         onExpand = {
-                                            if (isBgVault) {
-                                                vaultViewModel.recordUserActivity()
-                                            }
                                             playerViewModel.setPipActive(false)
                                             playerViewModel.setControlsVisible(true)
                                             activeVideoForPlayback = backgroundVideo
@@ -619,16 +740,14 @@ class MainActivity : FragmentActivity() {
                                 onRenameVideo = libraryViewModel::renameVideo,
                                 onMoveVideoToFolder = libraryViewModel::moveVideoToFolder,
                                 onAddVideoToVault = { video ->
-                                    vaultViewModel.importVideoFromUri(
-                                        sourceUri = video.contentUri,
-                                        displayName = video.safeTitle,
-                                        deleteOriginal = false
-                                    )
-                                    uiScope.launch {
-                                        snackbarHostState.showSnackbar("تم بدء تشفير وإضافة \"${video.safeTitle}\" إلى الخزنة الخاصة")
-                                    }
+                                    moveVideosToVault(listOf(video))
                                 },
                                 onMoveVideoToTrash = libraryViewModel::moveToTrash,
+                                onMoveVideosToFolder = libraryViewModel::moveVideosToFolder,
+                                onAddVideosToVault = { videos ->
+                                    moveVideosToVault(videos)
+                                },
+                                onTrashVideos = libraryViewModel::trashVideos,
                                 trashItems = trashItems,
                                 trashError = trashError,
                                 trashExistenceMap = trashExistenceMap,
@@ -671,6 +790,9 @@ class MainActivity : FragmentActivity() {
                                 onRenamePlaylist = playlistViewModel::renamePlaylist,
                                 onDeletePlaylist = playlistViewModel::deletePlaylist,
                                 onRemovePlaylistItem = playlistViewModel::removeItemFromPlaylist,
+                                onRemovePlaylistItems = { itemIds, playlistId ->
+                                    playlistViewModel.removeItemsFromPlaylist(itemIds, playlistId)
+                                },
                                 onMovePlaylistItemUp = { index -> playlistViewModel.moveItem(index, index - 1) },
                                 onMovePlaylistItemDown = { index -> playlistViewModel.moveItem(index, index + 1) },
                                 onPlayPlaylist = { playlistId, startVideoId, shuffle ->
@@ -687,8 +809,23 @@ class MainActivity : FragmentActivity() {
                                     }
                                 },
                                 onAddToPlaylists = playlistViewModel::addVideoToPlaylists,
+                                onAddVideosToPlaylists = { list, ids ->
+                                    playlistViewModel.addVideosToPlaylists(list, ids)
+                                },
+                                favoritesPlaylistId = favoritesPlaylistId,
+                                favoriteVideos = favoriteVideos,
+                                favoriteVideoIds = favoriteVideoIds,
+                                favoriteVideoUris = favoriteVideoUris,
+                                onToggleFavorite = playlistViewModel::toggleFavorite,
+                                onAddVideosToFavorites = { list ->
+                                    playlistViewModel.addVideosToFavorites(list)
+                                },
+                                onRemoveVideosFromFavorites = { list ->
+                                    playlistViewModel.removeVideosFromFavorites(list)
+                                },
                                 vaultIsUnlocked = vaultIsUnlocked,
                                 vaultVideos = vaultVideos,
+                                vaultTotalCount = vaultCount,
                                 vaultImportState = vaultImportState,
                                 vaultBiometricError = vaultBiometricError,
                                 vaultError = vaultError,
@@ -701,18 +838,25 @@ class MainActivity : FragmentActivity() {
                                 onVaultUnlockWithPin = { pin ->
                                     vaultViewModel.unlockWithPin(pin)
                                 },
+                                onVaultSetupInitialPin = { pin, cb ->
+                                    vaultViewModel.setupInitialVaultPinAndUnlock(pin, onComplete = cb)
+                                },
+                                onVaultChangePin = { currentPin, newPin, cb ->
+                                    vaultViewModel.changeVaultPin(currentPin, newPin, cb)
+                                },
                                 onVaultSetPin = { newPin ->
                                     vaultViewModel.setVaultPin(newPin) { _, msg ->
                                         uiScope.launch { snackbarHostState.showSnackbar(msg) }
                                     }
                                 },
                                 onVaultRemovePin = {
-                                    vaultViewModel.removeVaultPin {
-                                        uiScope.launch { snackbarHostState.showSnackbar("تم إلغاء رمز PIN للخزنة") }
-                                    }
+                                    vaultViewModel.removeVaultPin()
                                 },
                                 onVaultSelectAutoLockTimeout = vaultViewModel::setAutoLockTimeout,
-                                onVaultLock = vaultViewModel::lockVault,
+                                onVaultLock = {
+                                    stopVaultPlaybackImmediatelyIfNeeded()
+                                    vaultViewModel.lockVault()
+                                },
                                 onVaultImportRequest = {
                                     vaultImportLauncher.launch("video/*")
                                 },
@@ -720,13 +864,16 @@ class MainActivity : FragmentActivity() {
                                 onVaultDismissImportState = vaultViewModel::dismissImportState,
                                 onVaultDismissError = vaultViewModel::clearError,
                                 onVaultVideoClick = { vaultVideo ->
-                                    requestNotificationIfNeeded()
+                                    // Never show notifications or PiP for Vault playback
                                     vaultViewModel.recordUserActivity()
                                     activeContextVideos = emptyList()
                                     activeVideoForPlayback = vaultVideo.toVideoItem()
                                 },
                                 onVaultRenameVideo = vaultViewModel::renameVideo,
                                 onVaultDeleteVideo = vaultViewModel::deleteVideo,
+                                onVaultDeleteVideos = { ids ->
+                                    vaultViewModel.deleteVideos(ids)
+                                },
                                 onVaultUserInteraction = vaultViewModel::recordUserActivity,
                                 seekIntervalSeconds = seekIntervalSeconds,
                                 onSelectSeekIntervalSeconds = playerViewModel::setSeekIntervalSeconds,
@@ -763,7 +910,17 @@ class MainActivity : FragmentActivity() {
 
     override fun onStop() {
         super.onStop()
+        val isVaultPlayback = (activeVideoState?.let { MediaNotificationPrivacy.isVaultVideo(it) } == true) ||
+            (playerViewModel.currentVideo?.let { MediaNotificationPrivacy.isVaultVideo(it) } == true) ||
+            MediaNotificationPrivacy.isVaultUri(playerViewModel.uiState.value.mediaUri)
         vaultViewModel.onAppBackgrounded()
+        if (isVaultPlayback) {
+            // Stop Vault playback immediately & never spawn any background notification/service
+            activeVideoState = null
+            playerViewModel.stopPlaybackCompletely()
+            VideoPlaybackService.stopAndCancelNotification(this)
+            return
+        }
         val exo = playerViewModel.playerManager.exoPlayer
         if (exo.mediaItemCount > 0 && (exo.playWhenReady || exo.isPlaying)) {
             VideoPlaybackService.startServiceForPlayback(this)

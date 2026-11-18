@@ -260,6 +260,113 @@ class PlaylistRepositoryImpl(
         ids to uris
     }
 
+    override suspend fun getFavoritesPlaylistWithItems(): Pair<Playlist, List<PlaylistItem>>? = withContext(Dispatchers.IO) {
+        val favoritesPlaylist = findAndMigrateFavoritesLocked() ?: return@withContext null
+        val items = getPlaylistItems(favoritesPlaylist.id)
+        favoritesPlaylist.copy(itemCount = items.size) to items
+    }
+
+    override suspend fun addVideosToPlaylists(videos: List<VideoItem>, playlistIds: List<Long>): Int = withContext(Dispatchers.IO) {
+        if (videos.isEmpty() || playlistIds.isEmpty()) return@withContext 0
+        var addedCount = 0
+        for (pId in playlistIds.distinct()) {
+            val existing = dbHelper.getItemsForPlaylist(pId)
+            var nextOrder = existing.size
+            val existingIds = existing.map { it.videoId }.toHashSet()
+            val existingUris = existing.mapNotNull { it.contentUri.takeIf { u -> u.isNotBlank() } }.toHashSet()
+            for (video in videos) {
+                val uriString = video.contentUri.toString()
+                val alreadyAdded = (video.id in existingIds) || (uriString.isNotBlank() && uriString in existingUris)
+                if (!alreadyAdded) {
+                    val inserted = dbHelper.insertItem(
+                        PlaylistItem(
+                            id = 0L,
+                            playlistId = pId,
+                            videoId = video.id,
+                            orderIndex = nextOrder++,
+                            videoTitle = video.safeTitle,
+                            durationMs = video.durationMs,
+                            sizeBytes = video.sizeBytes,
+                            dateAddedSec = video.dateAddedSec,
+                            contentUri = uriString,
+                            isAvailable = true
+                        )
+                    )
+                    if (inserted > 0L) {
+                        addedCount++
+                        existingIds.add(video.id)
+                        if (uriString.isNotBlank()) existingUris.add(uriString)
+                    }
+                }
+            }
+        }
+        if (addedCount > 0) refresh()
+        addedCount
+    }
+
+    override suspend fun removeVideosFromPlaylist(itemIds: List<Long>, playlistId: Long): Int = withContext(Dispatchers.IO) {
+        if (itemIds.isEmpty()) return@withContext 0
+        var removedCount = 0
+        for (itemId in itemIds.distinct()) {
+            if (dbHelper.deleteItem(itemId, playlistId) > 0) {
+                removedCount++
+            }
+        }
+        val remaining = dbHelper.getItemsForPlaylist(playlistId)
+        remaining.forEachIndexed { index, item ->
+            if (item.orderIndex != index) {
+                dbHelper.updateItemOrder(item.id, index)
+            }
+        }
+        refresh()
+        removedCount
+    }
+
+    override suspend fun addVideosToFavorites(videos: List<VideoItem>): Int = withContext(Dispatchers.IO) {
+        if (videos.isEmpty()) return@withContext 0
+        val fav = findAndMigrateFavoritesLocked()
+        val favId = fav?.id ?: dbHelper.insertPlaylist(PlaylistRepository.FAVORITES_PLAYLIST_TITLE)
+        if (favId <= 0L) return@withContext 0
+        addVideosToPlaylists(videos, listOf(favId))
+    }
+
+    override suspend fun removeVideosFromFavorites(videos: List<VideoItem>): Int = withContext(Dispatchers.IO) {
+        if (videos.isEmpty()) return@withContext 0
+        val fav = findAndMigrateFavoritesLocked() ?: return@withContext 0
+        val existing = dbHelper.getItemsForPlaylist(fav.id)
+        val targetIds = videos.map { it.id }.toSet()
+        val targetUris = videos.mapNotNull { it.contentUri.toString().takeIf { u -> u.isNotBlank() } }.toSet()
+        val matchingItemIds = existing
+            .filter { it.videoId in targetIds || it.contentUri in targetUris }
+            .map { it.id }
+        if (matchingItemIds.isEmpty()) return@withContext 0
+        removeVideosFromPlaylist(matchingItemIds, fav.id)
+    }
+
+    override suspend fun removeVideoByIdOrUriFromPlaylist(
+        playlistId: Long,
+        videoId: Long?,
+        contentUri: String?
+    ): Boolean = withContext(Dispatchers.IO) {
+        val items = dbHelper.getItemsForPlaylist(playlistId)
+        val matches = items.filter { item ->
+            (videoId != null && item.videoId == videoId) ||
+                (!contentUri.isNullOrBlank() && item.contentUri == contentUri)
+        }
+        if (matches.isEmpty()) return@withContext false
+        for (match in matches) {
+            dbHelper.deleteItem(match.id, playlistId)
+        }
+        val remaining = dbHelper.getItemsForPlaylist(playlistId)
+        remaining.forEachIndexed { index, item ->
+            if (item.orderIndex != index) {
+                dbHelper.updateItemOrder(item.id, index)
+            }
+        }
+        refresh()
+        true
+    }
+
     private fun isMediaAvailable(uri: Uri): Boolean {
         return try {
             if (uri.scheme == "vault") {

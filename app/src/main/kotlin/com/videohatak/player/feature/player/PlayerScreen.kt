@@ -123,6 +123,7 @@ fun PlayerScreen(
     onAddToVault: (VideoItem) -> Unit = {},
     onRenameVideo: (VideoItem, String) -> Unit = { _, _ -> },
     onMoveToTrash: (VideoItem) -> Unit = {},
+    onPlaylistMutated: () -> Unit = {},
     onUserInteraction: () -> Unit = {},
     onBackClick: () -> Unit,
     modifier: Modifier = Modifier
@@ -295,10 +296,15 @@ fun PlayerScreen(
         }
     }
 
+    val orientationMode = uiState.playerOrientationMode
+    DisposableEffect(orientationMode) {
+        activity?.requestedOrientation = orientationMode.activityOrientation
+        onDispose { }
+    }
+
     DisposableEffect(Unit) {
         val originalOrientation = activity?.requestedOrientation ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         val originalBrightness = activity?.window?.attributes?.screenBrightness ?: -1f
-        activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         onDispose {
             viewModel.setPipActive(false)
             viewModel.clearTemporaryPlaybackSpeed()
@@ -721,12 +727,13 @@ fun PlayerScreen(
                 onReplay10 = { viewModel.seekBackward() },
                 onToggleLock = viewModel::toggleLock,
                 onRotateScreen = {
-                    val targetLandscape = !isLandscape
-                    activity?.requestedOrientation = if (targetLandscape) {
-                        ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-                    } else {
-                        ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
-                    }
+                    val next = viewModel.cycleOrientationMode()
+                    statusBannerText = "تدوير الشاشة: ${next.arabicLabel}"
+                    viewModel.setControlsVisible(true)
+                },
+                onCycleOrientationMode = {
+                    val next = viewModel.cycleOrientationMode()
+                    statusBannerText = "تدوير الشاشة: ${next.arabicLabel}"
                     viewModel.setControlsVisible(true)
                 },
                 onCaptureFrame = {
@@ -787,6 +794,17 @@ fun PlayerScreen(
                 },
                 onSelectPlaybackMode = viewModel::setPlaybackMode,
                 isFavorite = isFavorite,
+                isPlayingFromPlaylist = uiState.activePlaylistId != null,
+                onRemoveFromPlaylist = {
+                    viewModel.removeCurrentVideoFromActivePlaylist { emptied ->
+                        onPlaylistMutated()
+                        if (emptied) {
+                            onBackClick()
+                        } else {
+                            statusBannerText = "تمت إزالة الفيديو من القائمة فقط"
+                        }
+                    }
+                },
                 onAddToPlaylist = {
                     if (isVaultVideo) {
                         statusBannerText = "لا يمكن إضافة مقاطع الخزنة الخاصة إلى قوائم التشغيل العامة"
@@ -808,7 +826,7 @@ fun PlayerScreen(
                         statusBannerText = "هذا الفيديو موجود بالفعل داخل الخزنة الخاصة"
                     } else {
                         onAddToVault(activeVideoItem)
-                        statusBannerText = "تم بدء تشفير وإضافة \"${activeVideoItem.safeTitle}\" إلى الخزنة الخاصة"
+                        statusBannerText = "تم بدء نقل وتشفير \"${activeVideoItem.safeTitle}\" إلى الخزنة الخاصة"
                     }
                 },
                 onRenameVideo = {
@@ -981,7 +999,9 @@ fun PlayerScreen(
                 onCancelTranslationDownload = viewModel::cancelTranslationModelDownload,
                 onDeleteTranslationModel = viewModel::deleteTranslationModel,
                 onDownloadRequiredPair = viewModel::downloadRequiredModelsForPair,
-                isVaultVideo = isVaultVideo
+                isVaultVideo = isVaultVideo,
+                showSourceTextWithTranslation = uiState.showSourceTextWithTranslation,
+                onToggleShowSourceText = viewModel::setShowSourceTextWithTranslation
             )
         }
 

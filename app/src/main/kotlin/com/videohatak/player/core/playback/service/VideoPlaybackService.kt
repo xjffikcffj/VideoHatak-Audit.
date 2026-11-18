@@ -50,18 +50,56 @@ class VideoPlaybackService : MediaSessionService() {
         const val ACTION_STOP = "com.videohatak.player.action.STOP"
 
         fun startServiceForPlayback(context: Context) {
+            val player = runCatching { VideoPlayerManager.getInstance(context.applicationContext).exoPlayer }.getOrNull()
+            if (isVaultPlaybackActive(player)) {
+                stopAndCancelNotification(context)
+                return
+            }
             try {
                 val intent = Intent(context, VideoPlaybackService::class.java)
                 ContextCompat.startForegroundService(context, intent)
             } catch (_: Exception) {
             }
         }
+
+        fun stopAndCancelNotification(context: Context) {
+            try {
+                val manager = context.getSystemService(NotificationManager::class.java)
+                manager?.cancel(NOTIFICATION_ID)
+            } catch (_: Exception) {
+            }
+            try {
+                context.stopService(Intent(context, VideoPlaybackService::class.java))
+            } catch (_: Exception) {
+            }
+        }
+
+        internal fun isVaultPlaybackActive(player: Player?): Boolean {
+            if (player == null) return false
+            if (MediaNotificationPrivacy.isVaultMediaItem(player.currentMediaItem)) return true
+            for (i in 0 until player.mediaItemCount) {
+                if (MediaNotificationPrivacy.isVaultMediaItem(player.getMediaItemAt(i))) return true
+            }
+            return false
+        }
+
+        internal fun shouldKeepForegroundNotification(
+            mediaItemCount: Int,
+            playbackState: Int,
+            isVaultPrivate: Boolean
+        ): Boolean {
+            if (isVaultPrivate) return false
+            if (mediaItemCount <= 0) return false
+            return playbackState == Player.STATE_READY || playbackState == Player.STATE_BUFFERING
+        }
     }
 
     private val playerListener = object : Player.Listener {
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             val player = attachedPlayer ?: return
-            if (player.mediaItemCount == 0 && player.playbackState == Player.STATE_IDLE) {
+            if (isVaultPlaybackActive(player) ||
+                (player.mediaItemCount == 0 && player.playbackState == Player.STATE_IDLE)
+            ) {
                 stopForegroundServiceCleanly()
                 return
             }
@@ -70,6 +108,11 @@ class VideoPlaybackService : MediaSessionService() {
 
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
             val player = attachedPlayer ?: return
+            if (isVaultPlaybackActive(player) || MediaNotificationPrivacy.isVaultMediaItem(mediaItem)) {
+                stopForegroundServiceCleanly()
+                stopSelf()
+                return
+            }
             if (mediaItem != null) {
                 currentArtworkUriKey = null
                 currentArtworkBitmap = null
@@ -79,21 +122,27 @@ class VideoPlaybackService : MediaSessionService() {
 
         override fun onPlaybackStateChanged(playbackState: Int) {
             val player = attachedPlayer ?: return
+            if (isVaultPlaybackActive(player)) {
+                stopForegroundServiceCleanly()
+                stopSelf()
+                return
+            }
             if (playbackState == Player.STATE_IDLE && player.mediaItemCount == 0) {
                 stopForegroundServiceCleanly()
             } else if (playbackState == Player.STATE_BUFFERING || playbackState == Player.STATE_READY) {
                 updateNotification(player, shouldStayForeground(player))
             } else if (playbackState == Player.STATE_ENDED) {
-                updateNotification(player, keepForeground = false)
+                stopForegroundServiceCleanly()
             }
         }
     }
 
     private fun shouldStayForeground(player: Player): Boolean {
-        if (player.mediaItemCount == 0 || player.playbackState == Player.STATE_IDLE || player.playbackState == Player.STATE_ENDED) {
-            return false
-        }
-        return player.isPlaying || player.playWhenReady || player.playbackState == Player.STATE_BUFFERING
+        return shouldKeepForegroundNotification(
+            mediaItemCount = player.mediaItemCount,
+            playbackState = player.playbackState,
+            isVaultPrivate = isVaultPlaybackActive(player)
+        )
     }
 
     override fun onCreate() {
@@ -122,11 +171,19 @@ class VideoPlaybackService : MediaSessionService() {
     }
 
     /**
-     * Prevent Media3's internal notification manager from conflicting with our custom foreground
-     * notification on NOTIFICATION_ID = 1001.
+     * Prevent Media3's internal notification manager from exposing any Vault item
+     * or replacing NOTIFICATION_ID = 1001.
      */
     override fun onUpdateNotification(session: MediaSession, startInForegroundRequired: Boolean) {
         val player = attachedPlayer ?: session.player
+        if (isVaultPlaybackActive(player)) {
+            if (startInForegroundRequired && !isForegroundStarted && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                postTransientSilentCleanupForeground()
+            }
+            stopForegroundServiceCleanly()
+            stopSelf()
+            return
+        }
         if (player.mediaItemCount > 0 || startInForegroundRequired) {
             updateNotification(player, keepForeground = startInForegroundRequired || shouldStayForeground(player))
         }
@@ -136,6 +193,15 @@ class VideoPlaybackService : MediaSessionService() {
         super.onStartCommand(intent, flags, startId)
         val playerManager = VideoPlayerManager.getInstance(applicationContext)
         val player = attachedPlayer ?: playerManager.exoPlayer
+
+        if (isVaultPlaybackActive(player)) {
+            if (!isForegroundStarted && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                postTransientSilentCleanupForeground()
+            }
+            stopForegroundServiceCleanly()
+            stopSelfResult(startId)
+            return START_NOT_STICKY
+        }
 
         when (intent?.action) {
             ACTION_PLAY_PAUSE -> {
@@ -161,12 +227,16 @@ class VideoPlaybackService : MediaSessionService() {
             }
         }
 
-        if (player.mediaItemCount > 0 || player.isPlaying || player.playWhenReady) {
+        val hasActiveMedia = player.mediaItemCount > 0 &&
+            player.playbackState != Player.STATE_IDLE &&
+            player.playbackState != Player.STATE_ENDED
+        if (hasActiveMedia || player.isPlaying || player.playWhenReady) {
             updateNotification(player, keepForeground = shouldStayForeground(player) || !isForegroundStarted)
             return START_STICKY
         } else {
-            // Satisfy startForeground contract when launched via startForegroundService, then shut down idle service
-            updateNotification(player, keepForeground = true)
+            if (!isForegroundStarted && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                postTransientSilentCleanupForeground()
+            }
             stopForegroundServiceCleanly()
             stopSelfResult(startId)
             return START_NOT_STICKY
@@ -176,6 +246,7 @@ class VideoPlaybackService : MediaSessionService() {
     override fun onTaskRemoved(rootIntent: Intent?) {
         val player = attachedPlayer
         val keepAlive = player != null &&
+            !isVaultPlaybackActive(player) &&
             player.mediaItemCount > 0 &&
             player.playWhenReady &&
             player.playbackState != Player.STATE_IDLE &&
@@ -188,6 +259,9 @@ class VideoPlaybackService : MediaSessionService() {
     }
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? {
+        if (isVaultPlaybackActive(attachedPlayer)) {
+            return null
+        }
         return mediaSession
     }
 
@@ -204,16 +278,24 @@ class VideoPlaybackService : MediaSessionService() {
     }
 
     private fun updateNotification(player: Player, keepForeground: Boolean) {
+        if (isVaultPlaybackActive(player)) {
+            stopForegroundServiceCleanly()
+            return
+        }
         val session = mediaSession ?: return
         val currentMediaItem = player.currentMediaItem
         val privacyMeta = MediaNotificationPrivacy.resolveNotificationMetadata(
             mediaItem = currentMediaItem,
             isPlaying = player.isPlaying || (player.playWhenReady && player.playbackState == Player.STATE_BUFFERING)
         )
+        if (privacyMeta.isVaultPrivate) {
+            stopForegroundServiceCleanly()
+            return
+        }
 
         val mediaUri = currentMediaItem?.localConfiguration?.uri
         val uriKey = mediaUri?.toString()
-        val artworkBitmap = resolveOrScheduleArtwork(mediaUri, uriKey, privacyMeta.isVaultPrivate)
+        val artworkBitmap = resolveOrScheduleArtwork(mediaUri, uriKey, isVaultPrivate = false)
 
         val notification = buildPlaybackNotification(
             session = session,
@@ -259,6 +341,10 @@ class VideoPlaybackService : MediaSessionService() {
                     isVaultPrivate = false
                 )
                 val player = attachedPlayer ?: return@launch
+                if (isVaultPlaybackActive(player)) {
+                    stopForegroundServiceCleanly()
+                    return@launch
+                }
                 val activeUriKey = player.currentMediaItem?.localConfiguration?.uri?.toString()
                 if (activeUriKey == uriKey && !loaded.isRecycled) {
                     currentArtworkBitmap = loaded
@@ -267,6 +353,10 @@ class VideoPlaybackService : MediaSessionService() {
                         mediaItem = player.currentMediaItem,
                         isPlaying = player.isPlaying || (player.playWhenReady && player.playbackState == Player.STATE_BUFFERING)
                     )
+                    if (privacyMeta.isVaultPrivate) {
+                        stopForegroundServiceCleanly()
+                        return@launch
+                    }
                     val refreshed = buildPlaybackNotification(
                         session = session,
                         privacyMeta = privacyMeta,
@@ -319,16 +409,16 @@ class VideoPlaybackService : MediaSessionService() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
-        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
+        return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setLargeIcon(artwork)
             .setContentTitle(privacyMeta.title)
             .setContentText(privacyMeta.contentText)
             .setContentIntent(contentIntent)
-            .setOngoing(isPlaying)
+            .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setSilent(true)
-            .setVisibility(privacyMeta.visibility)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .addAction(prevAction)
             .addAction(playPauseAction)
@@ -338,24 +428,31 @@ class VideoPlaybackService : MediaSessionService() {
                 MediaStyleNotificationHelper.MediaStyle(session)
                     .setShowActionsInCompactView(0, 1, 2)
             )
+            .build()
+    }
 
-        if (privacyMeta.isVaultPrivate) {
-            val publicVersionNotification = NotificationCompat.Builder(this, CHANNEL_ID)
-                .setSmallIcon(android.R.drawable.ic_media_play)
-                .setLargeIcon(MediaNotificationArtworkLoader.getFallbackArtwork(this))
-                .setContentTitle(MediaNotificationPrivacy.VAULT_MASKED_TITLE)
-                .setContentText(MediaNotificationPrivacy.VAULT_MASKED_TEXT)
-                .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-                .setSilent(true)
-                .build()
-            builder.setPublicVersion(publicVersionNotification)
+    private fun postTransientSilentCleanupForeground() {
+        val transientNotification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setContentTitle("")
+            .setContentText("")
+            .setSilent(true)
+            .setVisibility(NotificationCompat.VISIBILITY_SECRET)
+            .setPriority(NotificationCompat.PRIORITY_MIN)
+            .build()
+        val fgType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+        } else {
+            0
         }
-
-        return builder.build()
+        runCatching {
+            ServiceCompat.startForeground(this, NOTIFICATION_ID, transientNotification, fgType)
+            isForegroundStarted = true
+        }
     }
 
     private fun postNotification(notification: Notification, keepForeground: Boolean) {
-        if (!isForegroundStarted || keepForeground) {
+        if (keepForeground) {
             val fgType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
             } else {
@@ -364,16 +461,19 @@ class VideoPlaybackService : MediaSessionService() {
             ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, fgType)
             isForegroundStarted = true
         } else {
-            val manager = getSystemService(NotificationManager::class.java)
-            manager?.notify(NOTIFICATION_ID, notification)
-            ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_DETACH)
-            isForegroundStarted = false
+            stopForegroundServiceCleanly()
         }
     }
 
     private fun stopForegroundServiceCleanly() {
         isForegroundStarted = false
-        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+        runCatching {
+            ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+        }
+        runCatching {
+            val manager = getSystemService(NotificationManager::class.java)
+            manager?.cancel(NOTIFICATION_ID)
+        }
     }
 
     private fun createNotificationChannel() {

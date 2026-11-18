@@ -46,6 +46,8 @@ import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.RadioButtonDefaults
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -305,7 +307,9 @@ fun SmartSubtitleTranslationDialog(
         sourceLanguage: SubtitleTranslationLanguage,
         targetLanguage: SubtitleTranslationLanguage
     ) -> Unit = { _, _, _ -> },
-    isVaultVideo: Boolean = false
+    isVaultVideo: Boolean = false,
+    showSourceTextWithTranslation: Boolean = false,
+    onToggleShowSourceText: (Boolean) -> Unit = {}
 ) {
     val palette = LocalVideoHatakPalette.current
     val effectiveEngineMode = if (isVaultVideo) TranslationEngineMode.OFFLINE_ON_DEVICE else engineMode
@@ -1050,6 +1054,42 @@ fun SmartSubtitleTranslationDialog(
                     )
                 }
 
+                // Bilingual Display Option: Source text above translated line
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = palette.surfaceElevated,
+                    border = BorderStroke(0.75.dp, palette.border),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onToggleShowSourceText(!showSourceTextWithTranslation) }
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "عرض النص الأصلي مع الترجمة",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                color = palette.onSurface
+                            )
+                            Text(
+                                text = "يظهر السطر الأصلي أعلى الترجمة العربية مع الحفاظ على التوقيت",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = palette.onSurfaceMuted
+                            )
+                        }
+                        Switch(
+                            checked = showSourceTextWithTranslation,
+                            onCheckedChange = onToggleShowSourceText,
+                            colors = SwitchDefaults.colors(checkedThumbColor = palette.accent)
+                        )
+                    }
+                }
+
                 // Optional Cloud Proxy Configuration (kept separate from Offline mode)
                 if (!isVaultVideo && effectiveEngineMode == TranslationEngineMode.CLOUD_PROXY) {
                     Surface(
@@ -1287,7 +1327,7 @@ fun SmartSubtitleTranslationDialog(
                             OutlinedButton(
                                 onClick = {
                                     val exported = com.videohatak.player.core.subtitle.parser.SubtitleParser.exportSrt(
-                                        translationStatus.pairs.map { it.toTranslatedCue() }
+                                        translationStatus.pairs.map { it.toCue(showSourceTextWithTranslation) }
                                     )
                                     onExportTranslated(exported, SubtitleFormat.SRT)
                                 },

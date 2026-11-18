@@ -148,12 +148,27 @@ data class TranslatedCuePair(
     val originalText: String,
     val translatedText: String
 ) {
-    fun toTranslatedCue(): SubtitleCue = SubtitleCue(
-        index = index,
-        startTimeMs = startTimeMs,
-        endTimeMs = endTimeMs,
-        text = translatedText
-    )
+    fun toTranslatedCue(): SubtitleCue = toCue(includeSourceText = false)
+
+    fun toCue(includeSourceText: Boolean): SubtitleCue {
+        val cleanOriginal = originalText.trim()
+        val cleanTranslated = translatedText.trim()
+        val formattedText = if (
+            includeSourceText &&
+            cleanOriginal.isNotBlank() &&
+            !cleanOriginal.equals(cleanTranslated, ignoreCase = true)
+        ) {
+            "$cleanOriginal\n$cleanTranslated"
+        } else {
+            cleanTranslated.ifBlank { cleanOriginal }
+        }
+        return SubtitleCue(
+            index = index,
+            startTimeMs = startTimeMs,
+            endTimeMs = endTimeMs,
+            text = formattedText
+        )
+    }
 }
 
 data class SubtitleBatchRequest(

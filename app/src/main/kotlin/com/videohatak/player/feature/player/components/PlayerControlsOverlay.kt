@@ -6,71 +6,60 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.AspectRatio
-import androidx.compose.material.icons.filled.CameraAlt
-import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Edit
-import androidx.compose.material.icons.filled.Favorite
-import androidx.compose.material.icons.filled.FavoriteBorder
-import androidx.compose.material.icons.filled.FastForward
 import androidx.compose.material.icons.filled.Forward10
 import androidx.compose.material.icons.filled.Headphones
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.MoreVert
-import androidx.compose.material.icons.filled.PauseCircle
-import androidx.compose.material.icons.filled.PictureInPicture
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PhotoCamera
+import androidx.compose.material.icons.filled.PictureInPictureAlt
 import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.PlayCircle
 import androidx.compose.material.icons.filled.PlaylistAdd
+import androidx.compose.material.icons.filled.PlaylistRemove
 import androidx.compose.material.icons.filled.Repeat
-import androidx.compose.material.icons.filled.RepeatOne
-import androidx.compose.material.icons.filled.Replay
 import androidx.compose.material.icons.filled.Replay10
 import androidx.compose.material.icons.filled.ScreenRotation
-import androidx.compose.material.icons.filled.Shuffle
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
-import androidx.compose.material.icons.filled.StopCircle
+import androidx.compose.material.icons.filled.Speed
+import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.filled.StarBorder
+import androidx.compose.material.icons.filled.StayCurrentLandscape
+import androidx.compose.material.icons.filled.StayCurrentPortrait
 import androidx.compose.material.icons.filled.Subtitles
 import androidx.compose.material.icons.filled.ZoomOutMap
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.RadioButton
-import androidx.compose.material3.RadioButtonDefaults
-import androidx.compose.material3.Slider
-import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -81,27 +70,31 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import com.videohatak.player.core.designsystem.theme.LocalVideoHatakPalette
 import com.videohatak.player.core.playback.PlaybackMode
+import com.videohatak.player.core.playback.PlayerOrientationMode
 import com.videohatak.player.core.playback.PlayerUiState
 import com.videohatak.player.core.playback.VideoPlayerManager
 import com.videohatak.player.core.playback.VideoResizeMode
+import com.videohatak.player.core.playback.service.MediaNotificationPrivacy
 import com.videohatak.player.core.thumbnail.model.ThumbnailPreviewState
 import kotlin.math.roundToInt
 
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun PlayerControlsOverlay(
     uiState: PlayerUiState,
     thumbnailState: ThumbnailPreviewState,
-    zoomScale: Float = 1f,
+    zoomScale: Float,
     onBack: () -> Unit,
     onPlayPause: () -> Unit,
-    onPreviousTrack: () -> Unit = {},
-    onNextTrack: () -> Unit = {},
+    onPreviousTrack: () -> Unit,
+    onNextTrack: () -> Unit,
     onSeekStart: (Long, Float) -> Unit,
     onSeekProgress: (Long, Float) -> Unit,
     onSeekStop: (Long) -> Unit,
@@ -109,239 +102,75 @@ fun PlayerControlsOverlay(
     onReplay10: () -> Unit,
     onToggleLock: () -> Unit,
     onRotateScreen: () -> Unit = {},
-    onCaptureFrame: () -> Unit = {},
-    onResetZoom: () -> Unit = {},
+    onCycleOrientationMode: () -> Unit = onRotateScreen,
+    onCaptureFrame: () -> Unit,
+    onResetZoom: () -> Unit,
     isPipAllowed: Boolean = true,
     onEnterPip: () -> Unit,
     onCycleResizeMode: () -> Unit,
+    @Suppress("UNUSED_PARAMETER")
     onSelectResizeMode: (VideoResizeMode) -> Unit = {},
     onOpenSubtitlesDialog: () -> Unit,
     onSpeedClick: () -> Unit,
+    @Suppress("UNUSED_PARAMETER")
     onSelectSpeed: (Float) -> Unit = {},
     onSelectPlaybackMode: (PlaybackMode) -> Unit = {},
     isFavorite: Boolean = false,
-    onAddToPlaylist: () -> Unit = {},
-    onToggleFavorite: () -> Unit = {},
-    onAddToVault: () -> Unit = {},
-    onRenameVideo: () -> Unit = {},
-    onMoveToTrash: () -> Unit = {},
-    onShowDetails: () -> Unit = {},
-    onToggleAudioOnly: () -> Unit = {},
+    isPlayingFromPlaylist: Boolean = uiState.activePlaylistId != null,
+    onRemoveFromPlaylist: () -> Unit = {},
+    onAddToPlaylist: () -> Unit,
+    onToggleFavorite: () -> Unit,
+    onAddToVault: () -> Unit,
+    onRenameVideo: () -> Unit,
+    onMoveToTrash: () -> Unit,
+    onShowDetails: () -> Unit,
+    onToggleAudioOnly: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val palette = LocalVideoHatakPalette.current
-    var showPlaybackModeDialog by remember { mutableStateOf(false) }
-    var showSpeedDialog by remember { mutableStateOf(false) }
-    var showResizeDialog by remember { mutableStateOf(false) }
-    var showOptionsMenu by remember { mutableStateOf(false) }
+    var moreMenuExpanded by remember { mutableStateOf(false) }
+    var playbackModeSubmenuExpanded by remember { mutableStateOf(false) }
 
-    if (showPlaybackModeDialog) {
-        AlertDialog(
-            onDismissRequest = { showPlaybackModeDialog = false },
-            containerColor = palette.surface,
-            titleContentColor = palette.onSurface,
-            textContentColor = palette.onSurface,
-            title = { Text("وضع التشغيل", fontWeight = FontWeight.Bold) },
-            text = {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .verticalScroll(rememberScrollState()),
-                    verticalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    PlaybackMode.entries.forEach { mode ->
-                        val selected = uiState.playbackMode == mode
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(10.dp))
-                                .clickable {
-                                    onSelectPlaybackMode(mode)
-                                    showPlaybackModeDialog = false
-                                }
-                                .padding(horizontal = 6.dp, vertical = 6.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            RadioButton(
-                                selected = selected,
-                                onClick = {
-                                    onSelectPlaybackMode(mode)
-                                    showPlaybackModeDialog = false
-                                },
-                                colors = RadioButtonDefaults.colors(selectedColor = palette.accent)
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = mode.titleArabic,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.SemiBold,
-                                    color = if (selected) palette.accent else palette.onSurface
-                                )
-                                Text(
-                                    text = mode.descriptionArabic,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = palette.onSurfaceMuted
-                                )
-                            }
-                        }
-                    }
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = { showPlaybackModeDialog = false }) {
-                    Text("إغلاق", color = palette.accent)
-                }
-            }
-        )
-    }
-
-    if (showSpeedDialog) {
-        AlertDialog(
-            onDismissRequest = { showSpeedDialog = false },
-            containerColor = palette.surface,
-            titleContentColor = palette.onSurface,
-            textContentColor = palette.onSurface,
-            title = { Text("سرعة التشغيل", fontWeight = FontWeight.Bold) },
-            text = {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .verticalScroll(rememberScrollState()),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    Text(
-                        text = "السرعة الحالية: ${VideoPlayerManager.formatSpeedLabel(uiState.playbackSpeed)}",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = palette.accent
-                    )
-                    Slider(
-                        value = uiState.playbackSpeed.coerceIn(
-                            VideoPlayerManager.MIN_PLAYBACK_SPEED,
-                            VideoPlayerManager.MAX_PLAYBACK_SPEED
-                        ),
-                        onValueChange = { raw ->
-                            val snapped = (raw * 20f).roundToInt() / 20f
-                            onSelectSpeed(VideoPlayerManager.clampPlaybackSpeed(snapped))
-                        },
-                        valueRange = VideoPlayerManager.MIN_PLAYBACK_SPEED..VideoPlayerManager.MAX_PLAYBACK_SPEED,
-                        colors = SliderDefaults.colors(
-                            thumbColor = palette.accent,
-                            activeTrackColor = palette.accent,
-                            inactiveTrackColor = palette.border
-                        )
-                    )
-                    FlowRow(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        VideoPlayerManager.SUPPORTED_PLAYBACK_SPEEDS.forEach { speedOption ->
-                            val selected = kotlin.math.abs(uiState.playbackSpeed - speedOption) < 0.02f
-                            Surface(
-                                shape = RoundedCornerShape(10.dp),
-                                color = if (selected) palette.accent.copy(alpha = 0.22f) else palette.surfaceElevated,
-                                border = BorderStroke(
-                                    width = 1.dp,
-                                    color = if (selected) palette.accent else palette.border
-                                ),
-                                modifier = Modifier.clickable {
-                                    onSelectSpeed(speedOption)
-                                    showSpeedDialog = false
-                                }
-                            ) {
-                                Text(
-                                    text = VideoPlayerManager.formatSpeedLabel(speedOption),
-                                    style = MaterialTheme.typography.labelLarge,
-                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
-                                    color = if (selected) palette.accent else palette.onSurface,
-                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
-                                )
-                            }
-                        }
-                    }
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = { showSpeedDialog = false }) {
-                    Text("تم", color = palette.accent)
-                }
-            }
-        )
-    }
-
-    if (showResizeDialog) {
-        AlertDialog(
-            onDismissRequest = { showResizeDialog = false },
-            containerColor = palette.surface,
-            titleContentColor = palette.onSurface,
-            textContentColor = palette.onSurface,
-            title = { Text("نسبة العرض والمقاس", fontWeight = FontWeight.Bold) },
-            text = {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .verticalScroll(rememberScrollState()),
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    VideoResizeMode.entries.forEach { mode ->
-                        val selected = uiState.resizeModeEnum == mode
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(10.dp))
-                                .clickable {
-                                    onSelectResizeMode(mode)
-                                    showResizeDialog = false
-                                }
-                                .padding(horizontal = 8.dp, vertical = 8.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = mode.titleArabic,
-                                style = MaterialTheme.typography.bodyMedium,
-                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
-                                color = if (selected) palette.accent else palette.onSurface,
-                                modifier = Modifier.weight(1f)
-                            )
-                            if (selected) {
-                                Icon(
-                                    imageVector = Icons.Default.Check,
-                                    contentDescription = null,
-                                    tint = palette.accent
-                                )
-                            }
-                        }
-                    }
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = { showResizeDialog = false }) {
-                    Text("إغلاق", color = palette.accent)
-                }
-            }
-        )
-    }
+    val isVaultPlayback = MediaNotificationPrivacy.isVaultUri(uiState.mediaUri)
 
     Box(modifier = modifier.fillMaxSize()) {
+        // Locked screen mode: show only a discreet unlock pill when tapped
         if (uiState.isLocked) {
-            Box(
+            AnimatedVisibility(
+                visible = uiState.isControlsVisible,
+                enter = fadeIn(),
+                exit = fadeOut(),
                 modifier = Modifier
-                    .fillMaxSize()
-                    .padding(24.dp),
-                contentAlignment = Alignment.TopStart
+                    .align(Alignment.CenterStart)
+                    .safeDrawingPadding()
+                    .padding(16.dp)
             ) {
-                IconButton(
-                    onClick = onToggleLock,
+                Surface(
+                    shape = RoundedCornerShape(24.dp),
+                    color = palette.surface.copy(alpha = 0.88f),
+                    border = BorderStroke(1.dp, palette.accent),
                     modifier = Modifier
-                        .clip(CircleShape)
-                        .background(palette.surface.copy(alpha = 0.85f))
+                        .clip(RoundedCornerShape(24.dp))
+                        .clickable { onToggleLock() }
                 ) {
-                    Icon(
-                        imageVector = Icons.Default.Lock,
-                        contentDescription = "فتح القفل",
-                        tint = palette.accent
-                    )
+                    Row(
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.LockOpen,
+                            contentDescription = "فتح قفل الشاشة",
+                            tint = palette.accent,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "فتح القفل",
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = palette.onSurface
+                        )
+                    }
                 }
             }
             return@Box
@@ -350,344 +179,397 @@ fun PlayerControlsOverlay(
         AnimatedVisibility(
             visible = uiState.isControlsVisible,
             enter = fadeIn(),
-            exit = fadeOut()
+            exit = fadeOut(),
+            modifier = Modifier.fillMaxSize()
         ) {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(
-                        Brush.verticalGradient(
-                            colors = listOf(
-                                palette.background.copy(alpha = 0.84f),
-                                Color.Transparent,
-                                palette.background.copy(alpha = 0.88f)
-                            )
-                        )
-                    )
-            ) {
-                // Top Bar Controls
-                Row(
+            Box(modifier = Modifier.fillMaxSize()) {
+                // Top scrim + header bar
+                Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 8.dp, vertical = 10.dp)
-                        .align(Alignment.TopCenter),
-                    verticalAlignment = Alignment.CenterVertically
+                        .align(Alignment.TopCenter)
+                        .background(
+                            Brush.verticalGradient(
+                                listOf(Color.Black.copy(alpha = 0.78f), Color.Transparent)
+                            )
+                        )
+                        .safeDrawingPadding()
+                        .padding(horizontal = 10.dp, vertical = 8.dp)
                 ) {
-                    IconButton(onClick = onBack, modifier = Modifier.size(40.dp)) {
-                        Icon(
-                            imageVector = Icons.Default.ArrowBack,
-                            contentDescription = "تصغير والعودة مع إبقاء التشغيل",
-                            tint = palette.onSurface
-                        )
-                    }
-
-                    Text(
-                        text = uiState.title,
-                        style = MaterialTheme.typography.titleMedium,
-                        color = palette.onSurface,
-                        fontWeight = FontWeight.Bold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier
-                            .weight(1f)
-                            .padding(horizontal = 4.dp)
-                    )
-
-                    IconButton(onClick = onCaptureFrame, modifier = Modifier.size(38.dp)) {
-                        Icon(
-                            imageVector = Icons.Default.CameraAlt,
-                            contentDescription = "التقاط صورة من الفيديو",
-                            tint = palette.onSurface
-                        )
-                    }
-
-                    IconButton(onClick = onRotateScreen, modifier = Modifier.size(38.dp)) {
-                        Icon(
-                            imageVector = Icons.Default.ScreenRotation,
-                            contentDescription = "تدوير الشاشة",
-                            tint = palette.onSurface
-                        )
-                    }
-
-                    IconButton(onClick = onOpenSubtitlesDialog, modifier = Modifier.size(38.dp)) {
-                        Icon(
-                            imageVector = Icons.Default.Subtitles,
-                            contentDescription = "الترجمات",
-                            tint = palette.onSurface
-                        )
-                    }
-
-                    if (isPipAllowed) {
-                        IconButton(onClick = onEnterPip, modifier = Modifier.size(38.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        IconButton(onClick = onBack) {
                             Icon(
-                                imageVector = Icons.Default.PictureInPicture,
-                                contentDescription = "صورة في صورة",
-                                tint = palette.onSurface
-                            )
-                        }
-                    }
-
-                    IconButton(onClick = onToggleLock, modifier = Modifier.size(38.dp)) {
-                        Icon(
-                            imageVector = Icons.Default.LockOpen,
-                            contentDescription = "قفل الشاشة",
-                            tint = palette.onSurface
-                        )
-                    }
-
-                    Box {
-                        IconButton(
-                            onClick = { showOptionsMenu = true },
-                            modifier = Modifier.size(38.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.MoreVert,
-                                contentDescription = "المزيد من الخيارات",
-                                tint = palette.onSurface
+                                imageVector = Icons.Default.ArrowBack,
+                                contentDescription = "رجوع",
+                                tint = Color.White
                             )
                         }
 
-                        MaterialTheme(
-                            colorScheme = MaterialTheme.colorScheme.copy(surface = palette.surface)
-                        ) {
-                            DropdownMenu(
-                                expanded = showOptionsMenu,
-                                onDismissRequest = { showOptionsMenu = false },
-                                modifier = Modifier.heightIn(max = 280.dp)
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = uiState.title.ifBlank { "تشغيل الفيديو" },
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = Color.White,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            if (uiState.isAudioOnlyMode) {
+                                Text(
+                                    text = "وضع الاستماع فقط",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = palette.accent
+                                )
+                            }
+                        }
+
+                        if (!isVaultPlayback) {
+                            IconButton(onClick = onToggleFavorite) {
+                                Icon(
+                                    imageVector = if (isFavorite) Icons.Default.Star else Icons.Default.StarBorder,
+                                    contentDescription = if (isFavorite) "إزالة من المفضلة" else "إضافة للمفضلة",
+                                    tint = if (isFavorite) palette.accent else Color.White
+                                )
+                            }
+                        }
+
+                        // Strictly 3-dots menu at top trailing edge (NO standalone Vault icon button on overlay)
+                        Box {
+                            IconButton(onClick = { moreMenuExpanded = true }) {
+                                Icon(
+                                    imageVector = Icons.Default.MoreVert,
+                                    contentDescription = "خيارات المشغّل",
+                                    tint = Color.White
+                                )
+                            }
+
+                            MaterialTheme(
+                                colorScheme = MaterialTheme.colorScheme.copy(surface = palette.surface)
                             ) {
-                                DropdownMenuItem(
-                                    text = { Text("إضافة إلى قائمة تشغيل", color = palette.onSurface) },
-                                    leadingIcon = {
-                                        Icon(Icons.Default.PlaylistAdd, contentDescription = null, tint = palette.accent)
-                                    },
-                                    onClick = {
-                                        showOptionsMenu = false
-                                        onAddToPlaylist()
+                                DropdownMenu(
+                                    expanded = moreMenuExpanded,
+                                    onDismissRequest = {
+                                        moreMenuExpanded = false
+                                        playbackModeSubmenuExpanded = false
                                     }
-                                )
-                                DropdownMenuItem(
-                                    text = {
-                                        Text(
-                                            text = if (isFavorite) "إزالة من المفضلة" else "إضافة إلى المفضلة",
-                                            color = palette.onSurface
+                                ) {
+                                    // First option when playing from inside a playlist: "إزالة من القائمة"
+                                    if (isPlayingFromPlaylist) {
+                                        DropdownMenuItem(
+                                            text = {
+                                                Text(
+                                                    text = "إزالة من القائمة",
+                                                    color = palette.onSurface,
+                                                    fontWeight = FontWeight.SemiBold
+                                                )
+                                            },
+                                            leadingIcon = {
+                                                Icon(
+                                                    imageVector = Icons.Default.PlaylistRemove,
+                                                    contentDescription = null,
+                                                    tint = palette.accent
+                                                )
+                                            },
+                                            onClick = {
+                                                moreMenuExpanded = false
+                                                onRemoveFromPlaylist()
+                                            }
                                         )
-                                    },
-                                    leadingIcon = {
-                                        Icon(
-                                            imageVector = if (isFavorite) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
-                                            contentDescription = null,
-                                            tint = palette.accent
+                                        HorizontalDivider(color = palette.border.copy(alpha = 0.4f))
+                                    }
+
+                                    if (!isVaultPlayback) {
+                                        DropdownMenuItem(
+                                            text = { Text("إضافة إلى القائمة", color = palette.onSurface) },
+                                            leadingIcon = {
+                                                Icon(Icons.Default.PlaylistAdd, contentDescription = null, tint = palette.accent)
+                                            },
+                                            onClick = {
+                                                moreMenuExpanded = false
+                                                onAddToPlaylist()
+                                            }
                                         )
-                                    },
-                                    onClick = {
-                                        showOptionsMenu = false
-                                        onToggleFavorite()
-                                    }
-                                )
-                                DropdownMenuItem(
-                                    text = { Text("إضافة إلى الخزنة", color = palette.onSurface) },
-                                    leadingIcon = {
-                                        Icon(Icons.Default.Lock, contentDescription = null, tint = palette.accent)
-                                    },
-                                    onClick = {
-                                        showOptionsMenu = false
-                                        onAddToVault()
-                                    }
-                                )
-                                DropdownMenuItem(
-                                    text = { Text("تغيير اسم الفيديو", color = palette.onSurface) },
-                                    leadingIcon = {
-                                        Icon(Icons.Default.Edit, contentDescription = null, tint = palette.accent)
-                                    },
-                                    onClick = {
-                                        showOptionsMenu = false
-                                        onRenameVideo()
-                                    }
-                                )
-                                DropdownMenuItem(
-                                    text = { Text("نقل إلى سلة المهملات", color = MaterialTheme.colorScheme.error) },
-                                    leadingIcon = {
-                                        Icon(
-                                            Icons.Default.DeleteOutline,
-                                            contentDescription = null,
-                                            tint = MaterialTheme.colorScheme.error
+                                        DropdownMenuItem(
+                                            text = { Text("نقل إلى الخزنة", color = palette.onSurface) },
+                                            leadingIcon = {
+                                                Icon(Icons.Default.Lock, contentDescription = null, tint = palette.accent)
+                                            },
+                                            onClick = {
+                                                moreMenuExpanded = false
+                                                onAddToVault()
+                                            }
                                         )
-                                    },
-                                    onClick = {
-                                        showOptionsMenu = false
-                                        onMoveToTrash()
                                     }
-                                )
-                                DropdownMenuItem(
-                                    text = { Text("تفاصيل الفيديو", color = palette.onSurface) },
-                                    leadingIcon = {
-                                        Icon(Icons.Default.Info, contentDescription = null, tint = palette.accent)
-                                    },
-                                    onClick = {
-                                        showOptionsMenu = false
-                                        onShowDetails()
-                                    }
-                                )
-                                HorizontalDivider(color = palette.border.copy(alpha = 0.4f))
-                                DropdownMenuItem(
-                                    text = {
-                                        Text(
-                                            text = if (uiState.isAudioOnlyMode) "الاستماع فقط (مفعّل)" else "الاستماع فقط",
-                                            color = if (uiState.isAudioOnlyMode) palette.accent else palette.onSurface,
-                                            fontWeight = if (uiState.isAudioOnlyMode) FontWeight.Bold else FontWeight.Normal
-                                        )
-                                    },
-                                    leadingIcon = {
-                                        Icon(
-                                            imageVector = Icons.Default.Headphones,
-                                            contentDescription = null,
-                                            tint = palette.accent
-                                        )
-                                    },
-                                    trailingIcon = if (uiState.isAudioOnlyMode) {
-                                        {
-                                            Icon(
-                                                imageVector = Icons.Default.Check,
-                                                contentDescription = null,
-                                                tint = palette.accent
+
+                                    DropdownMenuItem(
+                                        text = { Text("الترجمة والذكاء المحلي", color = palette.onSurface) },
+                                        leadingIcon = {
+                                            Icon(Icons.Default.Subtitles, contentDescription = null, tint = palette.accent)
+                                        },
+                                        onClick = {
+                                            moreMenuExpanded = false
+                                            onOpenSubtitlesDialog()
+                                        }
+                                    )
+
+                                    DropdownMenuItem(
+                                        text = {
+                                            Text(
+                                                "السرعة (${VideoPlayerManager.formatSpeedLabel(uiState.playbackSpeed)})",
+                                                color = palette.onSurface
+                                            )
+                                        },
+                                        leadingIcon = {
+                                            Icon(Icons.Default.Speed, contentDescription = null, tint = palette.accent)
+                                        },
+                                        onClick = {
+                                            moreMenuExpanded = false
+                                            onSpeedClick()
+                                        }
+                                    )
+
+                                    DropdownMenuItem(
+                                        text = {
+                                            Text(
+                                                "وضع التشغيل: ${uiState.playbackMode.titleArabic}",
+                                                color = palette.onSurface
+                                            )
+                                        },
+                                        leadingIcon = {
+                                            Icon(Icons.Default.Repeat, contentDescription = null, tint = palette.accent)
+                                        },
+                                        onClick = {
+                                            playbackModeSubmenuExpanded = !playbackModeSubmenuExpanded
+                                        }
+                                    )
+
+                                    if (playbackModeSubmenuExpanded) {
+                                        PlaybackMode.entries.forEach { mode ->
+                                            val isSelectedMode = uiState.playbackMode == mode
+                                            DropdownMenuItem(
+                                                text = {
+                                                    Text(
+                                                        text = if (isSelectedMode) "✓ ${mode.titleArabic}" else "   ${mode.titleArabic}",
+                                                        color = if (isSelectedMode) palette.accent else palette.onSurfaceMuted,
+                                                        fontWeight = if (isSelectedMode) FontWeight.Bold else FontWeight.Normal
+                                                    )
+                                                },
+                                                onClick = {
+                                                    playbackModeSubmenuExpanded = false
+                                                    moreMenuExpanded = false
+                                                    onSelectPlaybackMode(mode)
+                                                }
                                             )
                                         }
-                                    } else null,
-                                    onClick = {
-                                        showOptionsMenu = false
-                                        onToggleAudioOnly()
                                     }
-                                )
+
+                                    DropdownMenuItem(
+                                        text = {
+                                            Text(
+                                                if (uiState.isAudioOnlyMode) "العودة لعرض الفيديو" else "وضع الاستماع فقط",
+                                                color = palette.onSurface
+                                            )
+                                        },
+                                        leadingIcon = {
+                                            Icon(Icons.Default.Headphones, contentDescription = null, tint = palette.accent)
+                                        },
+                                        onClick = {
+                                            moreMenuExpanded = false
+                                            onToggleAudioOnly()
+                                        }
+                                    )
+
+                                    if (isPipAllowed) {
+                                        DropdownMenuItem(
+                                            text = { Text("صورة في صورة", color = palette.onSurface) },
+                                            leadingIcon = {
+                                                Icon(Icons.Default.PictureInPictureAlt, contentDescription = null, tint = palette.accent)
+                                            },
+                                            onClick = {
+                                                moreMenuExpanded = false
+                                                onEnterPip()
+                                            }
+                                        )
+                                    }
+
+                                    if (!isVaultPlayback && !uiState.isAudioOnlyMode) {
+                                        DropdownMenuItem(
+                                            text = { Text("التقاط إطار", color = palette.onSurface) },
+                                            leadingIcon = {
+                                                Icon(Icons.Default.PhotoCamera, contentDescription = null, tint = palette.accent)
+                                            },
+                                            onClick = {
+                                                moreMenuExpanded = false
+                                                onCaptureFrame()
+                                            }
+                                        )
+                                    }
+
+                                    DropdownMenuItem(
+                                        text = { Text("تغيير الاسم", color = palette.onSurface) },
+                                        leadingIcon = {
+                                            Icon(Icons.Default.Edit, contentDescription = null, tint = palette.accent)
+                                        },
+                                        onClick = {
+                                            moreMenuExpanded = false
+                                            onRenameVideo()
+                                        }
+                                    )
+
+                                    DropdownMenuItem(
+                                        text = { Text("معلومات الفيديو", color = palette.onSurface) },
+                                        leadingIcon = {
+                                            Icon(Icons.Default.Info, contentDescription = null, tint = palette.accent)
+                                        },
+                                        onClick = {
+                                            moreMenuExpanded = false
+                                            onShowDetails()
+                                        }
+                                    )
+
+                                    if (!isVaultPlayback) {
+                                        DropdownMenuItem(
+                                            text = { Text("نقل إلى السلة", color = MaterialTheme.colorScheme.error) },
+                                            leadingIcon = {
+                                                Icon(
+                                                    imageVector = Icons.Default.DeleteOutline,
+                                                    contentDescription = null,
+                                                    tint = MaterialTheme.colorScheme.error
+                                                )
+                                            },
+                                            onClick = {
+                                                moreMenuExpanded = false
+                                                onMoveToTrash()
+                                            }
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
                 }
 
-                // Center Transport Controls: Prev, -10s, Play/Pause, +10s, Next
+                // Center Transport Controls
                 Row(
                     modifier = Modifier
-                        .fillMaxWidth()
-                        .align(Alignment.Center),
-                    horizontalArrangement = Arrangement.Center,
-                    verticalAlignment = Alignment.CenterVertically
+                        .align(Alignment.Center)
+                        .padding(horizontal = 16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(18.dp)
                 ) {
-                    IconButton(
-                        onClick = onPreviousTrack,
-                        enabled = uiState.hasPreviousMediaItem,
-                        modifier = Modifier.size(48.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.SkipPrevious,
-                            contentDescription = "الفيديو السابق",
-                            tint = if (uiState.hasPreviousMediaItem) palette.onSurface else palette.onSurfaceMuted.copy(alpha = 0.45f),
-                            modifier = Modifier.size(34.dp)
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.width(12.dp))
-
-                    IconButton(onClick = onReplay10, modifier = Modifier.size(56.dp)) {
-                        if (uiState.seekIntervalSeconds == 10) {
+                    if (uiState.hasPreviousMediaItem) {
+                        IconButton(
+                            onClick = onPreviousTrack,
+                            modifier = Modifier
+                                .size(48.dp)
+                                .clip(CircleShape)
+                                .background(Color.Black.copy(alpha = 0.52f))
+                        ) {
                             Icon(
-                                Icons.Default.Replay10,
-                                contentDescription = "ترجيع 10 ثوان",
-                                tint = palette.onSurface,
-                                modifier = Modifier.size(36.dp)
+                                imageVector = Icons.Default.SkipPrevious,
+                                contentDescription = "السابق",
+                                tint = Color.White,
+                                modifier = Modifier.size(28.dp)
                             )
-                        } else {
-                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                Icon(
-                                    Icons.Default.Replay,
-                                    contentDescription = "ترجيع ${uiState.seekIntervalSeconds} ثوان",
-                                    tint = palette.onSurface,
-                                    modifier = Modifier.size(28.dp)
-                                )
-                                Text(
-                                    text = "-${uiState.seekIntervalSeconds}ث",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = palette.accent,
-                                    fontWeight = FontWeight.Bold
-                                )
-                            }
                         }
                     }
 
-                    Spacer(modifier = Modifier.width(18.dp))
-
-                    IconButton(onClick = onPlayPause, modifier = Modifier.size(72.dp)) {
+                    IconButton(
+                        onClick = onReplay10,
+                        modifier = Modifier
+                            .size(50.dp)
+                            .clip(CircleShape)
+                            .background(Color.Black.copy(alpha = 0.52f))
+                    ) {
                         Icon(
-                            imageVector = if (uiState.isPlaying) Icons.Default.PauseCircle else Icons.Default.PlayCircle,
-                            contentDescription = if (uiState.isPlaying) "إيقاف" else "تشغيل",
-                            tint = palette.accent,
-                            modifier = Modifier.size(66.dp)
+                            imageVector = Icons.Default.Replay10,
+                            contentDescription = "ترجيع ${uiState.seekIntervalSeconds} ثوان",
+                            tint = Color.White,
+                            modifier = Modifier.size(28.dp)
                         )
                     }
 
-                    Spacer(modifier = Modifier.width(18.dp))
-
-                    IconButton(onClick = onForward10, modifier = Modifier.size(56.dp)) {
-                        if (uiState.seekIntervalSeconds == 10) {
+                    Surface(
+                        shape = CircleShape,
+                        color = palette.accent,
+                        modifier = Modifier
+                            .size(66.dp)
+                            .clip(CircleShape)
+                            .clickable(onClick = onPlayPause)
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
                             Icon(
-                                Icons.Default.Forward10,
-                                contentDescription = "تقديم 10 ثوان",
-                                tint = palette.onSurface,
-                                modifier = Modifier.size(36.dp)
+                                imageVector = if (uiState.isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                                contentDescription = if (uiState.isPlaying) "إيقاف مؤقت" else "تشغيل",
+                                tint = MaterialTheme.colorScheme.onPrimary,
+                                modifier = Modifier.size(38.dp)
                             )
-                        } else {
-                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                Icon(
-                                    Icons.Default.FastForward,
-                                    contentDescription = "تقديم ${uiState.seekIntervalSeconds} ثوان",
-                                    tint = palette.onSurface,
-                                    modifier = Modifier.size(28.dp)
-                                )
-                                Text(
-                                    text = "+${uiState.seekIntervalSeconds}ث",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = palette.accent,
-                                    fontWeight = FontWeight.Bold
-                                )
-                            }
                         }
                     }
 
-                    Spacer(modifier = Modifier.width(12.dp))
-
                     IconButton(
-                        onClick = onNextTrack,
-                        enabled = uiState.hasNextMediaItem,
-                        modifier = Modifier.size(48.dp)
+                        onClick = onForward10,
+                        modifier = Modifier
+                            .size(50.dp)
+                            .clip(CircleShape)
+                            .background(Color.Black.copy(alpha = 0.52f))
                     ) {
                         Icon(
-                            imageVector = Icons.Default.SkipNext,
-                            contentDescription = "الفيديو التالي",
-                            tint = if (uiState.hasNextMediaItem) palette.onSurface else palette.onSurfaceMuted.copy(alpha = 0.45f),
-                            modifier = Modifier.size(34.dp)
+                            imageVector = Icons.Default.Forward10,
+                            contentDescription = "تقديم ${uiState.seekIntervalSeconds} ثوان",
+                            tint = Color.White,
+                            modifier = Modifier.size(28.dp)
                         )
+                    }
+
+                    if (uiState.hasNextMediaItem) {
+                        IconButton(
+                            onClick = onNextTrack,
+                            modifier = Modifier
+                                .size(48.dp)
+                                .clip(CircleShape)
+                                .background(Color.Black.copy(alpha = 0.52f))
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.SkipNext,
+                                contentDescription = "التالي",
+                                tint = Color.White,
+                                modifier = Modifier.size(28.dp)
+                            )
+                        }
                     }
                 }
 
-                // Bottom Controls + Design #4 WavySeekBar
+                // Bottom scrim + seekbar + quick action bar
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 12.dp)
                         .align(Alignment.BottomCenter)
-                        .clickable(
-                            interactionSource = remember { MutableInteractionSource() },
-                            indication = null
-                        ) {}
+                        .background(
+                            Brush.verticalGradient(
+                                listOf(Color.Transparent, Color.Black.copy(alpha = 0.82f))
+                            )
+                        )
+                        .safeDrawingPadding()
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     if (thumbnailState.isVisible) {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(bottom = 8.dp),
-                            contentAlignment = Alignment.Center
-                        ) {
+                        BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+                            val density = LocalDensity.current
+                            val cardWidthPx = with(density) { 148.dp.toPx() }
+                            val maxW = with(density) { maxWidth.toPx() }
+                            val xOffsetPx = ((thumbnailState.sliderFraction * maxW) - cardWidthPx / 2f)
+                                .coerceIn(0f, (maxW - cardWidthPx).coerceAtLeast(0f))
                             ThumbnailPreviewCard(
                                 bitmap = thumbnailState.bitmap,
-                                positionMs = thumbnailState.positionMs
+                                positionMs = thumbnailState.positionMs,
+                                modifier = Modifier.offset {
+                                    IntOffset(x = xOffsetPx.roundToInt(), y = 0)
+                                }
                             )
                         }
                     }
@@ -700,88 +582,128 @@ fun PlayerControlsOverlay(
                         onSeekStop = onSeekStop
                     )
 
-                    Spacer(modifier = Modifier.height(4.dp))
-
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        // Active Playback Mode Pill Button
-                        val modeIcon = when (uiState.playbackMode) {
-                            PlaybackMode.STOP_AFTER_CURRENT -> Icons.Default.StopCircle
-                            PlaybackMode.SHUFFLE_ALL -> Icons.Default.Shuffle
-                            PlaybackMode.PLAY_ALL_IN_ORDER -> Icons.Default.PlayArrow
-                            PlaybackMode.REPEAT_ONE -> Icons.Default.RepeatOne
-                            PlaybackMode.REPEAT_PLAYLIST -> Icons.Default.Repeat
+                        PlayerQuickActionChip(
+                            icon = Icons.Default.Lock,
+                            label = "قفل",
+                            onClick = onToggleLock
+                        )
+
+                        PlayerQuickActionChip(
+                            icon = Icons.Default.Subtitles,
+                            label = "الترجمة",
+                            isHighlighted = uiState.primaryTrack != null || uiState.secondaryTrack != null,
+                            onClick = onOpenSubtitlesDialog
+                        )
+
+                        PlayerQuickActionChip(
+                            icon = Icons.Default.Speed,
+                            label = VideoPlayerManager.formatSpeedLabel(uiState.playbackSpeed),
+                            isHighlighted = uiState.playbackSpeed != 1.0f,
+                            onClick = onSpeedClick
+                        )
+
+                        // Direct sequential aspect ratio / resize mode button (no dropdown menu)
+                        PlayerQuickActionChip(
+                            icon = Icons.Default.AspectRatio,
+                            label = resizeShortLabel(uiState.resizeModeEnum),
+                            isHighlighted = uiState.resizeModeEnum != VideoResizeMode.FIT,
+                            onClick = onCycleResizeMode
+                        )
+
+                        // 3-mode sequential screen rotation button: PORTRAIT -> LANDSCAPE -> AUTO
+                        PlayerQuickActionChip(
+                            icon = orientationIcon(uiState.playerOrientationMode),
+                            label = uiState.playerOrientationMode.arabicLabel,
+                            isHighlighted = uiState.playerOrientationMode != PlayerOrientationMode.AUTO,
+                            onClick = onCycleOrientationMode
+                        )
+
+                        if (isPipAllowed) {
+                            PlayerQuickActionChip(
+                                icon = Icons.Default.PictureInPictureAlt,
+                                label = "نافذة",
+                                onClick = onEnterPip
+                            )
                         }
-                        Surface(
-                            shape = RoundedCornerShape(20.dp),
-                            color = palette.surface.copy(alpha = 0.85f),
-                            border = BorderStroke(0.75.dp, palette.accent.copy(alpha = 0.65f)),
-                            modifier = Modifier.clickable { showPlaybackModeDialog = true }
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(
-                                    imageVector = modeIcon,
-                                    contentDescription = uiState.playbackMode.titleArabic,
-                                    tint = palette.accent,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    text = uiState.playbackMode.titleArabic,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = palette.onSurface,
-                                    fontWeight = FontWeight.SemiBold,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                            }
-                        }
 
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            if (zoomScale > 1.05f) {
-                                TextButton(onClick = onResetZoom) {
-                                    Icon(
-                                        imageVector = Icons.Default.ZoomOutMap,
-                                        contentDescription = "إعادة ضبط التكبير",
-                                        tint = palette.accent,
-                                        modifier = Modifier.size(16.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text(
-                                        text = "100%",
-                                        color = palette.accent,
-                                        style = MaterialTheme.typography.labelMedium,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                }
-                            }
-
-                            IconButton(onClick = { showSpeedDialog = true }) {
-                                Text(
-                                    text = VideoPlayerManager.formatSpeedLabel(uiState.effectivePlaybackSpeed),
-                                    color = if (uiState.isTemporarySpeedActive) palette.accent else palette.onSurface,
-                                    fontWeight = FontWeight.Bold,
-                                    style = MaterialTheme.typography.bodyMedium
-                                )
-                            }
-
-                            IconButton(onClick = { showResizeDialog = true }) {
-                                Icon(
-                                    imageVector = Icons.Default.AspectRatio,
-                                    contentDescription = uiState.resizeModeLabelArabic,
-                                    tint = palette.onSurface
-                                )
-                            }
+                        if (zoomScale > 1.05f) {
+                            PlayerQuickActionChip(
+                                icon = Icons.Default.ZoomOutMap,
+                                label = "100%",
+                                isHighlighted = true,
+                                onClick = onResetZoom
+                            )
                         }
                     }
                 }
             }
         }
     }
+}
+
+@Composable
+private fun PlayerQuickActionChip(
+    icon: ImageVector,
+    label: String,
+    isHighlighted: Boolean = false,
+    onClick: () -> Unit
+) {
+    val palette = LocalVideoHatakPalette.current
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = if (isHighlighted) {
+            palette.accent.copy(alpha = 0.24f)
+        } else {
+            Color.White.copy(alpha = 0.12f)
+        },
+        border = BorderStroke(
+            width = 0.75.dp,
+            color = if (isHighlighted) palette.accent else Color.White.copy(alpha = 0.22f)
+        ),
+        modifier = Modifier
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick)
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(5.dp)
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = label,
+                tint = if (isHighlighted) palette.accent else Color.White,
+                modifier = Modifier.size(16.dp)
+            )
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = if (isHighlighted) FontWeight.Bold else FontWeight.Medium,
+                color = if (isHighlighted) palette.accent else Color.White,
+                maxLines = 1
+            )
+        }
+    }
+}
+
+private fun resizeShortLabel(mode: VideoResizeMode): String = when (mode) {
+    VideoResizeMode.FIT -> "ملاءمة"
+    VideoResizeMode.ZOOM -> "تكبير"
+    VideoResizeMode.FILL -> "تمديد"
+    VideoResizeMode.ORIGINAL_SIZE -> "أصلي"
+    VideoResizeMode.RATIO_16_9 -> "16:9"
+    VideoResizeMode.RATIO_4_3 -> "4:3"
+}
+
+private fun orientationIcon(mode: PlayerOrientationMode): ImageVector = when (mode) {
+    PlayerOrientationMode.PORTRAIT -> Icons.Default.StayCurrentPortrait
+    PlayerOrientationMode.LANDSCAPE -> Icons.Default.StayCurrentLandscape
+    PlayerOrientationMode.AUTO -> Icons.Default.ScreenRotation
 }

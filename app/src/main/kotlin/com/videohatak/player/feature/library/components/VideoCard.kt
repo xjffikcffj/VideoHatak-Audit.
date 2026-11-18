@@ -2,10 +2,11 @@ package com.videohatak.player.feature.library.components
 
 import android.graphics.Bitmap
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -20,6 +21,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.DriveFileMove
 import androidx.compose.material.icons.filled.Edit
@@ -28,6 +30,9 @@ import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.PlaylistAdd
+import androidx.compose.material.icons.filled.RadioButtonUnchecked
+import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.filled.StarBorder
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DropdownMenu
@@ -58,10 +63,17 @@ import com.videohatak.player.core.designsystem.theme.LocalVideoHatakPalette
 import com.videohatak.player.core.model.VideoItem
 import com.videohatak.player.core.thumbnail.cache.VideoThumbnailLoader
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun VideoCard(
     video: VideoItem,
     onClick: () -> Unit,
+    onLongClick: (() -> Unit)? = null,
+    isSelectionMode: Boolean = false,
+    isSelected: Boolean = false,
+    isFavorite: Boolean = false,
+    onToggleFavoriteClick: (() -> Unit)? = null,
+    favoriteMenuLabel: String? = null,
     onAddToPlaylist: () -> Unit = {},
     onRenameClick: () -> Unit = {},
     onMoveToFolderClick: () -> Unit = {},
@@ -86,10 +98,18 @@ fun VideoCard(
         modifier = modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(16.dp))
-            .clickable(onClick = onClick),
+            .combinedClickable(
+                onClick = onClick,
+                onLongClick = onLongClick
+            ),
         shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = palette.surface),
-        border = BorderStroke(0.75.dp, palette.border.copy(alpha = 0.6f))
+        colors = CardDefaults.cardColors(
+            containerColor = if (isSelected) palette.accent.copy(alpha = 0.14f) else palette.surface
+        ),
+        border = BorderStroke(
+            width = if (isSelected) 1.5.dp else 0.75.dp,
+            color = if (isSelected) palette.accent else palette.border.copy(alpha = 0.6f)
+        )
     ) {
         Row(
             modifier = Modifier
@@ -125,19 +145,38 @@ fun VideoCard(
                     )
                 }
 
-                Box(
-                    modifier = Modifier
-                        .size(28.dp)
-                        .clip(CircleShape)
-                        .background(Color.Black.copy(alpha = 0.56f)),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.PlayArrow,
-                        contentDescription = null,
-                        tint = palette.accent,
-                        modifier = Modifier.size(18.dp)
-                    )
+                if (isSelectionMode) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.TopStart)
+                            .padding(5.dp)
+                            .size(22.dp)
+                            .clip(CircleShape)
+                            .background(Color.Black.copy(alpha = 0.65f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = if (isSelected) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked,
+                            contentDescription = null,
+                            tint = if (isSelected) palette.accent else Color.White,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                } else {
+                    Box(
+                        modifier = Modifier
+                            .size(28.dp)
+                            .clip(CircleShape)
+                            .background(Color.Black.copy(alpha = 0.56f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.PlayArrow,
+                            contentDescription = null,
+                            tint = palette.accent,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
                 }
 
                 Box(
@@ -201,89 +240,120 @@ fun VideoCard(
                 }
             }
 
-            // Trailing 3-dots menu button
-            Box {
-                IconButton(
-                    onClick = {
-                        if (onMoreClick != null) {
-                            onMoreClick()
-                        } else {
-                            menuExpanded = true
+            // Trailing 3-dots menu button (hidden during multi-select so taps stay clean)
+            if (!isSelectionMode) {
+                Box {
+                    IconButton(
+                        onClick = {
+                            if (onMoreClick != null) {
+                                onMoreClick()
+                            } else {
+                                menuExpanded = true
+                            }
                         }
-                    }
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.MoreVert,
-                        contentDescription = "خيارات الفيديو",
-                        tint = palette.onSurfaceMuted
-                    )
-                }
-
-                MaterialTheme(
-                    colorScheme = MaterialTheme.colorScheme.copy(surface = palette.surface)
-                ) {
-                    DropdownMenu(
-                        expanded = menuExpanded,
-                        onDismissRequest = { menuExpanded = false }
                     ) {
-                        DropdownMenuItem(
-                            text = { Text("إضافة إلى القائمة", color = palette.onSurface) },
-                            leadingIcon = { Icon(Icons.Default.PlaylistAdd, contentDescription = null, tint = palette.accent) },
-                            onClick = {
-                                menuExpanded = false
-                                onAddToPlaylist()
-                            }
+                        Icon(
+                            imageVector = Icons.Default.MoreVert,
+                            contentDescription = "خيارات الفيديو",
+                            tint = palette.onSurfaceMuted
                         )
-                        DropdownMenuItem(
-                            text = { Text("تغيير الاسم", color = palette.onSurface) },
-                            leadingIcon = { Icon(Icons.Default.Edit, contentDescription = null, tint = palette.accent) },
-                            onClick = {
-                                menuExpanded = false
-                                onRenameClick()
+                    }
+
+                    MaterialTheme(
+                        colorScheme = MaterialTheme.colorScheme.copy(surface = palette.surface)
+                    ) {
+                        DropdownMenu(
+                            expanded = menuExpanded,
+                            onDismissRequest = { menuExpanded = false }
+                        ) {
+                            if (onToggleFavoriteClick != null) {
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            text = favoriteMenuLabel
+                                                ?: if (isFavorite) "إزالة من المفضلة" else "إضافة إلى المفضلة",
+                                            color = palette.onSurface
+                                        )
+                                    },
+                                    leadingIcon = {
+                                        Icon(
+                                            imageVector = if (isFavorite) Icons.Default.Star else Icons.Default.StarBorder,
+                                            contentDescription = null,
+                                            tint = palette.accent
+                                        )
+                                    },
+                                    onClick = {
+                                        menuExpanded = false
+                                        onToggleFavoriteClick()
+                                    }
+                                )
                             }
-                        )
-                        DropdownMenuItem(
-                            text = { Text("نقل إلى مجلد", color = palette.onSurface) },
-                            leadingIcon = { Icon(Icons.Default.DriveFileMove, contentDescription = null, tint = palette.accent) },
-                            onClick = {
-                                menuExpanded = false
-                                onMoveToFolderClick()
-                            }
-                        )
-                        DropdownMenuItem(
-                            text = { Text("إضافة إلى الخزنة", color = palette.onSurface) },
-                            leadingIcon = { Icon(Icons.Default.Lock, contentDescription = null, tint = palette.accent) },
-                            onClick = {
-                                menuExpanded = false
-                                onAddToVaultClick()
-                            }
-                        )
-                        DropdownMenuItem(
-                            text = { Text("معلومات الفيديو", color = palette.onSurface) },
-                            leadingIcon = { Icon(Icons.Default.Info, contentDescription = null, tint = palette.accent) },
-                            onClick = {
-                                menuExpanded = false
-                                onInfoClick()
-                            }
-                        )
-                        if (onMoveToTrashClick != null) {
                             DropdownMenuItem(
-                                text = { Text("نقل إلى السلة", color = MaterialTheme.colorScheme.error) },
-                                leadingIcon = {
-                                    Icon(
-                                        Icons.Default.DeleteOutline,
-                                        contentDescription = null,
-                                        tint = MaterialTheme.colorScheme.error
-                                    )
-                                },
+                                text = { Text("إضافة إلى القائمة", color = palette.onSurface) },
+                                leadingIcon = { Icon(Icons.Default.PlaylistAdd, contentDescription = null, tint = palette.accent) },
                                 onClick = {
                                     menuExpanded = false
-                                    onMoveToTrashClick()
+                                    onAddToPlaylist()
                                 }
                             )
+                            DropdownMenuItem(
+                                text = { Text("تغيير الاسم", color = palette.onSurface) },
+                                leadingIcon = { Icon(Icons.Default.Edit, contentDescription = null, tint = palette.accent) },
+                                onClick = {
+                                    menuExpanded = false
+                                    onRenameClick()
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("نقل إلى مجلد", color = palette.onSurface) },
+                                leadingIcon = { Icon(Icons.Default.DriveFileMove, contentDescription = null, tint = palette.accent) },
+                                onClick = {
+                                    menuExpanded = false
+                                    onMoveToFolderClick()
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("نقل إلى الخزنة", color = palette.onSurface) },
+                                leadingIcon = { Icon(Icons.Default.Lock, contentDescription = null, tint = palette.accent) },
+                                onClick = {
+                                    menuExpanded = false
+                                    onAddToVaultClick()
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("معلومات الفيديو", color = palette.onSurface) },
+                                leadingIcon = { Icon(Icons.Default.Info, contentDescription = null, tint = palette.accent) },
+                                onClick = {
+                                    menuExpanded = false
+                                    onInfoClick()
+                                }
+                            )
+                            if (onMoveToTrashClick != null) {
+                                DropdownMenuItem(
+                                    text = { Text("نقل إلى السلة", color = MaterialTheme.colorScheme.error) },
+                                    leadingIcon = {
+                                        Icon(
+                                            Icons.Default.DeleteOutline,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.error
+                                        )
+                                    },
+                                    onClick = {
+                                        menuExpanded = false
+                                        onMoveToTrashClick()
+                                    }
+                                )
+                            }
                         }
                     }
                 }
+            } else {
+                Icon(
+                    imageVector = if (isSelected) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked,
+                    contentDescription = null,
+                    tint = if (isSelected) palette.accent else palette.onSurfaceMuted,
+                    modifier = Modifier.padding(horizontal = 8.dp)
+                )
             }
         }
     }

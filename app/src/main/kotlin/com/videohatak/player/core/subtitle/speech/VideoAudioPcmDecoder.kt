@@ -22,7 +22,10 @@ import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.coroutines.coroutineContext
+import kotlin.math.abs
 import kotlin.math.roundToInt
+import kotlin.math.sqrt
+import kotlin.math.tanh
 
 data class VideoAudioTrackMetadata(
     val hasAudioTrack: Boolean,
@@ -139,7 +142,7 @@ private class VaultMediaDataSource(
 object VideoAudioPcmDecoder {
     const val TARGET_SAMPLE_RATE_HZ = 16_000
     private const val CODEC_TIMEOUT_US = 10_000L
-    private const val STREAM_CHUNK_BYTES = 16_000 // 0.5 sec @ 16kHz 16-bit mono
+    private const val STREAM_CHUNK_BYTES = 8_000 // 0.25 sec @ 16kHz 16-bit mono for responsive ASR
     internal const val MAX_CONSECUTIVE_IDLE_CYCLES = 500
 
     suspend fun inspectAudioTracks(
@@ -283,6 +286,7 @@ object VideoAudioPcmDecoder {
             var totalOutputBytes = 0L
 
             val resampler = StreamingPcmResampler()
+            val speechConditioner = PcmSpeechConditioner(TARGET_SAMPLE_RATE_HZ)
             val emitBuffer = ByteArray(STREAM_CHUNK_BYTES)
             var emitOffset = 0
             var lastEmittedPtsUs = 0L
@@ -355,6 +359,7 @@ object VideoAudioPcmDecoder {
                                 monoInput = monoSamples,
                                 sourceSampleRate = currentSampleRate
                             )
+                            val conditioned16k = speechConditioner.process(resampled16k)
                             val progress = if (durationUs > 0L) {
                                 val pts = bufferInfo.presentationTimeUs.takeIf { it > 0L } ?: lastEmittedPtsUs
                                 (pts.toFloat() / durationUs.toFloat()).coerceIn(0f, 1f)
@@ -363,8 +368,8 @@ object VideoAudioPcmDecoder {
                             }
 
                             var idx = 0
-                            while (idx < resampled16k.size) {
-                                val s = resampled16k[idx++]
+                            while (idx < conditioned16k.size) {
+                                val s = conditioned16k[idx++]
                                 emitBuffer[emitOffset++] = (s.toInt() and 0xFF).toByte()
                                 emitBuffer[emitOffset++] = ((s.toInt() shr 8) and 0xFF).toByte()
                                 if (emitOffset >= emitBuffer.size) {
@@ -677,3 +682,95 @@ internal class StreamingPcmResampler {
         return if (outCount == out.size) out else out.copyOf(outCount)
     }
 }
+
+/**
+ * Real-time speech-band preconditioning for 16kHz PCM prior to offline Vosk ASR:
+ * 1. DC-offset & sub-85Hz rumble removal (1st-order high-pass filter) so low-frequency hum
+ *    does not skew loudness measurement.
+ * 2. Noise-floor-gated windowed RMS AGC: boosts quiet/whispered dialogue toward an optimal
+ *    ASR target loudness while leaving pure silence unamplified to avoid false hallucinations.
+ * 3. Soft-knee saturation limiter preventing clipping on sudden loud peaks.
+ */
+internal class PcmSpeechConditioner(
+    sampleRateHz: Int = VideoAudioPcmDecoder.TARGET_SAMPLE_RATE_HZ
+) {
+    private val hpAlpha: Float
+    private var prevIn: Float = 0f
+    private var prevOut: Float = 0f
+    private var smoothedGain: Float = 1.0f
+
+    private val frameSizeSamples: Int = (sampleRateHz / 50).coerceAtLeast(160) // ~20ms
+
+    init {
+        val rc = 1.0 / (2.0 * Math.PI * 85.0)
+        val dt = 1.0 / sampleRateHz.coerceAtLeast(8_000).toDouble()
+        hpAlpha = (rc / (rc + dt)).toFloat().coerceIn(0.85f, 0.995f)
+    }
+
+    fun process(samples: ShortArray): ShortArray {
+        if (samples.isEmpty()) return samples
+
+        // 1. Apply 85Hz high-pass / DC-blocking filter across the chunk
+        val hp = FloatArray(samples.size)
+        for (i in samples.indices) {
+            val x = samples[i].toFloat()
+            val y = hpAlpha * (prevOut + x - prevIn)
+            prevIn = x
+            prevOut = y
+            hp[i] = y
+        }
+
+        // 2. Frame-by-frame RMS AGC with noise-floor gate + soft saturation
+        val out = ShortArray(samples.size)
+        var offset = 0
+        while (offset < hp.size) {
+            val end = minOf(offset + frameSizeSamples, hp.size)
+            val count = end - offset
+
+            var sumSq = 0.0
+            for (i in offset until end) {
+                val v = hp[i].toDouble()
+                sumSq += v * v
+            }
+            val rms = sqrt(sumSq / count.toDouble()).toFloat()
+
+            val targetGain = if (rms >= SPEECH_NOISE_FLOOR_RMS) {
+                (TARGET_SPEECH_RMS / rms).coerceIn(1.0f, MAX_AGC_GAIN)
+            } else {
+                // Pure silence / sub-floor hiss stays unboosted
+                1.0f
+            }
+
+            // Fast attack to catch quiet speech onset; gentle release through short inter-word gaps
+            val coeff = if (targetGain < smoothedGain) 0.45f else if (rms >= SPEECH_NOISE_FLOOR_RMS) 0.30f else 0.06f
+            smoothedGain += (targetGain - smoothedGain) * coeff
+
+            for (i in offset until end) {
+                val amplified = hp[i] * smoothedGain
+                val limited = softLimit(amplified)
+                out[i] = limited.roundToInt()
+                    .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+                    .toShort()
+            }
+            offset = end
+        }
+        return out
+    }
+
+    private fun softLimit(sample: Float): Float {
+        val absVal = abs(sample)
+        if (absVal <= SOFT_LIMIT_THRESHOLD) return sample
+        val sign = if (sample >= 0f) 1f else -1f
+        val excess = (absVal - SOFT_LIMIT_THRESHOLD) / SOFT_LIMIT_HEADROOM
+        return sign * (SOFT_LIMIT_THRESHOLD + SOFT_LIMIT_HEADROOM * tanh(excess.toDouble()).toFloat())
+    }
+
+    companion object {
+        internal const val TARGET_SPEECH_RMS = 4_200f
+        internal const val SPEECH_NOISE_FLOOR_RMS = 28f
+        internal const val MAX_AGC_GAIN = 14.0f
+        private const val SOFT_LIMIT_THRESHOLD = 26_000f
+        private const val SOFT_LIMIT_HEADROOM = 6_767f
+    }
+}
+

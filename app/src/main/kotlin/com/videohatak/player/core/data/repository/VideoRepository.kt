@@ -13,6 +13,7 @@ import android.os.Build
 import android.os.Environment
 import android.os.Handler
 import android.os.HandlerThread
+import android.provider.DocumentsContract
 import android.provider.MediaStore
 import androidx.core.database.getIntOrNull
 import androidx.core.database.getLongOrNull
@@ -51,7 +52,20 @@ sealed interface VideoFileOperationResult {
 sealed interface PendingVideoFileOp {
     data class Rename(val video: VideoItem, val newTitle: String) : PendingVideoFileOp
     data class Move(val video: VideoItem, val targetRelativePath: String, val targetFolderName: String) : PendingVideoFileOp
+    data class BatchMove(
+        val remainingVideos: List<VideoItem>,
+        val targetRelativePath: String,
+        val targetFolderName: String,
+        val movedCount: Int = 0,
+        val failedCount: Int = 0
+    ) : PendingVideoFileOp
     data class DeletePermanent(val video: VideoItem, val trashItemId: Long? = null) : PendingVideoFileOp
+    data class DeleteVaultOriginals(
+        val pendingUris: List<Uri>,
+        val encryptedCount: Int,
+        val deletedSoFar: Int = 0,
+        val failedCount: Int = 0
+    ) : PendingVideoFileOp
 }
 
 sealed interface MediaExistenceResult {
@@ -104,6 +118,19 @@ interface VideoRepository {
             MediaExistenceResult.Exists -> deleteVideoPermanently(video, trashItemId)
             is MediaExistenceResult.Unverifiable -> VideoFileOperationResult.Error(existence.reason)
         }
+    }
+
+    suspend fun deleteVaultOriginals(
+        uris: List<Uri>,
+        encryptedCount: Int = uris.size
+    ): VideoFileOperationResult {
+        return VideoFileOperationResult.Error("غير مدعوم")
+    }
+
+    suspend fun completeVaultOriginalsDeleteAfterPermission(
+        op: PendingVideoFileOp.DeleteVaultOriginals
+    ): VideoFileOperationResult {
+        return VideoFileOperationResult.Success
     }
 }
 
@@ -561,6 +588,176 @@ class LocalVideoRepositoryImpl(
             } else {
                 VideoFileOperationResult.Error(e.localizedMessage ?: "تعذر حذف الملف بعد منح الإذن")
             }
+        }
+    }
+
+    override suspend fun deleteVaultOriginals(
+        uris: List<Uri>,
+        encryptedCount: Int
+    ): VideoFileOperationResult = withContext(Dispatchers.IO) {
+        val targetUris = uris.filterNot { it.scheme.equals("vault", ignoreCase = true) }.distinct()
+        if (targetUris.isEmpty()) return@withContext VideoFileOperationResult.Success
+
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            val legacyPerm = PermissionHelper.getLegacyWritePermission()
+            if (legacyPerm != null && !PermissionHelper.hasLegacyWritePermission(context)) {
+                return@withContext VideoFileOperationResult.RequiresLegacyWritePermission(
+                    permission = legacyPerm,
+                    pendingOp = PendingVideoFileOp.DeleteVaultOriginals(
+                        pendingUris = targetUris,
+                        encryptedCount = encryptedCount
+                    )
+                )
+            }
+        }
+
+        val pendingConsentUris = mutableListOf<Uri>()
+        var deletedCount = 0
+        var failedCount = 0
+        var recoverableIntentSender: IntentSender? = null
+
+        for (uri in targetUris) {
+            val res = tryDirectDeleteUri(uri)
+            when (res) {
+                is UriDeleteAttempt.Deleted -> deletedCount++
+                is UriDeleteAttempt.NeedsConsent -> {
+                    pendingConsentUris.add(uri)
+                    if (recoverableIntentSender == null && res.intentSender != null) {
+                        recoverableIntentSender = res.intentSender
+                    }
+                }
+                is UriDeleteAttempt.Failed -> failedCount++
+            }
+        }
+
+        if (pendingConsentUris.isEmpty()) {
+            return@withContext if (failedCount > 0 && deletedCount == 0) {
+                VideoFileOperationResult.Error("تم حفظ الفيديو في الخزنة، لكن تعذر حذف النسخة الأصلية من الجهاز")
+            } else {
+                VideoFileOperationResult.Success
+            }
+        }
+
+        val op = PendingVideoFileOp.DeleteVaultOriginals(
+            pendingUris = pendingConsentUris,
+            encryptedCount = encryptedCount,
+            deletedSoFar = deletedCount,
+            failedCount = failedCount
+        )
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val mediaUris = pendingConsentUris.filter { isMediaStoreUri(it) }
+            if (mediaUris.isNotEmpty()) {
+                return@withContext try {
+                    val pi = MediaStore.createDeleteRequest(contentResolver, mediaUris)
+                    VideoFileOperationResult.RequiresPermission(pi.intentSender, op)
+                } catch (e: Exception) {
+                    VideoFileOperationResult.Error(e.localizedMessage ?: "تعذر طلب صلاحية حذف النسخة الأصلية")
+                }
+            }
+        }
+
+        if (recoverableIntentSender != null) {
+            return@withContext VideoFileOperationResult.RequiresPermission(recoverableIntentSender, op)
+        }
+
+        VideoFileOperationResult.Error("تم حفظ الفيديو في الخزنة، لكن تعذر حذف النسخة الأصلية من موقعها الحالي")
+    }
+
+    override suspend fun completeVaultOriginalsDeleteAfterPermission(
+        op: PendingVideoFileOp.DeleteVaultOriginals
+    ): VideoFileOperationResult = withContext(Dispatchers.IO) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            var remainingNotDeleted = 0
+            for (uri in op.pendingUris) {
+                val stillExists = runCatching {
+                    contentResolver.openAssetFileDescriptor(uri, "r")?.use { true } ?: false
+                }.getOrDefault(false)
+                if (stillExists) {
+                    val deleted = runCatching { contentResolver.delete(uri, null, null) > 0 }.getOrDefault(false)
+                    if (!deleted) remainingNotDeleted++
+                }
+            }
+            return@withContext if (remainingNotDeleted > 0) {
+                VideoFileOperationResult.Error("تعذر حذف بعض الملفات الأصلية بعد منح الإذن ($remainingNotDeleted)")
+            } else {
+                VideoFileOperationResult.Success
+            }
+        }
+        deleteVaultOriginals(op.pendingUris, op.encryptedCount)
+    }
+
+    private sealed interface UriDeleteAttempt {
+        data object Deleted : UriDeleteAttempt
+        data class NeedsConsent(val intentSender: IntentSender? = null) : UriDeleteAttempt
+        data object Failed : UriDeleteAttempt
+    }
+
+    private fun isMediaStoreUri(uri: Uri): Boolean =
+        ContentResolver.SCHEME_CONTENT == uri.scheme &&
+            MediaStore.AUTHORITY.equals(uri.authority, ignoreCase = true)
+
+    private fun tryDirectDeleteUri(uri: Uri): UriDeleteAttempt {
+        try {
+            if (uri.scheme == ContentResolver.SCHEME_FILE) {
+                val file = uri.path?.let { File(it) }
+                if (file == null || !file.exists() || file.delete()) {
+                    return UriDeleteAttempt.Deleted
+                }
+                return UriDeleteAttempt.Failed
+            }
+
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q && isMediaStoreUri(uri)) {
+                val filePath = contentResolver.query(
+                    uri,
+                    arrayOf(@Suppress("DEPRECATION") MediaStore.Video.Media.DATA),
+                    null,
+                    null,
+                    null
+                )?.use { cursor ->
+                    val idx = cursor.getColumnIndex(@Suppress("DEPRECATION") MediaStore.Video.Media.DATA)
+                    if (idx >= 0 && cursor.moveToFirst()) cursor.getStringOrNull(idx) else null
+                }
+                if (!filePath.isNullOrBlank()) {
+                    val file = File(filePath)
+                    if (file.exists()) file.delete()
+                }
+            }
+
+            if (DocumentsContract.isDocumentUri(context, uri)) {
+                val docDeleted = runCatching {
+                    DocumentsContract.deleteDocument(contentResolver, uri)
+                }.getOrDefault(false)
+                if (docDeleted) return UriDeleteAttempt.Deleted
+            }
+
+            val deletedRows = contentResolver.delete(uri, null, null)
+            if (deletedRows > 0) return UriDeleteAttempt.Deleted
+
+            val stillExists = try {
+                contentResolver.openAssetFileDescriptor(uri, "r")?.use { true } ?: false
+            } catch (_: java.io.FileNotFoundException) {
+                false
+            } catch (_: Exception) {
+                true
+            }
+            if (!stillExists) return UriDeleteAttempt.Deleted
+
+            return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && isMediaStoreUri(uri)) {
+                UriDeleteAttempt.NeedsConsent()
+            } else {
+                UriDeleteAttempt.Failed
+            }
+        } catch (se: SecurityException) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && isMediaStoreUri(uri)) {
+                return UriDeleteAttempt.NeedsConsent()
+            }
+            if (Build.VERSION.SDK_INT == Build.VERSION_CODES.Q && se is RecoverableSecurityException) {
+                return UriDeleteAttempt.NeedsConsent(se.userAction.actionIntent.intentSender)
+            }
+            return UriDeleteAttempt.Failed
+        } catch (_: Exception) {
+            return UriDeleteAttempt.Failed
         }
     }
 

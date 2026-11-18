@@ -283,7 +283,7 @@ class VaultDatabaseHelper(context: Context) : SQLiteOpenHelper(
                 COLUMN_STORAGE_TYPE,
                 COLUMN_VAULT_STATE
             ),
-            "$COLUMN_IS_HIDDEN_IN_LIBRARY = 1",
+            "$COLUMN_IS_HIDDEN_IN_LIBRARY = 1 OR $COLUMN_VAULT_STATE IN ('ORIGINAL_HIDDEN', 'RESTORING', 'RESTORE_FAILED', 'ORIGINAL_MISSING', 'ORIGINAL_CHANGED', 'REQUIRES_PERMISSION')",
             null,
             null,
             null,
@@ -304,7 +304,7 @@ class VaultDatabaseHelper(context: Context) : SQLiteOpenHelper(
                     it.getString(stateIdx),
                     fallback = VaultEntryState.ORIGINAL_HIDDEN
                 )
-                if (origUri.isNotBlank() || origPath.isNotBlank() || msId != null) {
+                if (state.shouldHideOriginalInLibrary && (origUri.isNotBlank() || origPath.isNotBlank() || msId != null)) {
                     list.add(
                         VaultHiddenOriginal(
                             vaultId = it.getLong(idIdx),

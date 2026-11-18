@@ -11,6 +11,7 @@ import android.os.StatFs
 import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.provider.OpenableColumns
+import android.util.Log
 import com.videohatak.player.core.vault.crypto.VaultBase64
 import com.videohatak.player.core.vault.crypto.VaultCryptoManager
 import com.videohatak.player.core.vault.db.VaultDatabaseHelper
@@ -193,6 +194,7 @@ class VaultRepositoryImpl internal constructor(
     )
 
     companion object {
+        private const val TAG = "VaultRepository"
         private const val MASKED_DISPLAY_NAME = "مقطع خاص مشفر"
         private const val MASKED_MIME_TYPE = "application/octet-stream"
         private const val DECODE_ERROR_MESSAGE = "تعذر فك تشفير بيانات أحد المقاطع المحفوظة في الخزنة"
@@ -205,6 +207,10 @@ class VaultRepositoryImpl internal constructor(
                 instance ?: VaultRepositoryImpl(context.applicationContext).also { instance = it }
             }
         }
+    }
+
+    private val vaultDir: File = File(context.filesDir, "vault_encrypted").apply {
+        if (!exists()) mkdirs()
     }
 
     private val _isUnlocked = MutableStateFlow(false)
@@ -252,26 +258,36 @@ class VaultRepositoryImpl internal constructor(
     private val _vaultVideos = MutableStateFlow<List<VaultVideo>>(emptyList())
     override val vaultVideos: StateFlow<List<VaultVideo>> = _vaultVideos.asStateFlow()
 
-    private val _vaultCount = MutableStateFlow(
-        runCatching { dbHelper.getVideoCount() }.getOrDefault(0)
-    )
-    override val vaultCount: StateFlow<Int> = _vaultCount.asStateFlow()
-
-    private val _hiddenOriginalEntries = MutableStateFlow<List<VaultHiddenOriginal>>(
-        runCatching { loadInitialHiddenEntries() }.getOrDefault(emptyList())
-    )
+    private val _hiddenOriginalEntries = MutableStateFlow(loadInitialHiddenEntries())
     override val hiddenOriginalEntries: StateFlow<List<VaultHiddenOriginal>> =
         _hiddenOriginalEntries.asStateFlow()
 
-    private val vaultDir: File by lazy {
-        File(context.filesDir, "vault_encrypted").apply {
-            if (!exists()) mkdirs()
-        }
-    }
+    private val _vaultCount = MutableStateFlow(loadInitialVaultCount())
+    override val vaultCount: StateFlow<Int> = _vaultCount.asStateFlow()
 
     private fun loadInitialHiddenEntries(): List<VaultHiddenOriginal> {
-        reconcileLifecycleStatesLocked(runStorageCleanup = false)
-        return dbHelper.getHiddenOriginalEntries()
+        runCatching {
+            reconcileLifecycleStatesLocked(runStorageCleanup = false)
+        }.onFailure { err ->
+            Log.e(TAG, "Failed to reconcile vault lifecycle states during initialization", err)
+            if (_vaultError.value == null) {
+                _vaultError.value = err.localizedMessage
+            }
+        }
+        return runCatching {
+            dbHelper.getHiddenOriginalEntries()
+        }.onFailure { err ->
+            Log.e(TAG, "Failed to load hidden original entries during initialization", err)
+            _vaultError.value = "تعذر تحميل سجل العناصر المخفية من قاعدة بيانات الخزنة"
+        }.getOrDefault(emptyList())
+    }
+
+    private fun loadInitialVaultCount(): Int {
+        return runCatching {
+            dbHelper.getVideoCount()
+        }.onFailure { err ->
+            Log.e(TAG, "Failed to load initial vault video count", err)
+        }.getOrDefault(0)
     }
 
     override fun resolveEncryptedFile(video: VaultVideo): File {
@@ -290,8 +306,15 @@ class VaultRepositoryImpl internal constructor(
     private fun refreshLocked() {
         reconcileLifecycleStatesLocked(runStorageCleanup = true)
         _hiddenOriginalEntries.value = runCatching { dbHelper.getHiddenOriginalEntries() }
+            .onFailure { err ->
+                Log.e(TAG, "Failed to refresh hidden original entries", err)
+            }
             .getOrDefault(_hiddenOriginalEntries.value)
-        _vaultCount.value = runCatching { dbHelper.getVideoCount() }.getOrDefault(_vaultCount.value)
+        _vaultCount.value = runCatching { dbHelper.getVideoCount() }
+            .onFailure { err ->
+                Log.e(TAG, "Failed to refresh vault count", err)
+            }
+            .getOrDefault(_vaultCount.value)
         if (!_isUnlocked.value) {
             _vaultVideos.value = emptyList()
             return
@@ -315,7 +338,11 @@ class VaultRepositoryImpl internal constructor(
     }
 
     private fun reconcileLifecycleStatesLocked(runStorageCleanup: Boolean) {
-        val rows = runCatching { dbHelper.getAllVideos() }.getOrElse { return }
+        val rows = runCatching { dbHelper.getAllVideos() }
+            .onFailure { err ->
+                Log.e(TAG, "Failed to read vault rows during lifecycle reconciliation", err)
+            }
+            .getOrElse { return }
         for (row in rows) {
             val encFile = resolveEncryptedFile(row)
             when (row.vaultState) {
@@ -1322,9 +1349,15 @@ class VaultRepositoryImpl internal constructor(
     }
 
     private fun verifyOriginalAtReference(ref: VaultOriginalReference): OriginalVerifyResult {
+        val trimmedOriginalUri = ref.originalUri.trim()
+        val primaryScheme = trimmedOriginalUri.takeIf { it.isNotBlank() }?.let {
+            runCatching { Uri.parse(it).scheme?.lowercase().orEmpty() }.getOrDefault("")
+        }.orEmpty()
+        val allowFilePathFallback = primaryScheme.isEmpty() || primaryScheme == "file"
+
         val candidateUris = buildList {
-            if (ref.originalUri.isNotBlank()) {
-                add(Uri.parse(ref.originalUri))
+            if (trimmedOriginalUri.isNotBlank()) {
+                add(Uri.parse(trimmedOriginalUri))
             }
             if (ref.originalMediaStoreId != null && ref.originalMediaStoreId > 0L) {
                 val msUri = ContentUris.withAppendedId(
@@ -1333,7 +1366,7 @@ class VaultRepositoryImpl internal constructor(
                 )
                 if (none { it == msUri }) add(msUri)
             }
-            if (ref.originalFilePath.isNotBlank()) {
+            if (allowFilePathFallback && ref.originalFilePath.isNotBlank()) {
                 val fileUri = Uri.fromFile(File(ref.originalFilePath))
                 if (none { it == fileUri }) add(fileUri)
             }
@@ -1354,10 +1387,15 @@ class VaultRepositoryImpl internal constructor(
         }
 
         var hadSecurityDenied = false
+        var hadMissing = false
+        var lastUnreadableReason: String? = null
         for (candidate in candidateUris) {
             if (candidate.scheme.equals("file", ignoreCase = true)) {
                 val file = candidate.path?.let { File(it) }
-                if (file == null || !file.exists() || !file.isFile) continue
+                if (file == null || !file.exists() || !file.isFile) {
+                    hadMissing = true
+                    continue
+                }
                 if (!file.canRead()) {
                     hadSecurityDenied = true
                     continue
@@ -1374,10 +1412,14 @@ class VaultRepositoryImpl internal constructor(
                 if (stream != null) {
                     return compareStreamWithExpected(candidate, stream, ref)
                 }
+                lastUnreadableReason = "تعذر فتح مجرى القراءة للملف الأصلي"
             } catch (_: SecurityException) {
                 hadSecurityDenied = true
-            } catch (_: Exception) {
-                // Candidate missing or inaccessible; try next candidate
+            } catch (_: java.io.FileNotFoundException) {
+                hadMissing = true
+            } catch (e: Exception) {
+                lastUnreadableReason = e.localizedMessage?.takeIf { it.isNotBlank() }
+                    ?: "تعذر الوصول إلى الملف الأصلي حاليًا"
             }
         }
 
@@ -1386,6 +1428,11 @@ class VaultRepositoryImpl internal constructor(
                 uri = primaryUri,
                 storageType = ref.storageType,
                 reason = "تعذر فتح الملف الأصلي بسبب فقدان صلاحية الوصول إلى URI/التخزين — بقيت النسخة المشفرة محفوظة في الخزنة"
+            )
+        }
+        if (!hadMissing && lastUnreadableReason != null) {
+            return OriginalVerifyResult.Unreadable(
+                "تعذر التحقق من سلامة الملف الأصلي ($lastUnreadableReason) — بقيت النسخة المشفرة محفوظة بأمان في الخزنة"
             )
         }
 

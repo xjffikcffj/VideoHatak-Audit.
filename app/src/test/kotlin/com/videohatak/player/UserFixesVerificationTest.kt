@@ -10,9 +10,9 @@ import com.videohatak.player.core.data.repository.MediaExistenceResult
 import com.videohatak.player.core.data.repository.PendingVideoFileOp
 import com.videohatak.player.core.data.repository.VideoFileOperationResult
 import com.videohatak.player.core.data.repository.VideoRepository
-import com.videohatak.player.core.data.repository.VideoSortOrder
 import com.videohatak.player.core.model.VideoFolder
 import com.videohatak.player.core.model.VideoItem
+import com.videohatak.player.core.model.VideoSortOrder
 import com.videohatak.player.core.playlist.db.VideoHatakDatabaseHelper
 import com.videohatak.player.core.playlist.repository.PlaylistRepository
 import com.videohatak.player.core.playlist.repository.PlaylistRepositoryImpl

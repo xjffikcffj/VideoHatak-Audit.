@@ -248,6 +248,10 @@ class LibraryViewModel(
             val video = remaining.removeAt(0)
             when (val res = videoRepository.moveVideoToFolder(video, op.targetRelativePath, op.targetFolderName)) {
                 is VideoFileOperationResult.Success -> moved++
+                is VideoFileOperationResult.PartialSuccess -> {
+                    moved += res.succeededCount
+                    failed += res.failedCount
+                }
                 is VideoFileOperationResult.RequiresPermission -> {
                     val resumeList = listOf(video) + remaining
                     pendingFileOp = PendingVideoFileOp.BatchMove(
@@ -314,22 +318,51 @@ class LibraryViewModel(
                     }
                     _events.tryEmit(LibraryUiEvent.ShowMessage(msg))
                 }
+                is VideoFileOperationResult.PartialSuccess -> {
+                    loadVideos()
+                    val msg = buildVaultPartialCleanupMessage(
+                        encryptedCount = encryptedCount,
+                        encryptedFailedCount = encryptedFailedCount,
+                        removedPublicCount = res.succeededCount,
+                        failedPublicCount = res.failedCount
+                    )
+                    _events.tryEmit(LibraryUiEvent.ShowMessage(msg))
+                }
                 is VideoFileOperationResult.RequiresPermission -> {
-                    pendingFileOp = res.pendingOp
+                    val op = res.pendingOp
+                    pendingFileOp = if (op is PendingVideoFileOp.DeleteVaultOriginals) {
+                        op.copy(encryptedFailedCount = encryptedFailedCount)
+                    } else op
                     _events.tryEmit(LibraryUiEvent.LaunchWritePermission(res.intentSender))
                 }
                 is VideoFileOperationResult.RequiresLegacyWritePermission -> {
-                    pendingFileOp = res.pendingOp
+                    val op = res.pendingOp
+                    pendingFileOp = if (op is PendingVideoFileOp.DeleteVaultOriginals) {
+                        op.copy(encryptedFailedCount = encryptedFailedCount)
+                    } else op
                     _events.tryEmit(LibraryUiEvent.RequestLegacyWritePermission(res.permission))
                 }
                 is VideoFileOperationResult.Error -> {
                     loadVideos()
+                    val encFailSuffix = if (encryptedFailedCount > 0) "، وتعذر تشفير $encryptedFailedCount" else ""
                     _events.tryEmit(
-                        LibraryUiEvent.ShowMessage("تمت إضافة النسخة المشفرة إلى الخزنة ($encryptedCount) بنجاح، لكن ${res.message}")
+                        LibraryUiEvent.ShowMessage(
+                            "تمت إضافة النسخة المشفرة إلى الخزنة ($encryptedCount) بنجاح$encFailSuffix، لكن ${res.message}"
+                        )
                     )
                 }
             }
         }
+    }
+
+    private fun buildVaultPartialCleanupMessage(
+        encryptedCount: Int,
+        encryptedFailedCount: Int,
+        removedPublicCount: Int,
+        failedPublicCount: Int
+    ): String {
+        val encFailPart = if (encryptedFailedCount > 0) " وتعذر نقل $encryptedFailedCount،" else ""
+        return "تمت إضافة $encryptedCount إلى الخزنة بنجاح،$encFailPart وأُزيلت $removedPublicCount نسخة عامة، وبقيت $failedPublicCount نسخة عامة لم تُزل"
     }
 
     fun moveToTrash(video: VideoItem) {
@@ -563,6 +596,10 @@ class LibraryViewModel(
                         _events.tryEmit(LibraryUiEvent.ShowMessage(err))
                     }
                 }
+                is VideoFileOperationResult.PartialSuccess -> {
+                    pendingBulkFailedCount++
+                    _events.tryEmit(LibraryUiEvent.ShowMessage(res.message))
+                }
                 is VideoFileOperationResult.RequiresPermission -> {
                     pendingFileOp = res.pendingOp
                     _events.tryEmit(LibraryUiEvent.LaunchWritePermission(res.intentSender))
@@ -604,11 +641,13 @@ class LibraryViewModel(
                 when (op) {
                     is PendingVideoFileOp.DeleteVaultOriginals -> {
                         loadVideos()
-                        _events.tryEmit(
-                            LibraryUiEvent.ShowMessage(
-                                "تمت إضافة النسخة المشفرة إلى الخزنة (${op.encryptedCount}) بنجاح، وبقيت النسخة العامة في المعرض لعدم منح إذن إزالتها"
-                            )
-                        )
+                        val remainingCount = op.pendingUris.size + op.failedCount
+                        val msg = if (op.deletedSoFar > 0) {
+                            "تمت إضافة النسخة المشفرة إلى الخزنة (${op.encryptedCount}) بنجاح، وأُزيلت ${op.deletedSoFar} نسخة عامة، وبقيت $remainingCount نسخة عامة لعدم منح الإذن"
+                        } else {
+                            "تمت إضافة النسخة المشفرة إلى الخزنة (${op.encryptedCount}) بنجاح، وبقيت النسخة العامة في المعرض لعدم منح إذن إزالتها"
+                        }
+                        _events.tryEmit(LibraryUiEvent.ShowMessage(msg))
                     }
                     is PendingVideoFileOp.BatchMove -> {
                         loadVideos()
@@ -644,26 +683,47 @@ class LibraryViewModel(
                     when (res) {
                         is VideoFileOperationResult.Success -> {
                             loadVideos()
-                            val msg = if (op.encryptedCount == 1) {
-                                "تمت إضافة الفيديو إلى الخزنة بنجاح"
-                            } else {
-                                "تمت إضافة ${op.encryptedCount} فيديو إلى الخزنة بنجاح"
+                            val msg = when {
+                                op.encryptedFailedCount > 0 ->
+                                    "تمت إضافة ${op.encryptedCount} فيديو إلى الخزنة بنجاح، وتعذر نقل ${op.encryptedFailedCount}"
+                                op.encryptedCount == 1 -> "تمت إضافة الفيديو إلى الخزنة بنجاح"
+                                else -> "تمت إضافة ${op.encryptedCount} فيديو إلى الخزنة بنجاح"
                             }
                             _events.tryEmit(LibraryUiEvent.ShowMessage(msg))
                         }
+                        is VideoFileOperationResult.PartialSuccess -> {
+                            loadVideos()
+                            _events.tryEmit(
+                                LibraryUiEvent.ShowMessage(
+                                    buildVaultPartialCleanupMessage(
+                                        encryptedCount = op.encryptedCount,
+                                        encryptedFailedCount = op.encryptedFailedCount,
+                                        removedPublicCount = res.succeededCount,
+                                        failedPublicCount = res.failedCount
+                                    )
+                                )
+                            )
+                        }
                         is VideoFileOperationResult.RequiresPermission -> {
-                            pendingFileOp = res.pendingOp
+                            val nextOp = res.pendingOp
+                            pendingFileOp = if (nextOp is PendingVideoFileOp.DeleteVaultOriginals) {
+                                nextOp.copy(encryptedFailedCount = op.encryptedFailedCount)
+                            } else nextOp
                             _events.tryEmit(LibraryUiEvent.LaunchWritePermission(res.intentSender))
                         }
                         is VideoFileOperationResult.RequiresLegacyWritePermission -> {
-                            pendingFileOp = res.pendingOp
+                            val nextOp = res.pendingOp
+                            pendingFileOp = if (nextOp is PendingVideoFileOp.DeleteVaultOriginals) {
+                                nextOp.copy(encryptedFailedCount = op.encryptedFailedCount)
+                            } else nextOp
                             _events.tryEmit(LibraryUiEvent.RequestLegacyWritePermission(res.permission))
                         }
                         is VideoFileOperationResult.Error -> {
                             loadVideos()
+                            val encFailSuffix = if (op.encryptedFailedCount > 0) "، وتعذر تشفير ${op.encryptedFailedCount}" else ""
                             _events.tryEmit(
                                 LibraryUiEvent.ShowMessage(
-                                    "تمت إضافة النسخة المشفرة (${op.encryptedCount}) إلى الخزنة بنجاح، لكن ${res.message}"
+                                    "تمت إضافة النسخة المشفرة (${op.encryptedCount}) إلى الخزنة بنجاح$encFailSuffix، لكن ${res.message}"
                                 )
                             )
                         }
@@ -720,6 +780,10 @@ class LibraryViewModel(
             is VideoFileOperationResult.Success -> {
                 loadVideos()
                 _events.tryEmit(LibraryUiEvent.ShowMessage(successMessage))
+            }
+            is VideoFileOperationResult.PartialSuccess -> {
+                loadVideos()
+                _events.tryEmit(LibraryUiEvent.ShowMessage(result.message))
             }
             is VideoFileOperationResult.RequiresPermission -> {
                 pendingFileOp = result.pendingOp

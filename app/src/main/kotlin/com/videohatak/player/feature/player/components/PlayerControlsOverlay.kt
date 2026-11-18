@@ -28,8 +28,6 @@ import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.AspectRatio
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Edit
-import androidx.compose.material.icons.filled.FastForward
-import androidx.compose.material.icons.filled.FastRewind
 import androidx.compose.material.icons.filled.Headphones
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Lock
@@ -71,7 +69,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.graphics.vector.path
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.text.font.FontWeight
@@ -88,6 +88,52 @@ import com.videohatak.player.core.playback.VideoResizeMode
 import com.videohatak.player.core.playback.service.MediaNotificationPrivacy
 import com.videohatak.player.core.thumbnail.model.ThumbnailPreviewState
 import kotlin.math.roundToInt
+
+internal val SeekForwardDoubleTriangleIcon: ImageVector by lazy {
+    ImageVector.Builder(
+        name = "SeekForwardDoubleTriangle",
+        defaultWidth = 24.dp,
+        defaultHeight = 24.dp,
+        viewportWidth = 24f,
+        viewportHeight = 24f
+    ).apply {
+        path(fill = SolidColor(Color.White)) {
+            moveTo(3.5f, 5.5f)
+            lineTo(11.5f, 12f)
+            lineTo(3.5f, 18.5f)
+            close()
+        }
+        path(fill = SolidColor(Color.White)) {
+            moveTo(12.5f, 5.5f)
+            lineTo(20.5f, 12f)
+            lineTo(12.5f, 18.5f)
+            close()
+        }
+    }.build()
+}
+
+internal val SeekBackwardDoubleTriangleIcon: ImageVector by lazy {
+    ImageVector.Builder(
+        name = "SeekBackwardDoubleTriangle",
+        defaultWidth = 24.dp,
+        defaultHeight = 24.dp,
+        viewportWidth = 24f,
+        viewportHeight = 24f
+    ).apply {
+        path(fill = SolidColor(Color.White)) {
+            moveTo(20.5f, 5.5f)
+            lineTo(12.5f, 12f)
+            lineTo(20.5f, 18.5f)
+            close()
+        }
+        path(fill = SolidColor(Color.White)) {
+            moveTo(11.5f, 5.5f)
+            lineTo(3.5f, 12f)
+            lineTo(11.5f, 18.5f)
+            close()
+        }
+    }.build()
+}
 
 @Composable
 fun PlayerControlsOverlay(
@@ -491,7 +537,7 @@ fun PlayerControlsOverlay(
                                     .background(Color.Black.copy(alpha = 0.52f))
                             ) {
                                 Icon(
-                                    imageVector = Icons.Default.FastRewind,
+                                    imageVector = SeekBackwardDoubleTriangleIcon,
                                     contentDescription = "تأخير ${uiState.seekIntervalSeconds} ثوان",
                                     tint = Color.White,
                                     modifier = Modifier.size(28.dp)
@@ -524,7 +570,7 @@ fun PlayerControlsOverlay(
                                     .background(Color.Black.copy(alpha = 0.52f))
                             ) {
                                 Icon(
-                                    imageVector = Icons.Default.FastForward,
+                                    imageVector = SeekForwardDoubleTriangleIcon,
                                     contentDescription = "تقديم ${uiState.seekIntervalSeconds} ثوان",
                                     tint = Color.White,
                                     modifier = Modifier.size(28.dp)

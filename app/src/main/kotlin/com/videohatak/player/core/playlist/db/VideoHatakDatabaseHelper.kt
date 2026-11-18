@@ -21,12 +21,25 @@ interface BackupPlaylistStore {
     fun replaceAllPlaylistsAndItems(entries: List<Pair<Playlist, List<PlaylistItem>>>)
 }
 
+interface PlaylistDatabaseStore {
+    fun insertPlaylist(title: String): Long
+    fun updatePlaylist(id: Long, title: String): Int
+    fun deletePlaylist(id: Long): Int
+    fun getPlaylists(): List<Playlist>
+    fun insertItem(item: PlaylistItem): Long
+    fun deleteItem(itemId: Long, playlistId: Long): Int
+    fun getItemsForPlaylist(playlistId: Long): List<PlaylistItem>
+    fun updateItemOrder(itemId: Long, newIndex: Int)
+    fun updateItemAvailability(itemId: Long, isAvailable: Boolean)
+    fun updateItemUri(itemId: Long, newUri: String)
+}
+
 class VideoHatakDatabaseHelper(context: Context) : SQLiteOpenHelper(
     context,
     DATABASE_NAME,
     null,
     DATABASE_VERSION
-), TrashDatabaseStore, BackupPlaylistStore {
+), TrashDatabaseStore, BackupPlaylistStore, PlaylistDatabaseStore {
     companion object {
         private const val DATABASE_NAME = "videohatak_playlists.db"
         const val DATABASE_VERSION = 3
@@ -243,7 +256,7 @@ class VideoHatakDatabaseHelper(context: Context) : SQLiteOpenHelper(
         db.setForeignKeyConstraintsEnabled(true)
     }
 
-    fun insertPlaylist(title: String): Long {
+    override fun insertPlaylist(title: String): Long {
         val db = writableDatabase
         val now = System.currentTimeMillis()
         val values = ContentValues().apply {
@@ -254,7 +267,7 @@ class VideoHatakDatabaseHelper(context: Context) : SQLiteOpenHelper(
         return db.insert(TABLE_PLAYLISTS, null, values)
     }
 
-    fun updatePlaylist(id: Long, title: String): Int {
+    override fun updatePlaylist(id: Long, title: String): Int {
         val db = writableDatabase
         val values = ContentValues().apply {
             put(COL_P_TITLE, title)
@@ -263,7 +276,7 @@ class VideoHatakDatabaseHelper(context: Context) : SQLiteOpenHelper(
         return db.update(TABLE_PLAYLISTS, values, "$COL_P_ID = ?", arrayOf(id.toString()))
     }
 
-    fun deletePlaylist(id: Long): Int {
+    override fun deletePlaylist(id: Long): Int {
         val db = writableDatabase
         return db.delete(TABLE_PLAYLISTS, "$COL_P_ID = ?", arrayOf(id.toString()))
     }
@@ -309,7 +322,7 @@ class VideoHatakDatabaseHelper(context: Context) : SQLiteOpenHelper(
         return list
     }
 
-    fun insertItem(item: PlaylistItem): Long {
+    override fun insertItem(item: PlaylistItem): Long {
         val db = writableDatabase
         val values = ContentValues().apply {
             put(COL_I_PLAYLIST_ID, item.playlistId)
@@ -323,14 +336,18 @@ class VideoHatakDatabaseHelper(context: Context) : SQLiteOpenHelper(
             put(COL_I_IS_AVAILABLE, if (item.isAvailable) 1 else 0)
         }
         val res = db.insert(TABLE_PLAYLIST_ITEMS, null, values)
-        touchPlaylist(item.playlistId)
+        if (res > 0L) {
+            touchPlaylist(item.playlistId)
+        }
         return res
     }
 
-    fun deleteItem(itemId: Long, playlistId: Long): Int {
+    override fun deleteItem(itemId: Long, playlistId: Long): Int {
         val db = writableDatabase
         val rows = db.delete(TABLE_PLAYLIST_ITEMS, "$COL_I_ID = ?", arrayOf(itemId.toString()))
-        touchPlaylist(playlistId)
+        if (rows > 0) {
+            touchPlaylist(playlistId)
+        }
         return rows
     }
 
@@ -378,7 +395,7 @@ class VideoHatakDatabaseHelper(context: Context) : SQLiteOpenHelper(
         return list
     }
 
-    fun updateItemOrder(itemId: Long, newIndex: Int) {
+    override fun updateItemOrder(itemId: Long, newIndex: Int) {
         val db = writableDatabase
         val values = ContentValues().apply {
             put(COL_I_ORDER_INDEX, newIndex)
@@ -386,7 +403,7 @@ class VideoHatakDatabaseHelper(context: Context) : SQLiteOpenHelper(
         db.update(TABLE_PLAYLIST_ITEMS, values, "$COL_I_ID = ?", arrayOf(itemId.toString()))
     }
 
-    fun updateItemAvailability(itemId: Long, isAvailable: Boolean) {
+    override fun updateItemAvailability(itemId: Long, isAvailable: Boolean) {
         val db = writableDatabase
         val values = ContentValues().apply {
             put(COL_I_IS_AVAILABLE, if (isAvailable) 1 else 0)
@@ -394,7 +411,7 @@ class VideoHatakDatabaseHelper(context: Context) : SQLiteOpenHelper(
         db.update(TABLE_PLAYLIST_ITEMS, values, "$COL_I_ID = ?", arrayOf(itemId.toString()))
     }
 
-    fun updateItemUri(itemId: Long, newUri: String) {
+    override fun updateItemUri(itemId: Long, newUri: String) {
         val db = writableDatabase
         val values = ContentValues().apply {
             put(COL_I_URI, newUri)

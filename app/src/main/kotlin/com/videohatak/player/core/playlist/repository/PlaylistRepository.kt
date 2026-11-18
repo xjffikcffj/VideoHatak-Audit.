@@ -13,6 +13,15 @@ data class PlaylistAddOutcome(
     val playlistTitles: List<String> = emptyList()
 )
 
+sealed interface ToggleFavoriteResult {
+    data class Added(val playlistId: Long, val itemId: Long) : ToggleFavoriteResult
+    data class Removed(val playlistId: Long) : ToggleFavoriteResult
+    data class Failed(
+        val message: String,
+        val isFavoriteAfterAttempt: Boolean
+    ) : ToggleFavoriteResult
+}
+
 interface PlaylistRepository {
     companion object {
         const val FAVORITES_PLAYLIST_TITLE = "المفضلة ⭐"
@@ -43,6 +52,18 @@ interface PlaylistRepository {
     suspend fun relinkMissingItems(playlistId: Long): Int
     suspend fun isFavorite(video: VideoItem): Boolean = false
     suspend fun toggleFavorite(video: VideoItem): Boolean = false
+    suspend fun toggleFavoriteDetailed(video: VideoItem): ToggleFavoriteResult {
+        val wasFavorite = isFavorite(video)
+        val isNowFavorite = toggleFavorite(video)
+        return if (isNowFavorite != wasFavorite) {
+            if (isNowFavorite) ToggleFavoriteResult.Added(0L, 0L) else ToggleFavoriteResult.Removed(0L)
+        } else {
+            ToggleFavoriteResult.Failed(
+                message = if (wasFavorite) "تعذر إزالة الفيديو من المفضلة" else "تعذر إضافة الفيديو إلى المفضلة",
+                isFavoriteAfterAttempt = isNowFavorite
+            )
+        }
+    }
     suspend fun getFavoriteVideoKeys(): Pair<Set<Long>, Set<String>> = emptySet<Long>() to emptySet()
     suspend fun getFavoritesPlaylistWithItems(): Pair<Playlist, List<PlaylistItem>>? = null
     suspend fun addVideosToPlaylists(videos: List<VideoItem>, playlistIds: List<Long>): Int = 0

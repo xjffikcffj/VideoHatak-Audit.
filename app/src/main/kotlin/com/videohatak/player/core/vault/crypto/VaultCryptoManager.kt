@@ -13,6 +13,7 @@ import java.nio.ByteBuffer
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.security.KeyStore
+import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.Arrays
 import javax.crypto.AEADBadTagException
@@ -37,7 +38,8 @@ data class EncryptionResult(
     val encryptedDek: ByteArray,
     val plaintextSizeBytes: Long,
     val chunkSize: Int,
-    val headerSize: Int
+    val headerSize: Int,
+    val contentSha256: String = ""
 )
 
 internal interface VaultFileCommitter {
@@ -357,6 +359,7 @@ class VaultCryptoManager internal constructor(
         // Initial placeholder wrapped DEK (60 bytes: 12 IV + 32 key + 16 tag)
         val initialWrappedDek = wrapDataKey(dek)
         val buffer = ByteArray(chunkSize)
+        val sha256Digest = MessageDigest.getInstance("SHA-256")
         var plaintextSize = 0L
         var raf: RandomAccessFile? = null
 
@@ -397,6 +400,7 @@ class VaultCryptoManager internal constructor(
                 fileRaf.writeInt(encryptedChunk.size)
                 fileRaf.write(encryptedChunk)
 
+                sha256Digest.update(buffer, 0, bytesRead)
                 plaintextSize += bytesRead
                 chunkIndex++
 
@@ -420,12 +424,14 @@ class VaultCryptoManager internal constructor(
 
             fileCommitter.commitTempFile(tempFile, destinationFile)
 
+            val computedContentSha256 = sha256Digest.digest().joinToString("") { "%02x".format(it) }
             return EncryptionResult(
                 fileSalt = fileSalt,
                 encryptedDek = finalWrappedDek,
                 plaintextSizeBytes = plaintextSize,
                 chunkSize = chunkSize,
-                headerSize = headerSize
+                headerSize = headerSize,
+                contentSha256 = computedContentSha256
             )
         } catch (e: Exception) {
             try { raf?.close() } catch (_: Exception) {}
@@ -485,7 +491,28 @@ class VaultCryptoManager internal constructor(
         return encSize
     }
 
+    fun computeStreamSha256(inputStream: InputStream, chunkSize: Int = DEFAULT_CHUNK_SIZE): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val buffer = ByteArray(chunkSize)
+        try {
+            var bytesRead: Int
+            while (readChunkFully(inputStream, buffer, chunkSize).also { bytesRead = it } != -1) {
+                digest.update(buffer, 0, bytesRead)
+            }
+            return digest.digest().joinToString("") { "%02x".format(it) }
+        } finally {
+            zeroByteArray(buffer)
+        }
+    }
+
     fun verifyEncryptedFileIntegrity(encryptedFile: File) {
+        verifyEncryptedFileIntegrityAndHash(encryptedFile, expectedContentSha256 = null)
+    }
+
+    fun verifyEncryptedFileIntegrityAndHash(
+        encryptedFile: File,
+        expectedContentSha256: String? = null
+    ): String {
         if (!encryptedFile.exists() || encryptedFile.length() <= 0L) {
             throw IllegalStateException("Encrypted vault file verification failed")
         }
@@ -497,6 +524,7 @@ class VaultCryptoManager internal constructor(
             header.plaintextSizeBytes
         )
         val dek = unwrapDataKeyWithFallback(header.encryptedDek, headerAad)
+        val sha256Digest = MessageDigest.getInstance("SHA-256")
         try {
             RandomAccessFile(encryptedFile, "r").use { raf ->
                 raf.seek(header.headerSize.toLong())
@@ -526,6 +554,7 @@ class VaultCryptoManager internal constructor(
                     }
 
                     try {
+                        sha256Digest.update(plainChunk)
                         totalPlaintext += plainChunk.size
                         chunkIndex++
                     } finally {
@@ -539,6 +568,13 @@ class VaultCryptoManager internal constructor(
                     throw IOException("Unexpected trailing bytes after encrypted chunks at ${raf.filePointer}/${raf.length()}")
                 }
             }
+            val actualSha256 = sha256Digest.digest().joinToString("") { "%02x".format(it) }
+            if (!expectedContentSha256.isNullOrBlank() &&
+                !actualSha256.equals(expectedContentSha256, ignoreCase = true)
+            ) {
+                throw IOException("Encrypted vault decrypted content SHA-256 mismatch")
+            }
+            return actualSha256
         } finally {
             runCatching { zeroByteArray(dek.encoded) }
             runCatching { dek.destroy() }

@@ -5,6 +5,7 @@ import android.net.Uri
 import com.videohatak.player.core.data.repository.LocalVideoRepositoryImpl
 import com.videohatak.player.core.data.repository.VideoRepository
 import com.videohatak.player.core.model.VideoItem
+import com.videohatak.player.core.playlist.db.PlaylistDatabaseStore
 import com.videohatak.player.core.playlist.db.VideoHatakDatabaseHelper
 import com.videohatak.player.core.playlist.model.Playlist
 import com.videohatak.player.core.playlist.model.PlaylistItem
@@ -19,7 +20,7 @@ import kotlin.math.abs
 
 class PlaylistRepositoryImpl(
     private val context: Context,
-    private val dbHelper: VideoHatakDatabaseHelper = VideoHatakDatabaseHelper(context),
+    private val dbHelper: PlaylistDatabaseStore = VideoHatakDatabaseHelper(context),
     private val videoRepository: VideoRepository = LocalVideoRepositoryImpl(context)
 ) : PlaylistRepository {
 
@@ -206,49 +207,133 @@ class PlaylistRepositoryImpl(
         items.any { isSamePlaylistVideo(it.videoId, it.contentUri, video.id, uriString) }
     }
 
-    override suspend fun toggleFavorite(video: VideoItem): Boolean = withContext(Dispatchers.IO) {
-        val existingPlaylist = findAndMigrateFavoritesLocked()
+    override suspend fun toggleFavorite(video: VideoItem): Boolean =
+        when (val result = toggleFavoriteDetailed(video)) {
+            is ToggleFavoriteResult.Added -> true
+            is ToggleFavoriteResult.Removed -> false
+            is ToggleFavoriteResult.Failed -> result.isFavoriteAfterAttempt
+        }
+
+    override suspend fun toggleFavoriteDetailed(video: VideoItem): ToggleFavoriteResult = withContext(Dispatchers.IO) {
         val uriString = normalizeVideoUriKey(video.contentUri.toString())
+        if (video.id <= 0L && uriString.isEmpty()) {
+            return@withContext ToggleFavoriteResult.Failed(
+                message = "تعذر إضافة الفيديو إلى المفضلة لعدم توفر معرّف صالح",
+                isFavoriteAfterAttempt = false
+            )
+        }
+
+        val existingPlaylist = try {
+            findAndMigrateFavoritesLocked()
+        } catch (_: Exception) {
+            return@withContext ToggleFavoriteResult.Failed(
+                message = "تعذر الوصول إلى قائمة المفضلة في قاعدة البيانات",
+                isFavoriteAfterAttempt = false
+            )
+        }
 
         if (existingPlaylist != null) {
-            val items = dbHelper.getItemsForPlaylist(existingPlaylist.id)
+            val items = try {
+                dbHelper.getItemsForPlaylist(existingPlaylist.id)
+            } catch (_: Exception) {
+                return@withContext ToggleFavoriteResult.Failed(
+                    message = "تعذر قراءة عناصر المفضلة من قاعدة البيانات",
+                    isFavoriteAfterAttempt = false
+                )
+            }
+
             val matchingItems = items.filter {
                 isSamePlaylistVideo(it.videoId, it.contentUri, video.id, uriString)
             }
             if (matchingItems.isNotEmpty()) {
+                var anyDeleteFailed = false
                 for (match in matchingItems) {
-                    dbHelper.deleteItem(match.id, existingPlaylist.id)
-                }
-                val remaining = dbHelper.getItemsForPlaylist(existingPlaylist.id)
-                remaining.forEachIndexed { index, item ->
-                    if (item.orderIndex != index) {
-                        dbHelper.updateItemOrder(item.id, index)
+                    val deletedRows = try {
+                        dbHelper.deleteItem(match.id, existingPlaylist.id)
+                    } catch (_: Exception) {
+                        0
+                    }
+                    if (deletedRows <= 0) {
+                        anyDeleteFailed = true
                     }
                 }
-                refresh()
-                return@withContext false
-            }
-            val nextOrder = items.size
-            dbHelper.insertItem(
-                PlaylistItem(
-                    id = 0L,
-                    playlistId = existingPlaylist.id,
-                    videoId = video.id,
-                    orderIndex = nextOrder,
-                    videoTitle = video.safeTitle,
-                    durationMs = video.durationMs,
-                    sizeBytes = video.sizeBytes,
-                    dateAddedSec = video.dateAddedSec,
-                    contentUri = uriString,
-                    isAvailable = true
+                val remaining = try {
+                    dbHelper.getItemsForPlaylist(existingPlaylist.id)
+                } catch (_: Exception) {
+                    items
+                }
+                val stillPresent = remaining.any {
+                    isSamePlaylistVideo(it.videoId, it.contentUri, video.id, uriString)
+                }
+                if (!anyDeleteFailed && !stillPresent) {
+                    remaining.forEachIndexed { index, item ->
+                        if (item.orderIndex != index) {
+                            runCatching { dbHelper.updateItemOrder(item.id, index) }
+                        }
+                    }
+                    runCatching { refresh() }
+                    return@withContext ToggleFavoriteResult.Removed(existingPlaylist.id)
+                }
+                runCatching { refresh() }
+                return@withContext ToggleFavoriteResult.Failed(
+                    message = "تعذر إزالة الفيديو من المفضلة",
+                    isFavoriteAfterAttempt = stillPresent
                 )
-            )
-            refresh()
-            return@withContext true
+            }
+
+            val nextOrder = (items.maxOfOrNull { it.orderIndex } ?: -1) + 1
+            val insertedId = try {
+                dbHelper.insertItem(
+                    PlaylistItem(
+                        id = 0L,
+                        playlistId = existingPlaylist.id,
+                        videoId = video.id,
+                        orderIndex = nextOrder,
+                        videoTitle = video.safeTitle,
+                        durationMs = video.durationMs,
+                        sizeBytes = video.sizeBytes,
+                        dateAddedSec = video.dateAddedSec,
+                        contentUri = uriString,
+                        isAvailable = true
+                    )
+                )
+            } catch (_: Exception) {
+                -1L
+            }
+            val afterItems = try {
+                dbHelper.getItemsForPlaylist(existingPlaylist.id)
+            } catch (_: Exception) {
+                items
+            }
+            val isNowPresent = afterItems.any {
+                (insertedId > 0L && it.id == insertedId) ||
+                    isSamePlaylistVideo(it.videoId, it.contentUri, video.id, uriString)
+            }
+            runCatching { refresh() }
+            return@withContext if (insertedId > 0L && isNowPresent) {
+                ToggleFavoriteResult.Added(existingPlaylist.id, insertedId)
+            } else {
+                ToggleFavoriteResult.Failed(
+                    message = "تعذر إضافة الفيديو إلى المفضلة",
+                    isFavoriteAfterAttempt = isNowPresent
+                )
+            }
         }
 
-        val favoritesId = dbHelper.insertPlaylist(PlaylistRepository.FAVORITES_PLAYLIST_TITLE)
-        if (favoritesId > 0L) {
+        val favoritesId = try {
+            dbHelper.insertPlaylist(PlaylistRepository.FAVORITES_PLAYLIST_TITLE)
+        } catch (_: Exception) {
+            -1L
+        }
+        if (favoritesId <= 0L) {
+            runCatching { refresh() }
+            return@withContext ToggleFavoriteResult.Failed(
+                message = "تعذر إنشاء قائمة المفضلة",
+                isFavoriteAfterAttempt = false
+            )
+        }
+
+        val insertedId = try {
             dbHelper.insertItem(
                 PlaylistItem(
                     id = 0L,
@@ -263,9 +348,27 @@ class PlaylistRepositoryImpl(
                     isAvailable = true
                 )
             )
+        } catch (_: Exception) {
+            -1L
         }
-        refresh()
-        favoritesId > 0L
+        val afterItems = try {
+            dbHelper.getItemsForPlaylist(favoritesId)
+        } catch (_: Exception) {
+            emptyList()
+        }
+        val isNowPresent = afterItems.any {
+            (insertedId > 0L && it.id == insertedId) ||
+                isSamePlaylistVideo(it.videoId, it.contentUri, video.id, uriString)
+        }
+        runCatching { refresh() }
+        if (insertedId > 0L && isNowPresent) {
+            ToggleFavoriteResult.Added(favoritesId, insertedId)
+        } else {
+            ToggleFavoriteResult.Failed(
+                message = "تعذر إضافة الفيديو إلى المفضلة",
+                isFavoriteAfterAttempt = isNowPresent
+            )
+        }
     }
 
     override suspend fun getFavoriteVideoKeys(): Pair<Set<Long>, Set<String>> = withContext(Dispatchers.IO) {

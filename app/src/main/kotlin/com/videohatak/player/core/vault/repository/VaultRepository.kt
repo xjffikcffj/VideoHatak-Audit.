@@ -21,8 +21,8 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
+import java.io.IOException
 import java.io.InputStream
-import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
@@ -75,7 +75,8 @@ interface VaultRepository {
 class VaultRepositoryImpl internal constructor(
     private val context: Context,
     private val cryptoManager: VaultCryptoManager = VaultCryptoManager(),
-    private val dbHelper: VaultDatabaseStore = VaultDatabaseHelper(context)
+    private val dbHelper: VaultDatabaseStore = VaultDatabaseHelper(context),
+    private val contentSha256Computer: ((InputStream) -> String)? = null
 ) : VaultRepository {
 
     companion object {
@@ -239,35 +240,54 @@ class VaultRepositoryImpl internal constructor(
         lastPreservedOrphanCount = preservedOrphans
     }
 
-    private fun computeSourceFingerprint(sourceUri: Uri): String {
-        val digest = MessageDigest.getInstance("SHA-256")
-            .digest(sourceUri.toString().toByteArray(Charsets.UTF_8))
-        return digest.joinToString("") { "%02x".format(it) }
+    private data class ExistingVaultMatch(
+        val video: VaultVideo,
+        val integrityVerified: Boolean
+    )
+
+    private fun computeSourceContentSha256(sourceUri: Uri): String {
+        val stream = context.contentResolver.openInputStream(sourceUri)
+            ?: throw IOException("تعذر فتح ملف الفيديو لقراءة المحتوى وحساب البصمة")
+        val sha256 = stream.use { input ->
+            val custom = contentSha256Computer
+            if (custom != null) {
+                custom(input)
+            } else {
+                cryptoManager.computeStreamSha256(input)
+            }
+        }
+        if (sha256.isBlank()) {
+            throw IOException("تعذر حساب بصمة المحتوى SHA-256 للفيديو")
+        }
+        return sha256
     }
 
     private fun encodeMetadata(
         displayName: String,
         internalFileName: String,
         mimeType: String,
-        sourceFingerprint: String = ""
+        contentSha256: String = "",
+        legacySourceFingerprint: String = ""
     ): String {
         val json = JSONObject().apply {
             put("title", displayName)
             put("file", internalFileName)
             put("mime", mimeType)
-            if (sourceFingerprint.isNotBlank()) {
-                put("src", sourceFingerprint)
+            if (contentSha256.isNotBlank()) {
+                put("contentSha256", contentSha256)
+            }
+            if (legacySourceFingerprint.isNotBlank()) {
+                put("src", legacySourceFingerprint)
             }
         }
         return cryptoManager.encryptMetadata(json.toString())
     }
 
-    private fun findExistingVaultMatch(
-        sourceFingerprint: String,
-        resolvedName: String,
-        estimatedSize: Long,
-        durationMs: Long
-    ): VaultVideo? {
+    private fun findExistingVaultMatchByContent(
+        sourceContentSha256: String,
+        sourceSizeBytes: Long
+    ): ExistingVaultMatch? {
+        if (sourceContentSha256.isBlank()) return null
         val rows = dbHelper.getAllVideos()
         for (row in rows) {
             val resolvedFile = resolveEncryptedFile(row)
@@ -278,32 +298,37 @@ class VaultRepositoryImpl internal constructor(
             if (!encMeta.isNullOrBlank()) {
                 try {
                     val json = JSONObject(cryptoManager.decryptMetadata(encMeta))
-                    val storedSrc = json.optString("src")
-                    if (storedSrc.isNotBlank() && storedSrc == sourceFingerprint) {
-                        return row
-                    }
-                    val storedTitle = json.optString("title")
-                    if (estimatedSize > 0L &&
-                        row.originalSizeBytes == estimatedSize &&
-                        row.durationMs == durationMs &&
-                        storedTitle.equals(resolvedName, ignoreCase = true)
-                    ) {
-                        return row
+                    val storedContentSha256 = json.optString("contentSha256")
+                    if (storedContentSha256.isNotBlank()) {
+                        if (storedContentSha256.equals(sourceContentSha256, ignoreCase = true)) {
+                            val integrityOk = runCatching {
+                                verifyEncryptedOutputIntegrity(
+                                    destFile = resolvedFile,
+                                    expectedContentSha256 = sourceContentSha256
+                                )
+                                true
+                            }.getOrDefault(false)
+                            return ExistingVaultMatch(video = row, integrityVerified = integrityOk)
+                        }
+                        continue
                     }
                 } catch (_: Exception) {
+                    continue
+                }
+            }
+
+            // Legacy entries without contentSha256 in metadata must only match via actual decrypted SHA-256,
+            // never by URI string or (title, size, duration) alone.
+            if (sourceSizeBytes <= 0L || row.originalSizeBytes == sourceSizeBytes) {
+                val decryptedSha256 = runCatching {
+                    cryptoManager.verifyEncryptedFileIntegrityAndHash(resolvedFile, expectedContentSha256 = null)
+                }.getOrNull()
+                if (decryptedSha256 != null && decryptedSha256.equals(sourceContentSha256, ignoreCase = true)) {
+                    return ExistingVaultMatch(video = row, integrityVerified = true)
                 }
             }
         }
         return null
-    }
-
-    private fun isDuplicateInVault(
-        sourceFingerprint: String,
-        resolvedName: String,
-        estimatedSize: Long,
-        durationMs: Long
-    ): Boolean {
-        return findExistingVaultMatch(sourceFingerprint, resolvedName, estimatedSize, durationMs) != null
     }
 
     private fun hasEnoughStorageForEncryption(estimatedSize: Long): Boolean {
@@ -324,8 +349,8 @@ class VaultRepositoryImpl internal constructor(
         }
     }
 
-    private fun verifyEncryptedOutputIntegrity(destFile: File) {
-        cryptoManager.verifyEncryptedFileIntegrity(destFile)
+    private fun verifyEncryptedOutputIntegrity(destFile: File, expectedContentSha256: String? = null) {
+        cryptoManager.verifyEncryptedFileIntegrityAndHash(destFile, expectedContentSha256)
     }
 
     private fun decodeVaultRow(row: VaultVideo): VaultVideo? {
@@ -395,24 +420,33 @@ class VaultRepositoryImpl internal constructor(
         val stagingFile = File(vaultDir, "$fileName.stage")
         val stagingInnerTempName = "${stagingFile.name}.tmp"
         val resolvedName = displayName?.ifBlank { null } ?: queryFileName(sourceUri) ?: "$uniqueName.mp4"
-        val sourceFingerprint = computeSourceFingerprint(sourceUri)
-
-        val metadata = probeVideoMetadata(sourceUri)
         val estimatedSize = try {
             context.contentResolver.openFileDescriptor(sourceUri, "r")?.use { it.statSize } ?: 0L
         } catch (_: Exception) { 0L }
 
+        val sourceContentSha256 = try {
+            computeSourceContentSha256(sourceUri)
+        } catch (e: Exception) {
+            if (isCancelled() || e is InterruptedException) {
+                return@withContext VaultImportOutcome.Cancelled
+            }
+            val errMsg = "تعذر قراءة الفيديو أو التحقق من بصمة محتواه، بقي الملف الأصلي سليمًا في مكانه"
+            _vaultError.value = errMsg
+            return@withContext VaultImportOutcome.Failed(errMsg)
+        }
+
+        val metadata = probeVideoMetadata(sourceUri)
+
         val existingBeforeEncrypt = repoMutex.withLock {
-            findExistingVaultMatch(sourceFingerprint, resolvedName, estimatedSize, metadata.durationMs)
+            findExistingVaultMatchByContent(sourceContentSha256, estimatedSize)
         }
         if (existingBeforeEncrypt != null) {
-            val integrityOk = runCatching {
-                verifyEncryptedOutputIntegrity(resolveEncryptedFile(existingBeforeEncrypt))
-                true
-            }.getOrDefault(false)
             val errMsg = "هذا الفيديو محفوظ ومشفّر مسبقًا داخل الخزنة"
             _vaultError.value = errMsg
-            return@withContext VaultImportOutcome.AlreadyInVault(existingBeforeEncrypt, integrityOk)
+            return@withContext VaultImportOutcome.AlreadyInVault(
+                existingVideo = existingBeforeEncrypt.video,
+                integrityVerified = existingBeforeEncrypt.integrityVerified
+            )
         }
 
         if (!hasEnoughStorageForEncryption(estimatedSize)) {
@@ -447,28 +481,36 @@ class VaultRepositoryImpl internal constructor(
                 )
             }
 
-            // Mandatory end-to-end cryptographic & decryptability verification before touching original
-            verifyEncryptedOutputIntegrity(stagingFile)
+            if (encResult.contentSha256.isBlank() ||
+                !encResult.contentSha256.equals(sourceContentSha256, ignoreCase = true)
+            ) {
+                throw IOException("Source content SHA-256 mismatch during encryption")
+            }
 
-            val encryptedMeta = encodeMetadata(resolvedName, fileName, metadata.mimeType, sourceFingerprint)
+            // Mandatory end-to-end cryptographic & decrypted SHA-256 verification before touching original
+            verifyEncryptedOutputIntegrity(stagingFile, expectedContentSha256 = sourceContentSha256)
+
+            val encryptedMeta = encodeMetadata(
+                displayName = resolvedName,
+                internalFileName = fileName,
+                mimeType = metadata.mimeType,
+                contentSha256 = sourceContentSha256
+            )
             val ivBase64 = VaultBase64.encodeNoWrap(encResult.encryptedDek)
 
             repoMutex.withLock {
-                val duplicateLocked = findExistingVaultMatch(
-                    sourceFingerprint,
-                    resolvedName,
-                    estimatedSize,
-                    metadata.durationMs
+                val duplicateLocked = findExistingVaultMatchByContent(
+                    sourceContentSha256 = sourceContentSha256,
+                    sourceSizeBytes = encResult.plaintextSizeBytes
                 )
                 if (duplicateLocked != null) {
                     stagingFile.delete()
-                    val integrityOk = runCatching {
-                        verifyEncryptedOutputIntegrity(resolveEncryptedFile(duplicateLocked))
-                        true
-                    }.getOrDefault(false)
                     val errMsg = "هذا الفيديو محفوظ ومشفّر مسبقًا داخل الخزنة"
                     _vaultError.value = errMsg
-                    return@withContext VaultImportOutcome.AlreadyInVault(duplicateLocked, integrityOk)
+                    return@withContext VaultImportOutcome.AlreadyInVault(
+                        existingVideo = duplicateLocked.video,
+                        integrityVerified = duplicateLocked.integrityVerified
+                    )
                 }
 
                 if (!stagingFile.renameTo(destFile)) {
@@ -591,18 +633,18 @@ class VaultRepositoryImpl internal constructor(
                 return@withContext false
             }
             val internalFile = File(decoded.relativeEncryptedPath).name
-            val existingSourceFingerprint = existing.encryptedMetaBase64
+            val existingJson = existing.encryptedMetaBase64
                 ?.takeIf { it.isNotBlank() }
-                ?.let { enc ->
-                    runCatching { JSONObject(cryptoManager.decryptMetadata(enc)).optString("src") }.getOrNull()
-                }
-                .orEmpty()
+                ?.let { enc -> runCatching { JSONObject(cryptoManager.decryptMetadata(enc)) }.getOrNull() }
+            val existingContentSha256 = existingJson?.optString("contentSha256").orEmpty()
+            val existingLegacySrc = existingJson?.optString("src").orEmpty()
             val rows = try {
                 val newEncryptedMeta = encodeMetadata(
                     displayName = cleanTitle,
                     internalFileName = internalFile,
                     mimeType = decoded.mimeType,
-                    sourceFingerprint = existingSourceFingerprint
+                    contentSha256 = existingContentSha256,
+                    legacySourceFingerprint = existingLegacySrc
                 )
                 dbHelper.updateEncryptedMetadata(
                     id = videoId,

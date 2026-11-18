@@ -10,6 +10,7 @@ import com.videohatak.player.core.playlist.model.PlaylistPlaybackState
 import com.videohatak.player.core.playlist.model.PlaylistRepeatMode
 import com.videohatak.player.core.playlist.repository.PlaylistAddOutcome
 import com.videohatak.player.core.playlist.repository.PlaylistRepository
+import com.videohatak.player.core.playlist.repository.ToggleFavoriteResult
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -107,17 +108,17 @@ class PlaylistViewModel(
 
     fun toggleFavoriteWithFeedback(video: VideoItem, onResult: (Boolean, String) -> Unit) {
         viewModelScope.launch {
-            val isNowFavorite = repository.toggleFavorite(video)
+            val outcome = repository.toggleFavoriteDetailed(video)
             refreshFavoritesState()
             _selectedPlaylistWithItems.value?.first?.let { selected ->
                 if (PlaylistRepository.isProtectedFavoritesTitle(selected.title)) {
                     loadPlaylistWithItems(selected.id)
                 }
             }
-            val msg = if (isNowFavorite) {
-                "تمت إضافة الفيديو إلى المفضلة بنجاح"
-            } else {
-                "تمت إزالة الفيديو من المفضلة بنجاح"
+            val (isNowFavorite, msg) = when (outcome) {
+                is ToggleFavoriteResult.Added -> true to "تمت إضافة الفيديو إلى المفضلة بنجاح"
+                is ToggleFavoriteResult.Removed -> false to "تمت إزالة الفيديو من المفضلة بنجاح"
+                is ToggleFavoriteResult.Failed -> outcome.isFavoriteAfterAttempt to outcome.message
             }
             _events.tryEmit(PlaylistUiEvent.ShowMessage(msg))
             onResult(isNowFavorite, msg)

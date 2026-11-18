@@ -38,6 +38,11 @@ import java.io.File
 
 sealed interface VideoFileOperationResult {
     data object Success : VideoFileOperationResult
+    data class PartialSuccess(
+        val succeededCount: Int,
+        val failedCount: Int,
+        val message: String
+    ) : VideoFileOperationResult
     data class RequiresPermission(
         val intentSender: IntentSender,
         val pendingOp: PendingVideoFileOp
@@ -64,7 +69,8 @@ sealed interface PendingVideoFileOp {
         val pendingUris: List<Uri>,
         val encryptedCount: Int,
         val deletedSoFar: Int = 0,
-        val failedCount: Int = 0
+        val failedCount: Int = 0,
+        val encryptedFailedCount: Int = 0
     ) : PendingVideoFileOp
 }
 
@@ -631,60 +637,128 @@ class LocalVideoRepositoryImpl(
         }
 
         if (pendingConsentUris.isEmpty()) {
-            return@withContext if (failedCount > 0 && deletedCount == 0) {
-                VideoFileOperationResult.Error("تعذر إزالة النسخة العامة من المعرض")
-            } else {
-                VideoFileOperationResult.Success
-            }
+            return@withContext formatVaultOriginalsDeleteOutcome(
+                deletedCount = deletedCount,
+                failedCount = failedCount
+            )
         }
-
-        val op = PendingVideoFileOp.DeleteVaultOriginals(
-            pendingUris = pendingConsentUris,
-            encryptedCount = encryptedCount,
-            deletedSoFar = deletedCount,
-            failedCount = failedCount
-        )
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             val mediaUris = pendingConsentUris.filter { isMediaStoreUri(it) }
+            val nonMediaFailures = pendingConsentUris.size - mediaUris.size
             if (mediaUris.isNotEmpty()) {
+                val op = PendingVideoFileOp.DeleteVaultOriginals(
+                    pendingUris = mediaUris,
+                    encryptedCount = encryptedCount,
+                    deletedSoFar = deletedCount,
+                    failedCount = failedCount + nonMediaFailures
+                )
                 return@withContext try {
                     val pi = MediaStore.createDeleteRequest(contentResolver, mediaUris)
                     VideoFileOperationResult.RequiresPermission(pi.intentSender, op)
                 } catch (e: Exception) {
-                    VideoFileOperationResult.Error(e.localizedMessage ?: "تعذر طلب إذن إزالة النسخة العامة بعد النقل للخزنة")
+                    formatVaultOriginalsDeleteOutcome(
+                        deletedCount = deletedCount,
+                        failedCount = failedCount + pendingConsentUris.size,
+                        fallbackErrorMessage = e.localizedMessage
+                            ?: "تعذر طلب إذن إزالة النسخة العامة بعد النقل للخزنة"
+                    )
                 }
             }
         }
 
         if (recoverableIntentSender != null) {
+            val op = PendingVideoFileOp.DeleteVaultOriginals(
+                pendingUris = pendingConsentUris,
+                encryptedCount = encryptedCount,
+                deletedSoFar = deletedCount,
+                failedCount = failedCount
+            )
             return@withContext VideoFileOperationResult.RequiresPermission(recoverableIntentSender, op)
         }
 
-        VideoFileOperationResult.Error("بقيت النسخة العامة في موقعها")
+        formatVaultOriginalsDeleteOutcome(
+            deletedCount = deletedCount,
+            failedCount = failedCount + pendingConsentUris.size,
+            fallbackErrorMessage = "بقيت النسخة العامة في موقعها"
+        )
     }
 
     override suspend fun completeVaultOriginalsDeleteAfterPermission(
         op: PendingVideoFileOp.DeleteVaultOriginals
     ): VideoFileOperationResult = withContext(Dispatchers.IO) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            var remainingNotDeleted = 0
-            for (uri in op.pendingUris) {
-                val stillExists = runCatching {
-                    contentResolver.openAssetFileDescriptor(uri, "r")?.use { true } ?: false
-                }.getOrDefault(false)
-                if (stillExists) {
-                    val deleted = runCatching { contentResolver.delete(uri, null, null) > 0 }.getOrDefault(false)
-                    if (!deleted) remainingNotDeleted++
-                }
+        var postDeleted = 0
+        var postFailed = 0
+
+        for (uri in op.pendingUris.distinct()) {
+            if (!isUriStillPresent(uri)) {
+                postDeleted++
+                continue
             }
-            return@withContext if (remainingNotDeleted > 0) {
-                VideoFileOperationResult.Error("تعذر إزالة بعض النسخ العامة بعد النقل إلى الخزنة ($remainingNotDeleted)")
-            } else {
-                VideoFileOperationResult.Success
+            when (tryDirectDeleteUri(uri)) {
+                is UriDeleteAttempt.Deleted -> postDeleted++
+                is UriDeleteAttempt.NeedsConsent,
+                is UriDeleteAttempt.Failed -> postFailed++
             }
         }
-        deleteVaultOriginals(op.pendingUris, op.encryptedCount)
+
+        formatVaultOriginalsDeleteOutcome(
+            deletedCount = op.deletedSoFar + postDeleted,
+            failedCount = op.failedCount + postFailed
+        )
+    }
+
+    private fun formatVaultOriginalsDeleteOutcome(
+        deletedCount: Int,
+        failedCount: Int,
+        fallbackErrorMessage: String? = null
+    ): VideoFileOperationResult {
+        return when {
+            failedCount <= 0 -> VideoFileOperationResult.Success
+            deletedCount > 0 -> VideoFileOperationResult.PartialSuccess(
+                succeededCount = deletedCount,
+                failedCount = failedCount,
+                message = "تمت إزالة $deletedCount من النسخ العامة، وتعذر إزالة $failedCount"
+            )
+            else -> VideoFileOperationResult.Error(
+                fallbackErrorMessage ?: if (failedCount == 1) {
+                    "تعذر إزالة النسخة العامة من المعرض"
+                } else {
+                    "تعذر إزالة النسخ العامة من المعرض ($failedCount)"
+                }
+            )
+        }
+    }
+
+    private fun isUriStillPresent(uri: Uri): Boolean {
+        if (uri.scheme == ContentResolver.SCHEME_FILE) {
+            val file = uri.path?.let { File(it) }
+            return file != null && file.exists()
+        }
+        try {
+            contentResolver.openAssetFileDescriptor(uri, "r")?.use {
+                return true
+            }
+        } catch (_: java.io.FileNotFoundException) {
+            return false
+        } catch (_: SecurityException) {
+            return true
+        } catch (_: Exception) {
+            return true
+        }
+        return try {
+            contentResolver.query(
+                uri,
+                arrayOf(MediaStore.Video.Media._ID),
+                null,
+                null,
+                null
+            )?.use { cursor -> cursor.count > 0 } ?: false
+        } catch (_: java.io.FileNotFoundException) {
+            false
+        } catch (_: Exception) {
+            true
+        }
     }
 
     private sealed interface UriDeleteAttempt {

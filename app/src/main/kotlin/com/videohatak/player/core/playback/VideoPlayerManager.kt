@@ -2,6 +2,8 @@ package com.videohatak.player.core.playback
 
 import android.content.Context
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
@@ -188,6 +190,7 @@ class VideoPlayerManager internal constructor(
             .build()
 
         return ExoPlayer.Builder(nonNullContext)
+            .setLooper(Looper.getMainLooper())
             .setMediaSourceFactory(mediaSourceFactory)
             .setAudioAttributes(audioAttributes, /* handleAudioFocus = */ true)
             .setHandleAudioBecomingNoisy(true)
@@ -1135,7 +1138,60 @@ class VideoPlayerManager internal constructor(
         stopProgressPolling()
         onPeriodicPositionUpdate = null
         onMediaTransition = null
-        _exoPlayer?.release()
-        _exoPlayer = null
+        val playerToRelease = synchronized(this) {
+            val current = _exoPlayer
+            _exoPlayer = null
+            current
+        } ?: return
+
+        releasePlayerOnApplicationThread(playerToRelease)
+    }
+
+    private fun releasePlayerOnApplicationThread(player: ExoPlayer) {
+        val appLooper = runCatching { player.applicationLooper }.getOrNull()
+        if (appLooper == null || Thread.currentThread() == appLooper.thread) {
+            runCatching { player.removeListener(playerListener) }
+            player.release()
+            return
+        }
+
+        val appThread = appLooper.thread
+        if (!appThread.isAlive) {
+            Log.w(TAG, "Cannot dispatch ExoPlayer.release() to dead thread=${appThread.name}")
+            return
+        }
+
+        val latch = java.util.concurrent.CountDownLatch(1)
+        var releaseFailure: Throwable? = null
+        val posted = Handler(appLooper).post {
+            try {
+                runCatching { player.removeListener(playerListener) }
+                player.release()
+            } catch (t: Throwable) {
+                releaseFailure = t
+            } finally {
+                latch.countDown()
+            }
+        }
+        if (!posted) {
+            throw IllegalStateException(
+                "Failed to post ExoPlayer.release() to applicationLooper thread=${appThread.name}"
+            )
+        }
+
+        val completed = try {
+            latch.await(5L, java.util.concurrent.TimeUnit.SECONDS)
+        } catch (ie: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+        releaseFailure?.let {
+            throw IllegalStateException("ExoPlayer.release() failed on player application thread", it)
+        }
+        if (!completed) {
+            throw IllegalStateException(
+                "Timed out waiting for ExoPlayer.release() on applicationLooper thread=${appThread.name}"
+            )
+        }
     }
 }

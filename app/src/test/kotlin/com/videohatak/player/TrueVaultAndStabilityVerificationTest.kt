@@ -9,6 +9,9 @@ import android.database.sqlite.SQLiteOpenHelper
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.Looper
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
@@ -72,7 +75,13 @@ import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.lang.reflect.InvocationTargetException
+import java.lang.reflect.Proxy
 import java.security.MessageDigest
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 @OptIn(ExperimentalCoroutinesApi::class)
 @RunWith(RobolectricTestRunner::class)
@@ -596,9 +605,37 @@ class TrueVaultAndStabilityVerificationTest {
         )
     }
 
+    private fun <T> runOnLooperSync(looper: Looper, block: () -> T): T {
+        if (Looper.myLooper() == looper) {
+            return block()
+        }
+        val latch = CountDownLatch(1)
+        val resultRef = AtomicReference<T?>()
+        val errorRef = AtomicReference<Throwable?>()
+        val posted = Handler(looper).post {
+            try {
+                resultRef.set(block())
+            } catch (t: Throwable) {
+                errorRef.set(t)
+            } finally {
+                latch.countDown()
+            }
+        }
+        assertTrue("Failed to post operation onto player.applicationLooper", posted)
+        assertTrue("Timed out waiting for operation on player.applicationLooper", latch.await(10L, TimeUnit.SECONDS))
+        errorRef.get()?.let { throw it }
+        @Suppress("UNCHECKED_CAST")
+        return resultRef.get() as T
+    }
+
     @Test
-    fun videoPlayerManager_nextTrackWrapAroundAndAudioOnlyPreserved() = runBlocking {
-        val exoPlayer = ExoPlayer.Builder(testApp()).build()
+    fun videoPlayerManager_nextTrackWrapAroundAndAudioOnlyPreserved() {
+        val playerThread = HandlerThread("exo-next-track-test").apply { start() }
+        val exoPlayer = runOnLooperSync(playerThread.looper) {
+            ExoPlayer.Builder(testApp())
+                .setLooper(playerThread.looper)
+                .build()
+        }
         val manager = VideoPlayerManager(testApp(), customExoPlayer = exoPlayer)
         try {
             val f1 = tempFolder.newFile("track1.mp4").apply { writeBytes(ByteArray(128)) }
@@ -607,41 +644,130 @@ class TrueVaultAndStabilityVerificationTest {
                 MediaItem.Builder().setMediaId("1").setUri(Uri.fromFile(f1)).build(),
                 MediaItem.Builder().setMediaId("2").setUri(Uri.fromFile(f2)).build()
             )
-            exoPlayer.setMediaItems(items, 0, 0L)
-            exoPlayer.prepare()
-            manager.setAudioOnlyMode(true)
-            manager.setPlaybackMode(PlaybackMode.REPEAT_PLAYLIST)
+            runOnLooperSync(exoPlayer.applicationLooper) {
+                exoPlayer.setMediaItems(items, 0, 0L)
+                exoPlayer.prepare()
+                manager.setAudioOnlyMode(true)
+                manager.setPlaybackMode(PlaybackMode.REPEAT_PLAYLIST)
 
-            assertTrue(manager.hasResolvableNextMediaItem())
-            assertTrue(manager.nextTrack(resumePlaybackIfPausedOrEnded = true))
-            assertEquals(1, exoPlayer.currentMediaItemIndex)
-            assertTrue(manager.uiState.value.isAudioOnlyMode)
+                assertTrue(manager.hasResolvableNextMediaItem())
+                assertTrue(manager.nextTrack(resumePlaybackIfPausedOrEnded = true))
+                assertEquals(1, exoPlayer.currentMediaItemIndex)
+                assertTrue(manager.uiState.value.isAudioOnlyMode)
 
-            // Wrap around from last item to index 0 under REPEAT_PLAYLIST
-            assertTrue(manager.hasResolvableNextMediaItem())
-            assertTrue(manager.nextTrack(resumePlaybackIfPausedOrEnded = true))
-            assertEquals(0, exoPlayer.currentMediaItemIndex)
-            assertTrue(manager.uiState.value.isAudioOnlyMode)
+                // Wrap around from last item to index 0 under REPEAT_PLAYLIST
+                assertTrue(manager.hasResolvableNextMediaItem())
+                assertTrue(manager.nextTrack(resumePlaybackIfPausedOrEnded = true))
+                assertEquals(0, exoPlayer.currentMediaItemIndex)
+                assertTrue(manager.uiState.value.isAudioOnlyMode)
+            }
         } finally {
+            try {
+                runOnLooperSync(exoPlayer.applicationLooper) {
+                    manager.release()
+                }
+            } finally {
+                playerThread.quitSafely()
+            }
+        }
+    }
+
+    @Test
+    fun videoPlayerManager_release_alwaysRunsSynchronouslyOnPlayerApplicationLooperThread() {
+        val playerThread = HandlerThread("exo-release-thread-test").apply { start() }
+        val releaseCompleted = AtomicBoolean(false)
+        val releaseThreadRef = AtomicReference<Thread?>(null)
+        val realExoPlayer = runOnLooperSync(playerThread.looper) {
+            ExoPlayer.Builder(testApp())
+                .setLooper(playerThread.looper)
+                .build()
+        }
+        val trackingPlayer = Proxy.newProxyInstance(
+            ExoPlayer::class.java.classLoader,
+            arrayOf(ExoPlayer::class.java)
+        ) { _, method, args ->
+            if (method.name == "release") {
+                releaseThreadRef.set(Thread.currentThread())
+                val res = realExoPlayer.release()
+                releaseCompleted.set(true)
+                res
+            } else {
+                try {
+                    if (args == null) method.invoke(realExoPlayer) else method.invoke(realExoPlayer, *args)
+                } catch (ite: InvocationTargetException) {
+                    throw ite.targetException
+                }
+            }
+        } as ExoPlayer
+
+        val manager = VideoPlayerManager(testApp(), customExoPlayer = trackingPlayer)
+        try {
+            assertFalse(
+                "Caller thread should differ from player.applicationLooper thread to verify dispatch",
+                Thread.currentThread() === playerThread
+            )
+
+            // Invoke release() from a non-player thread; it must dispatch synchronously to playerThread
             manager.release()
+
+            assertTrue("ExoPlayer.release() must complete before VideoPlayerManager.release() returns", releaseCompleted.get())
+            assertTrue(
+                "ExoPlayer.release() must run on player.applicationLooper.thread",
+                releaseThreadRef.get() === playerThread
+            )
+            assertFalse(manager.hasResolvableNextMediaItem())
+        } finally {
+            if (!releaseCompleted.get()) {
+                runCatching { runOnLooperSync(playerThread.looper) { realExoPlayer.release() } }
+            }
+            playerThread.quitSafely()
         }
     }
 
     @Test
     fun artworkLoader_decodeSampledBitmap_safelyBoundsLargeArtworkAndRejectsCorruptBytes() {
         val large = Bitmap.createBitmap(1024, 1024, Bitmap.Config.ARGB_8888)
-        val baos = ByteArrayOutputStream()
-        large.compress(Bitmap.CompressFormat.PNG, 90, baos)
-        val pngBytes = baos.toByteArray()
+        val pngBaos = ByteArrayOutputStream()
+        large.compress(Bitmap.CompressFormat.PNG, 90, pngBaos)
+        val largePngBytes = pngBaos.toByteArray()
 
-        val sampled = MediaNotificationArtworkLoader.decodeSampledBitmap(pngBytes, maxSizePx = 256)
+        val sampled = MediaNotificationArtworkLoader.decodeSampledBitmap(largePngBytes, maxSizePx = 256)
         assertNotNull(sampled)
-        assertTrue(sampled!!.width <= 512 && sampled.height <= 512)
+        assertTrue(sampled!!.width <= 256 && sampled.height <= 256)
         assertEquals(Bitmap.Config.RGB_565, sampled.config)
+
+        val small = Bitmap.createBitmap(64, 64, Bitmap.Config.ARGB_8888)
+        val smallPngBaos = ByteArrayOutputStream()
+        small.compress(Bitmap.CompressFormat.PNG, 100, smallPngBaos)
+        val smallSampled = MediaNotificationArtworkLoader.decodeSampledBitmap(smallPngBaos.toByteArray(), maxSizePx = 256)
+        assertNotNull(smallSampled)
+        assertEquals(64, smallSampled!!.width)
+        assertEquals(64, smallSampled.height)
+        assertEquals(Bitmap.Config.RGB_565, smallSampled.config)
+
+        val jpegBaos = ByteArrayOutputStream()
+        small.compress(Bitmap.CompressFormat.JPEG, 90, jpegBaos)
+        val jpegSampled = MediaNotificationArtworkLoader.decodeSampledBitmap(jpegBaos.toByteArray(), maxSizePx = 256)
+        assertNotNull(jpegSampled)
+        assertEquals(Bitmap.Config.RGB_565, jpegSampled!!.config)
 
         assertNull(MediaNotificationArtworkLoader.decodeSampledBitmap(ByteArray(0)))
         assertNull(MediaNotificationArtworkLoader.decodeSampledBitmap(byteArrayOf(1, 2, 3, 4)))
-        assertNull(BitmapFactory.decodeByteArray(byteArrayOf(1, 2, 3), 0, 3))
+        assertNull(
+            MediaNotificationArtworkLoader.decodeSampledBitmap(
+                "NOT_AN_IMAGE_PAYLOAD_FOR_ARTWORK_LOADER_CHECK".repeat(3).toByteArray()
+            )
+        )
+
+        // Truncated PNG (keeps valid 8-byte PNG signature & IHDR header, cuts off IDAT/IEND)
+        val truncatedPng = largePngBytes.copyOf(minOf(largePngBytes.size - 16, 48))
+        assertNull(MediaNotificationArtworkLoader.decodeSampledBitmap(truncatedPng))
+
+        // Corrupted PNG (keeps PNG signature & header intact, corrupts payload/CRC inside IDAT)
+        val corruptedPng = largePngBytes.copyOf()
+        val corruptIdx = (corruptedPng.size / 2).coerceIn(33, corruptedPng.size - 13)
+        corruptedPng[corruptIdx] = (corruptedPng[corruptIdx].toInt() xor 0xFF).toByte()
+        assertNull(MediaNotificationArtworkLoader.decodeSampledBitmap(corruptedPng))
     }
 
     // -------------------------------------------------------------------------

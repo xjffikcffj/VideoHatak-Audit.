@@ -43,7 +43,7 @@ class VaultViewModel(
 ) : ViewModel() {
 
     val vaultVideos: StateFlow<List<VaultVideo>> = repository.vaultVideos
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     val videos: StateFlow<List<VaultVideo>> = vaultVideos
 
@@ -53,11 +53,11 @@ class VaultViewModel(
     val isUnlocked: StateFlow<Boolean> = _isUnlocked.asStateFlow()
 
     val hasPinConfigured: StateFlow<Boolean> = securityPreferences?.hasPin
-        ?.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
+        ?.stateIn(viewModelScope, SharingStarted.Eagerly, false)
         ?: MutableStateFlow(false)
 
     val autoLockTimeout: StateFlow<VaultAutoLockTimeout> = securityPreferences?.autoLockTimeout
-        ?.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), VaultAutoLockTimeout.IMMEDIATE)
+        ?.stateIn(viewModelScope, SharingStarted.Eagerly, VaultAutoLockTimeout.IMMEDIATE)
         ?: MutableStateFlow(VaultAutoLockTimeout.IMMEDIATE)
 
     private val _actionError = MutableStateFlow<String?>(null)

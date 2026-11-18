@@ -29,6 +29,7 @@ import com.videohatak.player.core.vault.security.VaultPinHasher
 import com.videohatak.player.core.vault.security.VaultSecurityPreferences
 import com.videohatak.player.feature.library.DataStoreLibraryScrollStore
 import com.videohatak.player.feature.library.LibraryScrollPosition
+import com.videohatak.player.feature.library.LibraryScrollStore
 import com.videohatak.player.feature.library.LibraryTab
 import com.videohatak.player.feature.library.LibraryUiEvent
 import com.videohatak.player.feature.library.LibraryViewModel
@@ -37,15 +38,18 @@ import com.videohatak.player.feature.playlist.PlaylistViewModel
 import com.videohatak.player.feature.vault.VaultUiEvent
 import com.videohatak.player.feature.vault.VaultViewModel
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -71,6 +75,7 @@ import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 import java.io.ByteArrayInputStream
 import java.io.File
+import java.io.IOException
 
 @OptIn(ExperimentalCoroutinesApi::class)
 @RunWith(RobolectricTestRunner::class)
@@ -89,7 +94,7 @@ class UserFixesVerificationTest {
     private fun testApp(): Application = RuntimeEnvironment.getApplication()
 
     private fun createDataStore(name: String): DataStore<Preferences> {
-        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val scope = CoroutineScope(SupervisorJob() + testDispatcher)
         createdScopes.add(scope)
         val file = File(tempFolder.newFolder(), "$name.preferences_pb")
         return PreferenceDataStoreFactory.create(scope = scope) { file }
@@ -155,6 +160,37 @@ class UserFixesVerificationTest {
         assertTrue(vm2.isVideosScrollLoaded.value)
         assertEquals(LibraryScrollPosition(14, 280), vm2.videosScrollPosition.value)
         assertEquals(LibraryScrollPosition(4, 280), LibraryScrollPosition(14, 280).clampForItemCount(5))
+    }
+
+    @Test
+    fun libraryViewModel_saveScrollBeforeInitCompletes_preservesLatestPositionAcrossRapidWrites() = runTest(testDispatcher) {
+        val savedLog = mutableListOf<LibraryScrollPosition>()
+        val delayedStore = object : LibraryScrollStore {
+            override val videosScrollPosition: Flow<LibraryScrollPosition> = flow {
+                delay(200L)
+                emit(LibraryScrollPosition(0, 0))
+            }
+
+            override suspend fun saveVideosScrollPosition(position: LibraryScrollPosition) {
+                delay(50L)
+                savedLog.add(position)
+            }
+        }
+
+        val vm = LibraryViewModel(FakeVideoRepository(), trashRepository = null, scrollStore = delayedStore)
+        // Save before delayed init read completes; late (0, 0) from init must NOT overwrite (12, 340)
+        vm.saveVideosScrollPosition(index = 12, offset = 340)
+        advanceUntilIdle()
+        assertTrue(vm.isVideosScrollLoaded.value)
+        assertEquals(LibraryScrollPosition(12, 340), vm.videosScrollPosition.value)
+
+        // Rapid sequential writes must end up persisting the latest scroll position
+        vm.saveVideosScrollPosition(15, 100)
+        vm.saveVideosScrollPosition(18, 220)
+        vm.saveVideosScrollPosition(22, 410)
+        advanceUntilIdle()
+        assertEquals(LibraryScrollPosition(22, 410), vm.videosScrollPosition.value)
+        assertEquals(LibraryScrollPosition(22, 410), savedLog.last())
     }
 
     @Test
@@ -224,12 +260,12 @@ class UserFixesVerificationTest {
     fun playlistViewModel_emitsAccuratePostCompletionNotifications() = runTest(testDispatcher) {
         val dbHelper = VideoHatakDatabaseHelper(testApp())
         dbHelper.replaceAllPlaylistsAndItems(emptyList())
-        val repo = PlaylistRepositoryImpl(testApp(), dbHelper)
+        val repo = PlaylistRepositoryImpl(testApp(), dbHelper, ioDispatcher = testDispatcher)
         val vm = PlaylistViewModel(repo)
         advanceUntilIdle()
 
         val emittedMessages = mutableListOf<String>()
-        val collectJob = launch {
+        val collectJob = launch(start = CoroutineStart.UNDISPATCHED) {
             vm.events.collect { event ->
                 if (event is PlaylistUiEvent.ShowMessage) {
                     emittedMessages.add(event.message)
@@ -333,7 +369,7 @@ class UserFixesVerificationTest {
             nowMsProvider = { 8000L }
         )
         val vaultMessages = mutableListOf<String>()
-        val collectJob = launch {
+        val collectJob = launch(start = CoroutineStart.UNDISPATCHED) {
             vm.events.collect { if (it is VaultUiEvent.ShowMessage) vaultMessages.add(it.message) }
         }
 
@@ -349,6 +385,79 @@ class UserFixesVerificationTest {
         vm.deleteVideo(1L)
         advanceUntilIdle()
         assertEquals("تمت إزالة الفيديو من الخزنة بنجاح", vaultMessages.last())
+
+        collectJob.cancel()
+    }
+
+    @Test
+    fun vaultChangePin_whenStorageWriteFails_preservesOldPinAndKeepsEncryptedFilesReadable() = runTest(testDispatcher) {
+        val backingStore = createDataStore("vault_storage_fail")
+        var failWrite = false
+        val failingWriteDataStore = object : DataStore<Preferences> {
+            override val data: Flow<Preferences> = backingStore.data
+            override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                if (failWrite) {
+                    throw IOException("Simulated DataStore write failure")
+                }
+                return backingStore.updateData(transform)
+            }
+        }
+
+        val prefs = VaultSecurityPreferences(failingWriteDataStore)
+        val crypto = VaultCryptoManager(keyStoreProvider = "TEST_PROVIDER")
+        val payload = "VAULT_VIDEO_MUST_REMAIN_READABLE_AFTER_FAIL".toByteArray()
+        val encFile = tempFolder.newFile("vault_storage_fail_check.enc")
+        val encRes = crypto.encryptStream(ByteArrayInputStream(payload), encFile, payload.size.toLong())
+
+        assertTrue(prefs.setPin("OldPin#2026"))
+        failWrite = true
+
+        val changeResult = prefs.changePin("OldPin#2026", "NewPin#2026", nowMs = 2000L)
+        assertEquals(PinChangeResult.StorageFailure, changeResult)
+
+        val vm = VaultViewModel(
+            repository = FakeVaultRepository(),
+            biometricHelper = VaultBiometricHelper(testApp()),
+            securityPreferences = prefs,
+            nowMsProvider = { 3000L }
+        )
+        val vaultMessages = mutableListOf<String>()
+        val collectJob = launch(start = CoroutineStart.UNDISPATCHED) {
+            vm.events.collect { if (it is VaultUiEvent.ShowMessage) vaultMessages.add(it.message) }
+        }
+
+        var changeOk = true
+        var changeMsg = ""
+        vm.changeVaultPin("OldPin#2026", "NewPin#2026") { ok, msg ->
+            changeOk = ok
+            changeMsg = msg
+        }
+        advanceUntilIdle()
+
+        assertFalse(changeOk)
+        assertTrue(changeMsg.contains("تعذر"))
+        assertTrue("No success event may be emitted when PIN storage write fails", vaultMessages.isEmpty())
+
+        // Old PIN must still unlock and new PIN must be rejected
+        assertEquals(PinVerifyResult.Success, prefs.verifyPinWithRateLimit("OldPin#2026", nowMs = 4000L))
+        assertTrue(prefs.verifyPinWithRateLimit("NewPin#2026", nowMs = 5000L) is PinVerifyResult.InvalidPin)
+
+        // Encrypted vault payload remains intact & readable
+        val outBuf = ByteArray(payload.size)
+        val readCount = crypto.readDecryptedRange(
+            encryptedFile = encFile,
+            fileSalt = encRes.fileSalt,
+            wrappedDek = encRes.encryptedDek,
+            chunkSize = encRes.chunkSize,
+            plaintextSize = encRes.plaintextSizeBytes,
+            headerSize = encRes.headerSize,
+            requestedOffset = 0L,
+            outBuffer = outBuf,
+            outBufferOffset = 0,
+            requestedLength = payload.size
+        )
+        assertEquals(payload.size, readCount)
+        assertArrayEquals(payload, outBuf)
 
         collectJob.cancel()
     }
@@ -391,7 +500,7 @@ class UserFixesVerificationTest {
     fun libraryViewModel_moveToVaultNotifications_neverImplyLossOrOrdinaryDeletion() = runTest(testDispatcher) {
         val vm = LibraryViewModel(FakeVideoRepository())
         val messages = mutableListOf<String>()
-        val collectJob = launch {
+        val collectJob = launch(start = CoroutineStart.UNDISPATCHED) {
             vm.events.collect { if (it is LibraryUiEvent.ShowMessage) messages.add(it.message) }
         }
 

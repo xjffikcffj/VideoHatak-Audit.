@@ -25,6 +25,7 @@ import com.videohatak.player.core.model.VideoSortField
 import com.videohatak.player.core.model.VideoSortOrder
 import com.videohatak.player.core.permission.PermissionHelper
 import com.videohatak.player.core.playlist.db.VideoHatakDatabaseHelper
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.awaitClose
@@ -142,7 +143,8 @@ interface VideoRepository {
 
 class LocalVideoRepositoryImpl(
     private val context: Context,
-    private val contentResolver: ContentResolver = context.contentResolver
+    private val contentResolver: ContentResolver = context.contentResolver,
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
 ) : VideoRepository {
 
     private val playlistDb by lazy { VideoHatakDatabaseHelper(context) }
@@ -159,7 +161,7 @@ class LocalVideoRepositoryImpl(
             }
         }
 
-        val collectorJob = launch(Dispatchers.IO) {
+        val collectorJob = launch(ioDispatcher) {
             for (ignored in refreshChannel) {
                 delay(250L)
                 while (refreshChannel.tryReceive().isSuccess) {
@@ -181,9 +183,9 @@ class LocalVideoRepositoryImpl(
             refreshChannel.close()
             handlerThread.quitSafely()
         }
-    }.flowOn(Dispatchers.IO)
+    }.flowOn(ioDispatcher)
 
-    override suspend fun getVideos(): List<VideoItem> = withContext(Dispatchers.IO) {
+    override suspend fun getVideos(): List<VideoItem> = withContext(ioDispatcher) {
         queryVideosInternal()
     }
 
@@ -303,7 +305,7 @@ class LocalVideoRepositoryImpl(
     }
 
     override suspend fun renameVideo(video: VideoItem, newName: String): VideoFileOperationResult =
-        withContext(Dispatchers.IO) {
+        withContext(ioDispatcher) {
             val cleaned = newName.trim().replace('/', '_').replace('\\', '_')
             if (cleaned.isBlank()) {
                 return@withContext VideoFileOperationResult.Error("الاسم الجديد غير صالح")
@@ -377,7 +379,7 @@ class LocalVideoRepositoryImpl(
         video: VideoItem,
         targetRelativePath: String,
         targetFolderName: String
-    ): VideoFileOperationResult = withContext(Dispatchers.IO) {
+    ): VideoFileOperationResult = withContext(ioDispatcher) {
         val normalizedRelPath = buildNormalizedRelativePath(targetRelativePath, targetFolderName)
 
         try {
@@ -463,7 +465,7 @@ class LocalVideoRepositoryImpl(
         }
     }
 
-    override suspend fun checkMediaExistence(video: VideoItem): MediaExistenceResult = withContext(Dispatchers.IO) {
+    override suspend fun checkMediaExistence(video: VideoItem): MediaExistenceResult = withContext(ioDispatcher) {
         if (!PermissionHelper.hasAnyAccess(PermissionHelper.checkPermissionStatus(context))) {
             return@withContext MediaExistenceResult.Unverifiable("لا توجد صلاحية وصول للوسائط للتحقق من وجود الملف")
         }
@@ -505,7 +507,7 @@ class LocalVideoRepositoryImpl(
     override suspend fun deleteVideoPermanently(
         video: VideoItem,
         trashItemId: Long?
-    ): VideoFileOperationResult = withContext(Dispatchers.IO) {
+    ): VideoFileOperationResult = withContext(ioDispatcher) {
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 val deleted = try {
@@ -571,7 +573,7 @@ class LocalVideoRepositoryImpl(
     override suspend fun completePermanentDeleteAfterPermission(
         video: VideoItem,
         trashItemId: Long?
-    ): VideoFileOperationResult = withContext(Dispatchers.IO) {
+    ): VideoFileOperationResult = withContext(ioDispatcher) {
         when (val currentExistence = checkMediaExistence(video)) {
             MediaExistenceResult.Missing -> return@withContext VideoFileOperationResult.Success
             is MediaExistenceResult.Unverifiable -> return@withContext VideoFileOperationResult.Error(currentExistence.reason)
@@ -600,7 +602,7 @@ class LocalVideoRepositoryImpl(
     override suspend fun deleteVaultOriginals(
         uris: List<Uri>,
         encryptedCount: Int
-    ): VideoFileOperationResult = withContext(Dispatchers.IO) {
+    ): VideoFileOperationResult = withContext(ioDispatcher) {
         val targetUris = uris.filterNot { it.scheme.equals("vault", ignoreCase = true) }.distinct()
         if (targetUris.isEmpty()) return@withContext VideoFileOperationResult.Success
 
@@ -686,7 +688,7 @@ class LocalVideoRepositoryImpl(
 
     override suspend fun completeVaultOriginalsDeleteAfterPermission(
         op: PendingVideoFileOp.DeleteVaultOriginals
-    ): VideoFileOperationResult = withContext(Dispatchers.IO) {
+    ): VideoFileOperationResult = withContext(ioDispatcher) {
         var postDeleted = 0
         var postFailed = 0
 

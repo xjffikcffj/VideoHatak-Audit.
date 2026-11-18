@@ -9,6 +9,7 @@ import com.videohatak.player.core.playlist.db.PlaylistDatabaseStore
 import com.videohatak.player.core.playlist.db.VideoHatakDatabaseHelper
 import com.videohatak.player.core.playlist.model.Playlist
 import com.videohatak.player.core.playlist.model.PlaylistItem
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -21,7 +22,8 @@ import kotlin.math.abs
 class PlaylistRepositoryImpl(
     private val context: Context,
     private val dbHelper: PlaylistDatabaseStore = VideoHatakDatabaseHelper(context),
-    private val videoRepository: VideoRepository = LocalVideoRepositoryImpl(context)
+    private val videoRepository: VideoRepository = LocalVideoRepositoryImpl(context),
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
 ) : PlaylistRepository {
 
     private val _playlists = MutableStateFlow<List<Playlist>>(emptyList())
@@ -39,52 +41,77 @@ class PlaylistRepositoryImpl(
         return null
     }
 
-    override suspend fun refresh() = withContext(Dispatchers.IO) {
-        findAndMigrateFavoritesLocked()
-        val list = dbHelper.getPlaylists()
-        val sorted = list.sortedByDescending { PlaylistRepository.isProtectedFavoritesTitle(it.title) }
-        _playlists.update { sorted }
+    override suspend fun refresh() = withContext(ioDispatcher) {
+        runCatching {
+            findAndMigrateFavoritesLocked()
+            val list = dbHelper.getPlaylists()
+            val sorted = list.sortedByDescending { PlaylistRepository.isProtectedFavoritesTitle(it.title) }
+            _playlists.update { sorted }
+        }
+        Unit
     }
 
-    override suspend fun createPlaylist(title: String): Long = withContext(Dispatchers.IO) {
+    override suspend fun createPlaylist(title: String): Long = withContext(ioDispatcher) {
         val cleanTitle = title.trim().ifBlank { "قائمة جديدة" }
-        if (PlaylistRepository.isProtectedFavoritesTitle(cleanTitle)) {
-            val existingFav = findAndMigrateFavoritesLocked()
-            if (existingFav != null) {
-                refresh()
-                return@withContext existingFav.id
+        try {
+            if (PlaylistRepository.isProtectedFavoritesTitle(cleanTitle)) {
+                val existingFav = findAndMigrateFavoritesLocked()
+                if (existingFav != null) {
+                    refresh()
+                    return@withContext existingFav.id
+                }
             }
+            val id = dbHelper.insertPlaylist(cleanTitle)
+            if (id > 0L) {
+                refresh()
+            }
+            id
+        } catch (_: Exception) {
+            -1L
         }
-        val id = dbHelper.insertPlaylist(cleanTitle)
-        refresh()
-        id
     }
 
-    override suspend fun renamePlaylist(id: Long, newTitle: String): Boolean = withContext(Dispatchers.IO) {
-        val current = dbHelper.getPlaylists().firstOrNull { it.id == id } ?: return@withContext false
-        if (PlaylistRepository.isProtectedFavoritesTitle(current.title)) {
-            return@withContext false
+    override suspend fun renamePlaylist(id: Long, newTitle: String): Boolean = withContext(ioDispatcher) {
+        try {
+            val current = dbHelper.getPlaylists().firstOrNull { it.id == id } ?: return@withContext false
+            if (PlaylistRepository.isProtectedFavoritesTitle(current.title)) {
+                return@withContext false
+            }
+            val cleanTitle = newTitle.trim()
+            if (cleanTitle.isBlank() || PlaylistRepository.isProtectedFavoritesTitle(cleanTitle)) {
+                return@withContext false
+            }
+            val rows = dbHelper.updatePlaylist(id, cleanTitle)
+            if (rows > 0) {
+                refresh()
+                true
+            } else {
+                false
+            }
+        } catch (_: Exception) {
+            false
         }
-        val cleanTitle = newTitle.trim()
-        if (cleanTitle.isBlank() || PlaylistRepository.isProtectedFavoritesTitle(cleanTitle)) {
-            return@withContext false
-        }
-        val rows = dbHelper.updatePlaylist(id, cleanTitle)
-        refresh()
-        rows > 0
     }
 
-    override suspend fun deletePlaylist(id: Long): Boolean = withContext(Dispatchers.IO) {
-        val current = dbHelper.getPlaylists().firstOrNull { it.id == id } ?: return@withContext false
-        if (PlaylistRepository.isProtectedFavoritesTitle(current.title)) {
-            return@withContext false
+    override suspend fun deletePlaylist(id: Long): Boolean = withContext(ioDispatcher) {
+        try {
+            val current = dbHelper.getPlaylists().firstOrNull { it.id == id } ?: return@withContext false
+            if (PlaylistRepository.isProtectedFavoritesTitle(current.title)) {
+                return@withContext false
+            }
+            val rows = dbHelper.deletePlaylist(id)
+            if (rows > 0) {
+                refresh()
+                true
+            } else {
+                false
+            }
+        } catch (_: Exception) {
+            false
         }
-        val rows = dbHelper.deletePlaylist(id)
-        refresh()
-        rows > 0
     }
 
-    override suspend fun getPlaylistItems(playlistId: Long): List<PlaylistItem> = withContext(Dispatchers.IO) {
+    override suspend fun getPlaylistItems(playlistId: Long): List<PlaylistItem> = withContext(ioDispatcher) {
         val rawItems = dbHelper.getItemsForPlaylist(playlistId)
         rawItems.map { item ->
             val exists = isMediaAvailable(Uri.parse(item.contentUri))
@@ -95,7 +122,7 @@ class PlaylistRepositoryImpl(
         }
     }
 
-    override suspend fun getPlaylistWithItems(playlistId: Long): Pair<Playlist, List<PlaylistItem>>? = withContext(Dispatchers.IO) {
+    override suspend fun getPlaylistWithItems(playlistId: Long): Pair<Playlist, List<PlaylistItem>>? = withContext(ioDispatcher) {
         val playlist = dbHelper.getPlaylists().find { it.id == playlistId } ?: return@withContext null
         val items = getPlaylistItems(playlistId)
         Pair(playlist, items)
@@ -121,7 +148,7 @@ class PlaylistRepositoryImpl(
         return false
     }
 
-    override suspend fun ensureFavoritesPlaylist(): Playlist? = withContext(Dispatchers.IO) {
+    override suspend fun ensureFavoritesPlaylist(): Playlist? = withContext(ioDispatcher) {
         val existing = findAndMigrateFavoritesLocked()
         if (existing != null) {
             refresh()
@@ -141,19 +168,29 @@ class PlaylistRepositoryImpl(
     }
 
     override suspend fun removeVideoFromPlaylistDetailed(itemId: Long, playlistId: Long): Boolean =
-        withContext(Dispatchers.IO) {
-            val deletedRows = dbHelper.deleteItem(itemId, playlistId)
-            val remaining = dbHelper.getItemsForPlaylist(playlistId)
-            remaining.forEachIndexed { index, item ->
-                if (item.orderIndex != index) {
-                    dbHelper.updateItemOrder(item.id, index)
-                }
+        withContext(ioDispatcher) {
+            val deletedRows = try {
+                dbHelper.deleteItem(itemId, playlistId)
+            } catch (_: Exception) {
+                0
             }
-            refresh()
-            deletedRows > 0
+            val remaining = runCatching { dbHelper.getItemsForPlaylist(playlistId) }.getOrNull()
+            val stillPresent = remaining?.any { it.id == itemId } == true
+            if (deletedRows > 0 && !stillPresent) {
+                remaining?.forEachIndexed { index, item ->
+                    if (item.orderIndex != index) {
+                        runCatching { dbHelper.updateItemOrder(item.id, index) }
+                    }
+                }
+                refresh()
+                true
+            } else {
+                refresh()
+                false
+            }
         }
 
-    override suspend fun moveItem(playlistId: Long, fromIndex: Int, toIndex: Int) = withContext(Dispatchers.IO) {
+    override suspend fun moveItem(playlistId: Long, fromIndex: Int, toIndex: Int) = withContext(ioDispatcher) {
         val items = dbHelper.getItemsForPlaylist(playlistId).toMutableList()
         if (fromIndex in items.indices && toIndex in items.indices && fromIndex != toIndex) {
             val item = items.removeAt(fromIndex)
@@ -169,7 +206,7 @@ class PlaylistRepositoryImpl(
      * AUD-06 & AUD-07: Relink missing items using multi-criteria matching.
      * Skips vault:// URIs safely.
      */
-    override suspend fun relinkMissingItems(playlistId: Long): Int = withContext(Dispatchers.IO) {
+    override suspend fun relinkMissingItems(playlistId: Long): Int = withContext(ioDispatcher) {
         val items = dbHelper.getItemsForPlaylist(playlistId)
         val allVideos = videoRepository.getVideos()
         var relinkedCount = 0
@@ -200,7 +237,7 @@ class PlaylistRepositoryImpl(
         relinkedCount
     }
 
-    override suspend fun isFavorite(video: VideoItem): Boolean = withContext(Dispatchers.IO) {
+    override suspend fun isFavorite(video: VideoItem): Boolean = withContext(ioDispatcher) {
         val favoritesPlaylist = findAndMigrateFavoritesLocked() ?: return@withContext false
         val items = dbHelper.getItemsForPlaylist(favoritesPlaylist.id)
         val uriString = normalizeVideoUriKey(video.contentUri.toString())
@@ -214,7 +251,7 @@ class PlaylistRepositoryImpl(
             is ToggleFavoriteResult.Failed -> result.isFavoriteAfterAttempt
         }
 
-    override suspend fun toggleFavoriteDetailed(video: VideoItem): ToggleFavoriteResult = withContext(Dispatchers.IO) {
+    override suspend fun toggleFavoriteDetailed(video: VideoItem): ToggleFavoriteResult = withContext(ioDispatcher) {
         val uriString = normalizeVideoUriKey(video.contentUri.toString())
         if (video.id <= 0L && uriString.isEmpty()) {
             return@withContext ToggleFavoriteResult.Failed(
@@ -371,7 +408,7 @@ class PlaylistRepositoryImpl(
         }
     }
 
-    override suspend fun getFavoriteVideoKeys(): Pair<Set<Long>, Set<String>> = withContext(Dispatchers.IO) {
+    override suspend fun getFavoriteVideoKeys(): Pair<Set<Long>, Set<String>> = withContext(ioDispatcher) {
         val favoritesPlaylist = findAndMigrateFavoritesLocked() ?: return@withContext (emptySet<Long>() to emptySet())
         val items = dbHelper.getItemsForPlaylist(favoritesPlaylist.id)
         val ids = items.mapNotNull { it.videoId.takeIf { id -> id > 0L } }.toSet()
@@ -379,7 +416,7 @@ class PlaylistRepositoryImpl(
         ids to uris
     }
 
-    override suspend fun getFavoritesPlaylistWithItems(): Pair<Playlist, List<PlaylistItem>>? = withContext(Dispatchers.IO) {
+    override suspend fun getFavoritesPlaylistWithItems(): Pair<Playlist, List<PlaylistItem>>? = withContext(ioDispatcher) {
         val favoritesPlaylist = findAndMigrateFavoritesLocked() ?: return@withContext null
         val items = getPlaylistItems(favoritesPlaylist.id)
         favoritesPlaylist.copy(itemCount = items.size) to items
@@ -391,7 +428,7 @@ class PlaylistRepositoryImpl(
     override suspend fun addVideosToPlaylistsDetailed(
         videos: List<VideoItem>,
         playlistIds: List<Long>
-    ): PlaylistAddOutcome = withContext(Dispatchers.IO) {
+    ): PlaylistAddOutcome = withContext(ioDispatcher) {
         val distinctIds = playlistIds.distinct()
         if (videos.isEmpty() || distinctIds.isEmpty()) {
             return@withContext PlaylistAddOutcome(
@@ -399,7 +436,14 @@ class PlaylistRepositoryImpl(
                 failedCount = if (distinctIds.isEmpty()) videos.size else 0
             )
         }
-        val availablePlaylists = dbHelper.getPlaylists().associateBy { it.id }
+        val availablePlaylists = try {
+            dbHelper.getPlaylists().associateBy { it.id }
+        } catch (_: Exception) {
+            return@withContext PlaylistAddOutcome(
+                targetPlaylistCount = distinctIds.size,
+                failedCount = videos.size * distinctIds.size
+            )
+        }
         var addedCount = 0
         var duplicateCount = 0
         var failedCount = 0
@@ -412,7 +456,12 @@ class PlaylistRepositoryImpl(
                 continue
             }
             targetTitles.add(playlist.title)
-            val existing = dbHelper.getItemsForPlaylist(pId)
+            val existing = try {
+                dbHelper.getItemsForPlaylist(pId)
+            } catch (_: Exception) {
+                failedCount += videos.size
+                continue
+            }
             var nextOrder = (existing.maxOfOrNull { it.orderIndex } ?: -1) + 1
             val currentItems = existing.toMutableList()
 
@@ -445,7 +494,11 @@ class PlaylistRepositoryImpl(
                         contentUri = uriString,
                         isAvailable = true
                     )
-                    val inserted = dbHelper.insertItem(newItem)
+                    val inserted = try {
+                        dbHelper.insertItem(newItem)
+                    } catch (_: Exception) {
+                        -1L
+                    }
                     if (inserted > 0L) {
                         addedCount++
                         nextOrder++
@@ -466,18 +519,23 @@ class PlaylistRepositoryImpl(
         )
     }
 
-    override suspend fun removeVideosFromPlaylist(itemIds: List<Long>, playlistId: Long): Int = withContext(Dispatchers.IO) {
+    override suspend fun removeVideosFromPlaylist(itemIds: List<Long>, playlistId: Long): Int = withContext(ioDispatcher) {
         if (itemIds.isEmpty()) return@withContext 0
         var removedCount = 0
         for (itemId in itemIds.distinct()) {
-            if (dbHelper.deleteItem(itemId, playlistId) > 0) {
+            val deleted = try {
+                dbHelper.deleteItem(itemId, playlistId)
+            } catch (_: Exception) {
+                0
+            }
+            if (deleted > 0) {
                 removedCount++
             }
         }
-        val remaining = dbHelper.getItemsForPlaylist(playlistId)
-        remaining.forEachIndexed { index, item ->
+        val remaining = runCatching { dbHelper.getItemsForPlaylist(playlistId) }.getOrNull()
+        remaining?.forEachIndexed { index, item ->
             if (item.orderIndex != index) {
-                dbHelper.updateItemOrder(item.id, index)
+                runCatching { dbHelper.updateItemOrder(item.id, index) }
             }
         }
         refresh()
@@ -488,10 +546,12 @@ class PlaylistRepositoryImpl(
         addVideosToFavoritesDetailed(videos).addedCount
 
     override suspend fun addVideosToFavoritesDetailed(videos: List<VideoItem>): PlaylistAddOutcome =
-        withContext(Dispatchers.IO) {
+        withContext(ioDispatcher) {
             if (videos.isEmpty()) return@withContext PlaylistAddOutcome(targetPlaylistCount = 1)
-            val fav = findAndMigrateFavoritesLocked()
-            val favId = fav?.id ?: dbHelper.insertPlaylist(PlaylistRepository.FAVORITES_PLAYLIST_TITLE)
+            val fav = runCatching { findAndMigrateFavoritesLocked() }.getOrNull()
+            val favId = fav?.id ?: runCatching {
+                dbHelper.insertPlaylist(PlaylistRepository.FAVORITES_PLAYLIST_TITLE)
+            }.getOrDefault(-1L)
             if (favId <= 0L) {
                 return@withContext PlaylistAddOutcome(
                     targetPlaylistCount = 1,
@@ -501,7 +561,7 @@ class PlaylistRepositoryImpl(
             addVideosToPlaylistsDetailed(videos, listOf(favId))
         }
 
-    override suspend fun removeVideosFromFavorites(videos: List<VideoItem>): Int = withContext(Dispatchers.IO) {
+    override suspend fun removeVideosFromFavorites(videos: List<VideoItem>): Int = withContext(ioDispatcher) {
         if (videos.isEmpty()) return@withContext 0
         val fav = findAndMigrateFavoritesLocked() ?: return@withContext 0
         val existing = dbHelper.getItemsForPlaylist(fav.id)
@@ -523,7 +583,7 @@ class PlaylistRepositoryImpl(
         playlistId: Long,
         videoId: Long?,
         contentUri: String?
-    ): Boolean = withContext(Dispatchers.IO) {
+    ): Boolean = withContext(ioDispatcher) {
         val items = dbHelper.getItemsForPlaylist(playlistId)
         val normalizedUri = normalizeVideoUriKey(contentUri)
         val matches = items.filter { item ->

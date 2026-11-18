@@ -646,6 +646,7 @@ fun LibraryScreen(
                                 CircularProgressIndicator(color = palette.accent)
                             }
                         } else if (currentTab == LibraryTab.FOLDERS && selectedFolder == null) {
+                            val latestFolders by rememberUpdatedState(uiState.folders)
                             val clampedFolderPos = remember(uiState.folders.size, foldersScrollPosition) {
                                 foldersScrollPosition.clampForItemCount(uiState.folders.size)
                             }
@@ -661,14 +662,14 @@ fun LibraryScreen(
                                         foldersListState.firstVisibleItemScrollOffset
                                     )
                                 }.collect { (inProgress, idx, off) ->
-                                    if (!inProgress && uiState.folders.isNotEmpty()) {
+                                    if (!inProgress && latestFolders.isNotEmpty()) {
                                         latestSaveFoldersScroll(idx, off)
                                     }
                                 }
                             }
                             DisposableEffect(Unit) {
                                 onDispose {
-                                    if (uiState.folders.isNotEmpty()) {
+                                    if (latestFolders.isNotEmpty()) {
                                         latestSaveFoldersScroll(
                                             foldersListState.firstVisibleItemIndex,
                                             foldersListState.firstVisibleItemScrollOffset
@@ -699,8 +700,13 @@ fun LibraryScreen(
                                     )
                                 }
                             } else if (currentTab == LibraryTab.VIDEOS && selectedFolder == null) {
-                                val initialClamped = remember(isVideosScrollLoaded) {
-                                    if (isVideosScrollLoaded) {
+                                val latestVideos by rememberUpdatedState(videos)
+                                val latestSearchQuery by rememberUpdatedState(searchQuery)
+                                val latestVideosScrollPosition by rememberUpdatedState(videosScrollPosition)
+                                val isSearchBlank = searchQuery.isBlank()
+
+                                val initialClamped = remember(isVideosScrollLoaded, isSearchBlank) {
+                                    if (isVideosScrollLoaded && isSearchBlank) {
                                         videosScrollPosition.clampForItemCount(videos.size)
                                     } else {
                                         LibraryScrollPosition()
@@ -712,9 +718,13 @@ fun LibraryScreen(
                                 )
                                 var hasRestoredVideosScroll by remember { mutableStateOf(false) }
 
-                                LaunchedEffect(isVideosScrollLoaded, videos.size) {
+                                LaunchedEffect(isVideosScrollLoaded, videos.size, isSearchBlank) {
+                                    if (!isSearchBlank) {
+                                        hasRestoredVideosScroll = false
+                                        return@LaunchedEffect
+                                    }
                                     if (!hasRestoredVideosScroll && isVideosScrollLoaded && videos.isNotEmpty()) {
-                                        val target = videosScrollPosition.clampForItemCount(videos.size)
+                                        val target = latestVideosScrollPosition.clampForItemCount(videos.size)
                                         if (!target.isAtOrigin &&
                                             (videosListState.firstVisibleItemIndex != target.firstVisibleItemIndex ||
                                                 videosListState.firstVisibleItemScrollOffset != target.firstVisibleItemScrollOffset)
@@ -728,8 +738,8 @@ fun LibraryScreen(
                                     }
                                 }
 
-                                LaunchedEffect(videosListState, videos.size, hasRestoredVideosScroll) {
-                                    if (!hasRestoredVideosScroll) return@LaunchedEffect
+                                LaunchedEffect(videosListState, hasRestoredVideosScroll, isSearchBlank) {
+                                    if (!hasRestoredVideosScroll || !isSearchBlank) return@LaunchedEffect
                                     snapshotFlow {
                                         Triple(
                                             videosListState.isScrollInProgress,
@@ -737,7 +747,7 @@ fun LibraryScreen(
                                             videosListState.firstVisibleItemScrollOffset
                                         )
                                     }.collect { (inProgress, idx, off) ->
-                                        if (!inProgress && videos.isNotEmpty()) {
+                                        if (!inProgress && latestSearchQuery.isBlank() && latestVideos.isNotEmpty()) {
                                             latestSaveVideosScroll(idx, off)
                                         }
                                     }
@@ -745,7 +755,10 @@ fun LibraryScreen(
 
                                 DisposableEffect(Unit) {
                                     onDispose {
-                                        if (hasRestoredVideosScroll && videos.isNotEmpty()) {
+                                        if (hasRestoredVideosScroll &&
+                                            latestSearchQuery.isBlank() &&
+                                            latestVideos.isNotEmpty()
+                                        ) {
                                             latestSaveVideosScroll(
                                                 videosListState.firstVisibleItemIndex,
                                                 videosListState.firstVisibleItemScrollOffset
@@ -773,10 +786,12 @@ fun LibraryScreen(
                                                         selectedVideoKeys + key
                                                     }
                                                 } else {
-                                                    latestSaveVideosScroll(
-                                                        videosListState.firstVisibleItemIndex,
-                                                        videosListState.firstVisibleItemScrollOffset
-                                                    )
+                                                    if (latestSearchQuery.isBlank()) {
+                                                        latestSaveVideosScroll(
+                                                            videosListState.firstVisibleItemIndex,
+                                                            videosListState.firstVisibleItemScrollOffset
+                                                        )
+                                                    }
                                                     onVideoClick(video, videos)
                                                 }
                                             },

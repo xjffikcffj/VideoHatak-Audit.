@@ -34,6 +34,7 @@ import com.videohatak.player.feature.player.components.SeekBackwardDoubleTriangl
 import com.videohatak.player.feature.player.components.SeekForwardDoubleTriangleIcon
 import com.videohatak.player.feature.playlist.PlaylistUiEvent
 import com.videohatak.player.feature.playlist.PlaylistViewModel
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.launch
@@ -293,7 +294,7 @@ class SupplementaryReviewFixesTest {
         val uri2 = Uri.parse("content://$authority/2")
         val uri3 = Uri.parse("content://$authority/3")
 
-        val videoRepo = LocalVideoRepositoryImpl(testApp())
+        val videoRepo = LocalVideoRepositoryImpl(testApp(), ioDispatcher = testDispatcher)
         val deleteResult = videoRepo.deleteVaultOriginals(listOf(uri1, uri2, uri3), encryptedCount = 3)
 
         assertTrue(
@@ -310,7 +311,7 @@ class SupplementaryReviewFixesTest {
         // Verify LibraryViewModel reports partial counts accurately rather than full success
         val vm = LibraryViewModel(videoRepo)
         val messages = mutableListOf<String>()
-        val collectJob = launch {
+        val collectJob = launch(start = CoroutineStart.UNDISPATCHED) {
             vm.events.collect { if (it is LibraryUiEvent.ShowMessage) messages.add(it.message) }
         }
 
@@ -351,7 +352,7 @@ class SupplementaryReviewFixesTest {
 
         val uri10 = Uri.parse("content://$authority/10")
         val uri11 = Uri.parse("content://$authority/11")
-        val videoRepo = LocalVideoRepositoryImpl(testApp())
+        val videoRepo = LocalVideoRepositoryImpl(testApp(), ioDispatcher = testDispatcher)
 
         // Case 1: Post-permission succeeds on pending uri10, but op.failedCount == 1 from prior batch
         val priorFailureResult = videoRepo.completeVaultOriginalsDeleteAfterPermission(
@@ -423,10 +424,10 @@ class SupplementaryReviewFixesTest {
         assertTrue(importOutcome is VaultImportOutcome.Imported)
         val imported = (importOutcome as VaultImportOutcome.Imported).video
 
-        val videoRepo = LocalVideoRepositoryImpl(testApp())
+        val videoRepo = LocalVideoRepositoryImpl(testApp(), ioDispatcher = testDispatcher)
         val vm = LibraryViewModel(videoRepo)
         val messages = mutableListOf<String>()
-        val collectJob = launch {
+        val collectJob = launch(start = CoroutineStart.UNDISPATCHED) {
             vm.events.collect { if (it is LibraryUiEvent.ShowMessage) messages.add(it.message) }
         }
 
@@ -518,12 +519,12 @@ class SupplementaryReviewFixesTest {
             override fun updateItemUri(itemId: Long, newUri: String) = backingDb.updateItemUri(itemId, newUri)
         }
 
-        val repo = PlaylistRepositoryImpl(testApp(), failingDbStore)
+        val repo = PlaylistRepositoryImpl(testApp(), failingDbStore, ioDispatcher = testDispatcher)
         val vm = PlaylistViewModel(repo)
         advanceUntilIdle()
 
         val emittedMessages = mutableListOf<String>()
-        val collectJob = launch {
+        val collectJob = launch(start = CoroutineStart.UNDISPATCHED) {
             vm.events.collect { if (it is PlaylistUiEvent.ShowMessage) emittedMessages.add(it.message) }
         }
 
@@ -596,6 +597,103 @@ class SupplementaryReviewFixesTest {
         assertEquals(callbackMsgAfterDeleteFail, emittedMessages.last())
         assertEquals(favPlaylistIdBefore, vm.favoritesPlaylistId.value)
         assertEquals(2, repo.getFavoritesPlaylistWithItems()?.second?.size)
+
+        collectJob.cancel()
+        backingDb.close()
+    }
+
+    @Test
+    fun playlistViewModel_writeExceptionsAndZeroRowUpdates_neverEmitSuccessMessagesAndKeepEagerFavoritesId() = runTest(testDispatcher) {
+        val backingDb = VideoHatakDatabaseHelper(testApp())
+        backingDb.replaceAllPlaylistsAndItems(emptyList())
+
+        var throwOnInsertItem = false
+        var failUpdatePlaylist = false
+        var failDeletePlaylist = false
+        var failDeleteItem = false
+        val flakyDbStore = object : PlaylistDatabaseStore {
+            override fun insertPlaylist(title: String): Long = backingDb.insertPlaylist(title)
+            override fun updatePlaylist(id: Long, title: String): Int =
+                if (failUpdatePlaylist) 0 else backingDb.updatePlaylist(id, title)
+            override fun deletePlaylist(id: Long): Int =
+                if (failDeletePlaylist) 0 else backingDb.deletePlaylist(id)
+            override fun getPlaylists(): List<Playlist> = backingDb.getPlaylists()
+            override fun insertItem(item: PlaylistItem): Long {
+                if (throwOnInsertItem) throw IllegalStateException("Simulated SQLite write error")
+                return backingDb.insertItem(item)
+            }
+            override fun deleteItem(itemId: Long, playlistId: Long): Int =
+                if (failDeleteItem) 0 else backingDb.deleteItem(itemId, playlistId)
+            override fun getItemsForPlaylist(playlistId: Long): List<PlaylistItem> =
+                backingDb.getItemsForPlaylist(playlistId)
+            override fun updateItemOrder(itemId: Long, newIndex: Int) = backingDb.updateItemOrder(itemId, newIndex)
+            override fun updateItemAvailability(itemId: Long, isAvailable: Boolean) =
+                backingDb.updateItemAvailability(itemId, isAvailable)
+            override fun updateItemUri(itemId: Long, newUri: String) = backingDb.updateItemUri(itemId, newUri)
+        }
+
+        val repo = PlaylistRepositoryImpl(testApp(), flakyDbStore, ioDispatcher = testDispatcher)
+        val favPlaylist = repo.ensureFavoritesPlaylist()!!
+        val customPlaylistId = repo.createPlaylist("قائمة تجريبية")
+        val vm = PlaylistViewModel(repo)
+        advanceUntilIdle()
+
+        // Must be populated eagerly without an active downstream collector
+        assertEquals(favPlaylist.id, vm.favoritesPlaylistId.value)
+
+        val emittedMessages = mutableListOf<String>()
+        val collectJob = launch(start = CoroutineStart.UNDISPATCHED) {
+            vm.events.collect { if (it is PlaylistUiEvent.ShowMessage) emittedMessages.add(it.message) }
+        }
+
+        val sampleVideo = VideoItem(
+            id = 850L,
+            contentUri = Uri.parse("content://media/external/video/media/850"),
+            title = "اختبار الاستثناءات",
+            displayName = "sample_850.mp4",
+            durationMs = 12_000L,
+            sizeBytes = 1_200_000L,
+            dateAddedSec = 500L
+        )
+
+        // Exception during insertItem must report failure, not crash or claim success
+        throwOnInsertItem = true
+        vm.addVideoToPlaylists(sampleVideo, listOf(customPlaylistId))
+        advanceUntilIdle()
+        assertTrue(emittedMessages.last().contains("تعذر"))
+        assertFalse(emittedMessages.last().contains("بنجاح"))
+
+        vm.toggleFavoriteWithFeedback(sampleVideo) { isNowFav, msg ->
+            assertFalse(isNowFav)
+            assertTrue(msg.contains("تعذر"))
+            assertFalse(msg.contains("بنجاح"))
+        }
+        advanceUntilIdle()
+
+        // Rename / delete / remove failure must emit failure notification (never success)
+        throwOnInsertItem = false
+        vm.addVideoToPlaylists(sampleVideo, listOf(customPlaylistId))
+        advanceUntilIdle()
+        val insertedItemId = repo.getPlaylistItems(customPlaylistId).first().id
+
+        failUpdatePlaylist = true
+        vm.renamePlaylist(customPlaylistId, "اسم جديد")
+        advanceUntilIdle()
+        assertTrue(emittedMessages.last().contains("تعذر"))
+        assertFalse(emittedMessages.last().contains("بنجاح"))
+
+        failDeletePlaylist = true
+        vm.deletePlaylist(customPlaylistId)
+        advanceUntilIdle()
+        assertTrue(emittedMessages.last().contains("تعذر"))
+        assertFalse(emittedMessages.last().contains("بنجاح"))
+
+        failDeleteItem = true
+        vm.removeItemFromPlaylist(insertedItemId, customPlaylistId)
+        advanceUntilIdle()
+        assertTrue(emittedMessages.last().contains("تعذر"))
+        assertFalse(emittedMessages.last().contains("بنجاح"))
+        assertEquals(1, repo.getPlaylistItems(customPlaylistId).size)
 
         collectJob.cancel()
         backingDb.close()

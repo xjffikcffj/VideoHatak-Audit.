@@ -32,14 +32,14 @@ class PlaylistViewModel(
 ) : ViewModel() {
 
     val playlists: StateFlow<List<Playlist>> = repository.playlists
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     private val _selectedPlaylistWithItems = MutableStateFlow<Pair<Playlist, List<PlaylistItem>>?>(null)
     val selectedPlaylistWithItems: StateFlow<Pair<Playlist, List<PlaylistItem>>?> = _selectedPlaylistWithItems.asStateFlow()
 
     val currentPlaylistItems: StateFlow<List<PlaylistItem>> = _selectedPlaylistWithItems
         .map { it?.second ?: emptyList() }
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     private val _playbackState = MutableStateFlow(PlaylistPlaybackState())
     val playbackState: StateFlow<PlaylistPlaybackState> = _playbackState.asStateFlow()
@@ -56,11 +56,11 @@ class PlaylistViewModel(
 
     val favoriteItems: StateFlow<List<PlaylistItem>> = _favoritesPlaylistWithItems
         .map { it?.second ?: emptyList() }
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     val favoritesPlaylistId: StateFlow<Long?> = _favoritesPlaylistWithItems
         .map { it?.first?.id }
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
+        .stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
     private val _events = MutableSharedFlow<PlaylistUiEvent>(extraBufferCapacity = 16)
     val events: SharedFlow<PlaylistUiEvent> = _events.asSharedFlow()
@@ -356,7 +356,10 @@ class PlaylistViewModel(
             if (_selectedPlaylistWithItems.value?.first?.id == playlistId) {
                 loadPlaylistWithItems(playlistId)
             }
+            val failed = (itemIds.size - removed).coerceAtLeast(0)
             val msg = when {
+                removed > 0 && failed > 0 && isFavPlaylist -> "تمت إزالة $removed من المفضلة، وتعذر إزالة $failed"
+                removed > 0 && failed > 0 -> "تمت إزالة $removed من القائمة، وتعذر إزالة $failed"
                 removed == 1 && isFavPlaylist -> "تمت إزالة الفيديو من المفضلة بنجاح"
                 removed > 1 && isFavPlaylist -> "تمت إزالة $removed فيديو من المفضلة بنجاح"
                 removed == 1 -> "تمت إزالة الفيديو من القائمة بنجاح"
@@ -432,6 +435,9 @@ class PlaylistViewModel(
                     else -> "الفيديوهات المحددة موجودة بالفعل في القائمة"
                 }
             }
+            outcome.addedCount > 0 && outcome.duplicateCount > 0 && outcome.failedCount > 0 -> {
+                "تمت إضافة ${outcome.addedCount} فيديو، و${outcome.duplicateCount} موجود بالفعل، وتعذر إضافة ${outcome.failedCount}"
+            }
             outcome.addedCount > 0 && outcome.duplicateCount > 0 -> {
                 if (isSingleFav) {
                     "تمت إضافة ${outcome.addedCount} إلى المفضلة، و${outcome.duplicateCount} موجود بالفعل"
@@ -439,8 +445,22 @@ class PlaylistViewModel(
                     "تمت إضافة ${outcome.addedCount} فيديو، و${outcome.duplicateCount} موجود بالفعل في القائمة"
                 }
             }
+            outcome.addedCount > 0 && outcome.failedCount > 0 -> {
+                if (isSingleFav) {
+                    "تمت إضافة ${outcome.addedCount} إلى المفضلة، وتعذر إضافة ${outcome.failedCount}"
+                } else {
+                    "تمت إضافة ${outcome.addedCount} فيديو، وتعذر إضافة ${outcome.failedCount}"
+                }
+            }
             outcome.addedCount > 0 -> {
                 "تمت إضافة ${outcome.addedCount} فيديو بنجاح"
+            }
+            outcome.duplicateCount > 0 && outcome.failedCount > 0 -> {
+                if (isSingleFav) {
+                    "بعض المقاطع موجودة بالفعل في المفضلة (${outcome.duplicateCount})، وتعذر إضافة ${outcome.failedCount}"
+                } else {
+                    "بعض المقاطع موجودة بالفعل في القائمة (${outcome.duplicateCount})، وتعذر إضافة ${outcome.failedCount}"
+                }
             }
             else -> {
                 if (isSingleFav) "تعذر إضافة الفيديو إلى المفضلة" else "تعذر إضافة الفيديو إلى القائمة"

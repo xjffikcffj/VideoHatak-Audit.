@@ -27,6 +27,8 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 sealed interface LibraryUiEvent {
     data class ShowMessage(val message: String) : LibraryUiEvent
@@ -67,11 +69,18 @@ class LibraryViewModel(
     private val _foldersScrollPosition = MutableStateFlow(LibraryScrollPosition())
     val foldersScrollPosition: StateFlow<LibraryScrollPosition> = _foldersScrollPosition.asStateFlow()
 
+    @Volatile
+    private var hasLocalVideosScrollSave = false
+    private val videosScrollSaveMutex = Mutex()
+
     init {
         if (scrollStore != null) {
             viewModelScope.launch {
                 try {
-                    _videosScrollPosition.value = scrollStore.videosScrollPosition.first()
+                    val persisted = scrollStore.videosScrollPosition.first()
+                    if (!hasLocalVideosScrollSave) {
+                        _videosScrollPosition.value = persisted
+                    }
                 } finally {
                     _isVideosScrollLoaded.value = true
                 }
@@ -168,6 +177,7 @@ class LibraryViewModel(
     }
 
     fun saveVideosScrollPosition(index: Int, offset: Int) {
+        hasLocalVideosScrollSave = true
         val next = LibraryScrollPosition(
             firstVisibleItemIndex = index.coerceAtLeast(0),
             firstVisibleItemScrollOffset = offset.coerceAtLeast(0)
@@ -177,7 +187,9 @@ class LibraryViewModel(
         }
         if (scrollStore != null) {
             viewModelScope.launch {
-                scrollStore.saveVideosScrollPosition(next)
+                videosScrollSaveMutex.withLock {
+                    scrollStore.saveVideosScrollPosition(_videosScrollPosition.value)
+                }
             }
         }
     }

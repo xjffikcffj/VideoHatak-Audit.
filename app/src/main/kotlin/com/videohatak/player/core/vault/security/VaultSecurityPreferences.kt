@@ -9,6 +9,7 @@ import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.videohatak.player.core.vault.crypto.VaultBase64
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
@@ -214,14 +215,20 @@ class VaultSecurityPreferences(
         } catch (_: Exception) {
             return false
         }
-        dataStore.edit { prefs ->
-            prefs[pinHashKey] = record.hashBase64
-            prefs[pinSaltKey] = record.saltBase64
-            prefs[pinAlgoKey] = record.algorithm
-            prefs[failedAttemptsKey] = 0
-            prefs[lockoutUntilKey] = 0L
+        return try {
+            dataStore.edit { prefs ->
+                prefs[pinHashKey] = record.hashBase64
+                prefs[pinSaltKey] = record.saltBase64
+                prefs[pinAlgoKey] = record.algorithm
+                prefs[failedAttemptsKey] = 0
+                prefs[lockoutUntilKey] = 0L
+            }
+            true
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Exception) {
+            false
         }
-        return true
     }
 
     suspend fun getRemainingLockoutMs(nowMs: Long = System.currentTimeMillis()): Long {
@@ -258,7 +265,12 @@ class VaultSecurityPreferences(
         val isMatch = VaultPinHasher.verifyPin(pin, storedHash, storedSalt, storedAlgo)
         if (isMatch) {
             if (currentAttempts > 0 || lockoutUntil > 0L) {
-                resetPinLockout()
+                try {
+                    resetPinLockout()
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Exception) {
+                }
             }
             return PinVerifyResult.Success
         }

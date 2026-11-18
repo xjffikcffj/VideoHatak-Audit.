@@ -10,6 +10,7 @@ import com.videohatak.player.core.vault.crypto.VaultCryptoManager
 import com.videohatak.player.core.vault.db.VaultDatabaseHelper
 import com.videohatak.player.core.vault.db.VaultDatabaseStore
 import com.videohatak.player.core.vault.model.VaultVideo
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -76,7 +77,8 @@ class VaultRepositoryImpl internal constructor(
     private val context: Context,
     private val cryptoManager: VaultCryptoManager = VaultCryptoManager(),
     private val dbHelper: VaultDatabaseStore = VaultDatabaseHelper(context),
-    private val contentSha256Computer: ((InputStream) -> String)? = null
+    private val contentSha256Computer: ((InputStream) -> String)? = null,
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
 ) : VaultRepository {
 
     companion object {
@@ -155,7 +157,7 @@ class VaultRepositoryImpl internal constructor(
         return File(vaultDir, File(raw).name)
     }
 
-    override suspend fun refresh() = withContext(Dispatchers.IO) {
+    override suspend fun refresh() = withContext(ioDispatcher) {
         repoMutex.withLock {
             refreshLocked()
         }
@@ -413,7 +415,7 @@ class VaultRepositoryImpl internal constructor(
         displayName: String?,
         onProgress: (Float) -> Unit,
         isCancelled: () -> Boolean
-    ): VaultImportOutcome = withContext(Dispatchers.IO) {
+    ): VaultImportOutcome = withContext(ioDispatcher) {
         val uniqueName = "vault_${UUID.randomUUID()}"
         val fileName = "$uniqueName.enc"
         val destFile = File(vaultDir, fileName)
@@ -611,7 +613,7 @@ class VaultRepositoryImpl internal constructor(
         }
     }
 
-    override suspend fun renameVideo(videoId: Long, newTitle: String): Boolean = withContext(Dispatchers.IO) {
+    override suspend fun renameVideo(videoId: Long, newTitle: String): Boolean = withContext(ioDispatcher) {
         repoMutex.withLock {
             if (!_isUnlocked.value) {
                 _vaultError.value = "يرجى فتح الخزنة أولًا قبل إعادة التسمية"
@@ -668,7 +670,7 @@ class VaultRepositoryImpl internal constructor(
         }
     }
 
-    override suspend fun deleteVaultVideo(id: Long): Boolean = withContext(Dispatchers.IO) {
+    override suspend fun deleteVaultVideo(id: Long): Boolean = withContext(ioDispatcher) {
         try {
             beforeDeleteHook?.invoke(id)
         } catch (ce: kotlinx.coroutines.CancellationException) {

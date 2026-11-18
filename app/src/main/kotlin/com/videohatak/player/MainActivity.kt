@@ -197,6 +197,15 @@ class MainActivity : FragmentActivity() {
                 libraryViewModel.onWritePermissionGranted(granted)
             }
 
+            var pendingVaultRestoreIds by remember { mutableStateOf<List<Long>>(emptyList()) }
+            val vaultLegacyRestorePermissionLauncher = rememberLauncherForActivityResult(
+                contract = ActivityResultContracts.RequestPermission()
+            ) { granted ->
+                val ids = pendingVaultRestoreIds
+                pendingVaultRestoreIds = emptyList()
+                vaultViewModel.onLegacyRestoreWritePermissionResult(granted, ids)
+            }
+
             LaunchedEffect(Unit) {
                 val initialStatus = PermissionHelper.checkPermissionStatus(this@MainActivity, this@MainActivity)
                 libraryViewModel.onPermissionStatusChanged(initialStatus)
@@ -253,6 +262,19 @@ class MainActivity : FragmentActivity() {
                         is VaultUiEvent.ShowMessage -> {
                             if (currentActiveVideo == null) {
                                 snackbarHostState.showSnackbar(event.message)
+                            }
+                        }
+                        is VaultUiEvent.LibraryMediaUpdated -> {
+                            libraryViewModel.refresh()
+                        }
+                        is VaultUiEvent.RequestLegacyWritePermission -> {
+                            pendingVaultRestoreIds = event.pendingRestoreIds
+                            runCatching {
+                                vaultLegacyRestorePermissionLauncher.launch(event.permission)
+                            }.onFailure {
+                                val ids = pendingVaultRestoreIds
+                                pendingVaultRestoreIds = emptyList()
+                                vaultViewModel.onLegacyRestoreWritePermissionResult(false, ids)
                             }
                         }
                     }
@@ -316,6 +338,7 @@ class MainActivity : FragmentActivity() {
             val vaultVideos by vaultViewModel.vaultVideos.collectAsStateWithLifecycle()
             val vaultCount by vaultViewModel.vaultCount.collectAsStateWithLifecycle()
             val vaultImportState by vaultViewModel.importState.collectAsStateWithLifecycle()
+            val vaultRestoreState by vaultViewModel.restoreState.collectAsStateWithLifecycle()
             val vaultBiometricError by vaultViewModel.biometricError.collectAsStateWithLifecycle()
             val vaultError by vaultViewModel.vaultError.collectAsStateWithLifecycle()
             val vaultHasPinConfigured by vaultViewModel.hasPinConfigured.collectAsStateWithLifecycle()
@@ -455,9 +478,11 @@ class MainActivity : FragmentActivity() {
                                 VideoPlaybackService.stopAndCancelNotification(this@MainActivity)
                             }
                             when (
-                                val outcome = repo.importVideoDetailed(
+                                val outcome = repo.importMediaVideoDetailed(
                                     sourceUri = target.contentUri,
-                                    displayName = target.safeTitle
+                                    displayName = target.safeTitle,
+                                    originalFileName = target.displayName.takeIf { it.isNotBlank() } ?: target.safeTitle,
+                                    originalRelativePath = target.relativePath.takeIf { it.isNotBlank() }
                                 )
                             ) {
                                 is VaultImportOutcome.Imported -> {
@@ -927,6 +952,11 @@ class MainActivity : FragmentActivity() {
                                     activeVideoForPlayback = vaultVideo.toVideoItem()
                                 },
                                 onVaultRenameVideo = vaultViewModel::renameVideo,
+                                vaultRestoreState = vaultRestoreState,
+                                onVaultRestoreVideo = vaultViewModel::restoreVideoFromVault,
+                                onVaultRestoreVideos = { ids ->
+                                    vaultViewModel.restoreVideosFromVault(ids)
+                                },
                                 onVaultDeleteVideo = vaultViewModel::deleteVideo,
                                 onVaultDeleteVideos = { ids ->
                                     vaultViewModel.deleteVideos(ids)

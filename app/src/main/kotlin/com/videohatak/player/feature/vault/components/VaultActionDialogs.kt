@@ -90,7 +90,7 @@ fun RenameVaultVideoDialog(
 }
 
 @Composable
-fun DeleteVaultVideoConfirmationDialog(
+fun RestoreVaultVideoConfirmationDialog(
     video: VaultVideo,
     onDismiss: () -> Unit,
     onConfirm: () -> Unit
@@ -105,13 +105,46 @@ fun DeleteVaultVideoConfirmationDialog(
         title = { Text("إزالة من الخزنة الخاصة", fontWeight = FontWeight.Bold) },
         text = {
             Text(
-                "هل أنت متأكد من إزالة \"${video.title}\" من الخزنة الخاصة؟ سيتم حذف النسخة المشفرة من داخل الخزنة نهائيًا.",
+                "سيتم فك تشفير \"${video.title}\" والتحقق من سلامته واستعادته إلى مكتبة الفيديوهات العامة، وبعد التأكد من نجاح الاستعادة فقط ستُزال نسخته من الخزنة.",
                 color = palette.onSurfaceMuted
             )
         },
         confirmButton = {
             TextButton(onClick = onConfirm) {
-                Text("إزالة من الخزنة", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
+                Text("إزالة واستعادة", color = palette.accent, fontWeight = FontWeight.Bold)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("إلغاء", color = palette.onSurfaceMuted)
+            }
+        }
+    )
+}
+
+@Composable
+fun DeleteVaultVideoConfirmationDialog(
+    video: VaultVideo,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit
+) {
+    val palette = LocalVideoHatakPalette.current
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = palette.surface,
+        titleContentColor = palette.onSurface,
+        textContentColor = palette.onSurface,
+        title = { Text("حذف نهائي من الخزنة", fontWeight = FontWeight.Bold) },
+        text = {
+            Text(
+                "تحذير: سيؤدي هذا الإجراء إلى حذف النسخة المشفرة من \"${video.title}\" نهائيًا دون استعادتها إلى مكتبة الهاتف. هل تريد المتابعة؟",
+                color = palette.onSurfaceMuted
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm) {
+                Text("حذف نهائي", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
             }
         },
         dismissButton = {
@@ -145,7 +178,7 @@ fun VaultSecurityInfoDialog(
                             "• المفاتيح: يُحفظ مفتاح التشفير الرئيسي داخل Android Keystore على الجهاز لحماية مفاتيح الملفات.\n" +
                             "• بوابة الوصول المستقلة: الخزنة محمية برمز قفل مستقل مرن يدعم الحروف العربية والإنجليزية والأرقام والرموز (بتجزئة PBKDF2 وتقييد المحاولات الخاطئة) دون الاعتماد على قفل شاشة الهاتف، مع خيار إضافي لاستخدام البصمة.\n" +
                             "• الخصوصية التامة: يفعّل التطبيق FLAG_SECURE لمنع لقطات وتسجيل الشاشة، ويعطّل PiP والإشعارات والتشغيل المصغّر وفي الخلفية، ويُوقف التشغيل فور الخروج أو القفل.\n" +
-                            "• النقل إلى الخزنة: عند نقل فيديو إلى الخزنة يتم تشفيره والتحقق من سلامة النسخة المشفرة وقابليتها لفك التشفير أولًا، ثم تُزال النسخة العامة من المعرض والمكتبة بأمان دون ترك نسخة مكررة.",
+                            "• النقل والاستعادة: عند نقل فيديو إلى الخزنة يتم تشفيره والتحقق من سلامته أولًا قبل إزالة النسخة العامة، وعند اختيار «إزالة من الخزنة» يُفك تشفيره ويُعاد إلى المكتبة العامة مع التحقق من سلامته قبل مسح النسخة المشفرة، بينما يتطلب «حذف نهائي» تأكيدًا مستقلًا.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = palette.onSurfaceMuted
                 )
@@ -198,6 +231,63 @@ fun ImportVideoProgressDialog(
                 Text("إلغاء العملية", color = MaterialTheme.colorScheme.error)
             }
         }
+    )
+}
+
+@Composable
+fun RestoreVideoProgressDialog(
+    currentTitle: String,
+    completedCount: Int,
+    totalCount: Int
+) {
+    val palette = LocalVideoHatakPalette.current
+
+    AlertDialog(
+        onDismissRequest = { /* Modal while verifying & writing restored public media */ },
+        containerColor = palette.surface,
+        titleContentColor = palette.onSurface,
+        textContentColor = palette.onSurface,
+        title = { Text("جارٍ استعادة الفيديو إلى المكتبة...", fontWeight = FontWeight.Bold) },
+        text = {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                if (currentTitle.isNotBlank()) {
+                    Text(
+                        text = currentTitle,
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = palette.onSurface
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                }
+                Text(
+                    text = "يتم فك التشفير والتحقق من سلامة المحتوى وإدراجه في مكتبة الهاتف قبل إزالة النسخة المشفرة.",
+                    color = palette.onSurfaceMuted
+                )
+                Spacer(modifier = Modifier.height(14.dp))
+                if (totalCount > 1) {
+                    Text(
+                        text = "${completedCount + 1} / $totalCount",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = palette.accent,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    LinearProgressIndicator(
+                        progress = { ((completedCount.toFloat()) / totalCount.coerceAtLeast(1)).coerceIn(0.05f, 1f) },
+                        modifier = Modifier.fillMaxWidth(),
+                        color = palette.accent,
+                        trackColor = palette.border
+                    )
+                } else {
+                    LinearProgressIndicator(
+                        modifier = Modifier.fillMaxWidth(),
+                        color = palette.accent,
+                        trackColor = palette.border
+                    )
+                }
+            }
+        },
+        confirmButton = {}
     )
 }
 
@@ -477,16 +567,49 @@ fun ConfirmDeleteVaultDialog(
         containerColor = palette.surface,
         titleContentColor = palette.onSurface,
         textContentColor = palette.onSurface,
-        title = { Text("إزالة من الخزنة الخاصة", fontWeight = FontWeight.Bold) },
+        title = { Text("حذف نهائي من الخزنة", fontWeight = FontWeight.Bold) },
         text = {
             Text(
-                "هل أنت متأكد من إزالة \"$videoTitle\" نهائيًا من الخزنة المشفرة؟",
+                "تحذير: هل أنت متأكد من الحذف النهائي لـ \"$videoTitle\" من الخزنة المشفرة دون استعادته إلى المكتبة؟",
                 color = palette.onSurfaceMuted
             )
         },
         confirmButton = {
             TextButton(onClick = onConfirm) {
-                Text("إزالة", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
+                Text("حذف نهائي", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("إلغاء", color = palette.onSurfaceMuted)
+            }
+        }
+    )
+}
+
+@Composable
+fun BatchRestoreVaultVideosDialog(
+    selectedCount: Int,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val palette = LocalVideoHatakPalette.current
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = palette.surface,
+        titleContentColor = palette.onSurface,
+        textContentColor = palette.onSurface,
+        title = { Text("إزالة واستعادة من الخزنة", fontWeight = FontWeight.Bold) },
+        text = {
+            Text(
+                "سيتم فك تشفير $selectedCount من الفيديوهات المحددة والتحقق من سلامتها واستعادتها إلى مكتبة الفيديوهات العامة، ثم إزالتها من الخزنة.",
+                color = palette.onSurfaceMuted
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm) {
+                Text("إزالة واستعادة ($selectedCount)", color = palette.accent, fontWeight = FontWeight.Bold)
             }
         },
         dismissButton = {
@@ -510,16 +633,16 @@ fun BatchDeleteVaultVideosDialog(
         containerColor = palette.surface,
         titleContentColor = palette.onSurface,
         textContentColor = palette.onSurface,
-        title = { Text("إزالة من الخزنة الخاصة", fontWeight = FontWeight.Bold) },
+        title = { Text("حذف نهائي من الخزنة", fontWeight = FontWeight.Bold) },
         text = {
             Text(
-                "هل أنت متأكد من إزالة $selectedCount من الفيديوهات المحددة نهائيًا من الخزنة المشفرة؟",
+                "تحذير: هل أنت متأكد من الحذف النهائي لـ $selectedCount من الفيديوهات المحددة من الخزنة المشفرة دون استعادتها إلى مكتبة الهاتف؟",
                 color = palette.onSurfaceMuted
             )
         },
         confirmButton = {
             TextButton(onClick = onConfirm) {
-                Text("إزالة المحدد", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
+                Text("حذف نهائي ($selectedCount)", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
             }
         },
         dismissButton = {

@@ -8,7 +8,9 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.videohatak.player.core.vault.biometric.VaultBiometricHelper
 import com.videohatak.player.core.vault.model.VaultVideo
+import com.videohatak.player.core.vault.repository.VaultImportOutcome
 import com.videohatak.player.core.vault.repository.VaultRepository
+import com.videohatak.player.core.vault.repository.VaultRestoreOutcome
 import com.videohatak.player.core.vault.security.PinChangeResult
 import com.videohatak.player.core.vault.security.PinVerifyResult
 import com.videohatak.player.core.vault.security.VaultAutoLockTimeout
@@ -32,6 +34,20 @@ import kotlinx.coroutines.launch
 
 sealed interface VaultUiEvent {
     data class ShowMessage(val message: String) : VaultUiEvent
+    data object LibraryMediaUpdated : VaultUiEvent
+    data class RequestLegacyWritePermission(
+        val permission: String,
+        val pendingRestoreIds: List<Long>
+    ) : VaultUiEvent
+}
+
+sealed interface VaultRestoreState {
+    data object Idle : VaultRestoreState
+    data class Restoring(
+        val currentTitle: String = "",
+        val completedCount: Int = 0,
+        val totalCount: Int = 1
+    ) : VaultRestoreState
 }
 
 class VaultViewModel(
@@ -71,6 +87,9 @@ class VaultViewModel(
 
     private val _importState = MutableStateFlow<VaultImportState>(VaultImportState.Idle)
     val importState: StateFlow<VaultImportState> = _importState.asStateFlow()
+
+    private val _restoreState = MutableStateFlow<VaultRestoreState>(VaultRestoreState.Idle)
+    val restoreState: StateFlow<VaultRestoreState> = _restoreState.asStateFlow()
 
     private val _biometricError = MutableStateFlow<String?>(null)
     val biometricError: StateFlow<String?> = _biometricError.asStateFlow()
@@ -385,33 +404,55 @@ class VaultViewModel(
                 progress = 0f
             )
 
-            val result = repository.importVideo(
-                sourceUri = sourceUri,
-                displayName = displayName,
-                onProgress = { progress ->
-                    _importState.update {
-                        if (it is VaultImportState.Encrypting) {
-                            it.copy(progress = progress)
-                        } else it
+            when (
+                val outcome = repository.importVideoDetailed(
+                    sourceUri = sourceUri,
+                    displayName = displayName,
+                    onProgress = { progress ->
+                        _importState.update {
+                            if (it is VaultImportState.Encrypting) {
+                                it.copy(progress = progress)
+                            } else it
+                        }
+                    },
+                    isCancelled = { isImportCancelled }
+                )
+            ) {
+                is VaultImportOutcome.Imported -> {
+                    _importState.value = VaultImportState.Success
+                    refresh()
+                    if (!deleteOriginal) {
+                        _events.tryEmit(VaultUiEvent.ShowMessage("تمت إضافة الفيديو إلى الخزنة بنجاح"))
                     }
-                },
-                isCancelled = { isImportCancelled }
-            )
-
-            if (result != null) {
-                _importState.value = VaultImportState.Success
-                refresh()
-                if (!deleteOriginal) {
-                    _events.tryEmit(VaultUiEvent.ShowMessage("تمت إضافة الفيديو إلى الخزنة بنجاح"))
+                    onComplete(true)
                 }
-                onComplete(true)
-            } else {
-                _importState.value = if (isImportCancelled) {
-                    VaultImportState.Idle
-                } else {
-                    VaultImportState.Error("فشل تشفير واستيراد الفيديو إلى الخزنة")
+                is VaultImportOutcome.AlreadyInVault -> {
+                    if (outcome.integrityVerified) {
+                        _importState.value = VaultImportState.Success
+                        refresh()
+                        if (!deleteOriginal) {
+                            _events.tryEmit(VaultUiEvent.ShowMessage("هذا الفيديو محفوظ ومشفّر مسبقًا داخل الخزنة"))
+                        }
+                        onComplete(true)
+                    } else {
+                        _importState.value = VaultImportState.Error(
+                            "هذا الفيديو موجود مسبقًا لكن تعذر التحقق من سلامة النسخة المشفرة — لم يتم حذف الأصل"
+                        )
+                        onComplete(false)
+                    }
                 }
-                onComplete(false)
+                VaultImportOutcome.Cancelled -> {
+                    _importState.value = VaultImportState.Idle
+                    onComplete(false)
+                }
+                is VaultImportOutcome.Failed -> {
+                    _importState.value = if (isImportCancelled) {
+                        VaultImportState.Idle
+                    } else {
+                        VaultImportState.Error(outcome.reason)
+                    }
+                    onComplete(false)
+                }
             }
         }
     }
@@ -451,6 +492,136 @@ class VaultViewModel(
             if (!renamed && repository.vaultError.value.isNullOrBlank()) {
                 _actionError.value = "تعذر إعادة تسمية الفيديو داخل الخزنة"
             }
+        }
+    }
+
+    fun restoreVideoFromVault(
+        videoId: Long,
+        onComplete: (VaultRestoreOutcome) -> Unit = {}
+    ) {
+        viewModelScope.launch {
+            _actionError.value = null
+            val targetTitle = vaultVideos.value.firstOrNull { it.id == videoId }?.displayName.orEmpty()
+            _restoreState.value = VaultRestoreState.Restoring(
+                currentTitle = targetTitle,
+                completedCount = 0,
+                totalCount = 1
+            )
+            val outcome = try {
+                repository.restoreVaultVideo(videoId)
+            } finally {
+                _restoreState.value = VaultRestoreState.Idle
+            }
+            when (outcome) {
+                is VaultRestoreOutcome.Restored -> {
+                    _events.tryEmit(VaultUiEvent.LibraryMediaUpdated)
+                    _events.tryEmit(VaultUiEvent.ShowMessage("تمت إزالة الفيديو من الخزنة واستعادته إلى المكتبة بنجاح"))
+                }
+                is VaultRestoreOutcome.RequiresLegacyWritePermission -> {
+                    _events.tryEmit(
+                        VaultUiEvent.RequestLegacyWritePermission(
+                            permission = outcome.permission,
+                            pendingRestoreIds = listOf(videoId)
+                        )
+                    )
+                }
+                is VaultRestoreOutcome.Failed -> {
+                    if (repository.vaultError.value.isNullOrBlank()) {
+                        _actionError.value = outcome.reason
+                    }
+                    _events.tryEmit(VaultUiEvent.ShowMessage(outcome.reason))
+                }
+            }
+            onComplete(outcome)
+        }
+    }
+
+    fun restoreVideosFromVault(
+        videoIds: Set<Long>,
+        onComplete: (succeededCount: Int, failedCount: Int) -> Unit = { _, _ -> }
+    ) {
+        if (videoIds.isEmpty()) {
+            onComplete(0, 0)
+            return
+        }
+        viewModelScope.launch {
+            _actionError.value = null
+            val orderedIds = videoIds.toList()
+            val total = orderedIds.size
+            var succeeded = 0
+            var failed = 0
+            var lastFailureReason: String? = null
+            var permissionRequested = false
+
+            try {
+                for ((index, videoId) in orderedIds.withIndex()) {
+                    val targetTitle = vaultVideos.value.firstOrNull { it.id == videoId }?.displayName.orEmpty()
+                    _restoreState.value = VaultRestoreState.Restoring(
+                        currentTitle = targetTitle,
+                        completedCount = index,
+                        totalCount = total
+                    )
+                    when (val outcome = repository.restoreVaultVideo(videoId)) {
+                        is VaultRestoreOutcome.Restored -> {
+                            succeeded++
+                        }
+                        is VaultRestoreOutcome.RequiresLegacyWritePermission -> {
+                            permissionRequested = true
+                            val remaining = orderedIds.drop(index)
+                            _events.tryEmit(
+                                VaultUiEvent.RequestLegacyWritePermission(
+                                    permission = outcome.permission,
+                                    pendingRestoreIds = remaining
+                                )
+                            )
+                            break
+                        }
+                        is VaultRestoreOutcome.Failed -> {
+                            failed++
+                            lastFailureReason = outcome.reason
+                        }
+                    }
+                }
+            } finally {
+                _restoreState.value = VaultRestoreState.Idle
+            }
+
+            if (succeeded > 0) {
+                _events.tryEmit(VaultUiEvent.LibraryMediaUpdated)
+            }
+            if (!permissionRequested) {
+                if (failed > 0 && repository.vaultError.value.isNullOrBlank()) {
+                    _actionError.value = lastFailureReason
+                        ?: "تمت استعادة $succeeded وتعذر استعادة $failed — بقيت الفيديوهات غير المستعادة محفوظة في الخزنة"
+                }
+                if (succeeded > 0) {
+                    val msg = when {
+                        failed == 0 && succeeded == 1 -> "تمت إزالة الفيديو من الخزنة واستعادته إلى المكتبة بنجاح"
+                        failed == 0 -> "تمت استعادة $succeeded فيديو إلى المكتبة وإزالتها من الخزنة بنجاح"
+                        else -> "تمت استعادة $succeeded فيديو إلى المكتبة، وتعذر استعادة $failed وبقيت محفوظة في الخزنة"
+                    }
+                    _events.tryEmit(VaultUiEvent.ShowMessage(msg))
+                } else if (failed > 0) {
+                    _events.tryEmit(
+                        VaultUiEvent.ShowMessage(
+                            lastFailureReason ?: "تعذر استعادة الفيديوهات إلى المكتبة — بقيت محفوظة داخل الخزنة"
+                        )
+                    )
+                }
+            }
+            onComplete(succeeded, failed)
+        }
+    }
+
+    fun onLegacyRestoreWritePermissionResult(granted: Boolean, pendingRestoreIds: List<Long>) {
+        if (!granted) {
+            val msg = "تم رفض إذن التخزين المطلوب لاستعادة الفيديو إلى المكتبة — بقي الفيديو محفوظًا داخل الخزنة"
+            _actionError.value = msg
+            _events.tryEmit(VaultUiEvent.ShowMessage(msg))
+            return
+        }
+        if (pendingRestoreIds.isNotEmpty()) {
+            restoreVideosFromVault(pendingRestoreIds.toSet())
         }
     }
 

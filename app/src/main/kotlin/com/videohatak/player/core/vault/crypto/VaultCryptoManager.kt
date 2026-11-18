@@ -42,6 +42,11 @@ data class EncryptionResult(
     val contentSha256: String = ""
 )
 
+data class DecryptionResult(
+    val plaintextSizeBytes: Long,
+    val contentSha256: String
+)
+
 internal interface VaultFileCommitter {
     @Throws(IOException::class)
     fun commitTempFile(tempFile: File, destinationFile: File)
@@ -576,6 +581,128 @@ class VaultCryptoManager internal constructor(
             }
             return actualSha256
         } finally {
+            runCatching { zeroByteArray(dek.encoded) }
+            runCatching { dek.destroy() }
+        }
+    }
+
+    @Throws(IOException::class)
+    fun decryptFileToFile(
+        encryptedFile: File,
+        destinationFile: File,
+        expectedContentSha256: String? = null,
+        expectedSizeBytes: Long? = null,
+        onProgress: (Float) -> Unit = {},
+        isCancelled: () -> Boolean = { false }
+    ): DecryptionResult {
+        if (!encryptedFile.exists() || !encryptedFile.isFile || encryptedFile.length() <= 0L) {
+            throw IOException("Encrypted vault file is missing or empty")
+        }
+        val header = parseEncryptedFileHeader(encryptedFile)
+        if (expectedSizeBytes != null && expectedSizeBytes > 0L && header.plaintextSizeBytes != expectedSizeBytes) {
+            throw IOException(
+                "Encrypted vault plaintext size mismatch: expected $expectedSizeBytes, header has ${header.plaintextSizeBytes}"
+            )
+        }
+        val headerAad = buildHeaderAad(
+            MAGIC_HEADER,
+            header.fileSalt,
+            header.chunkSize,
+            header.plaintextSizeBytes
+        )
+        val dek = unwrapDataKeyWithFallback(header.encryptedDek, headerAad)
+        val sha256Digest = MessageDigest.getInstance("SHA-256")
+        destinationFile.parentFile?.let { parent ->
+            if (!parent.exists()) parent.mkdirs()
+        }
+        if (destinationFile.exists()) {
+            destinationFile.delete()
+        }
+
+        var outStream: FileOutputStream? = null
+        try {
+            val fos = FileOutputStream(destinationFile)
+            outStream = fos
+            var totalPlaintext = 0L
+
+            RandomAccessFile(encryptedFile, "r").use { raf ->
+                raf.seek(header.headerSize.toLong())
+                var chunkIndex = 0
+                while (totalPlaintext < header.plaintextSizeBytes) {
+                    if (isCancelled()) {
+                        throw InterruptedException("Decryption cancelled by user")
+                    }
+                    val encSize = validateEncryptedChunkSize(raf.readInt(), header.chunkSize)
+                    val encBytes = ByteArray(encSize)
+                    raf.readFully(encBytes)
+
+                    val nonce = deriveChunkNonce(header.fileSalt, chunkIndex)
+                    val chunkAad = buildChunkAad(header.fileSalt, chunkIndex)
+                    val cipher = Cipher.getInstance(TRANSFORMATION)
+                    cipher.init(Cipher.DECRYPT_MODE, dek, GCMParameterSpec(GCM_TAG_LENGTH_BITS, nonce))
+                    cipher.updateAAD(chunkAad)
+
+                    val plainChunk = try {
+                        cipher.doFinal(encBytes)
+                    } catch (e: AEADBadTagException) {
+                        try {
+                            val fallbackCipher = Cipher.getInstance(TRANSFORMATION)
+                            fallbackCipher.init(Cipher.DECRYPT_MODE, dek, GCMParameterSpec(GCM_TAG_LENGTH_BITS, nonce))
+                            fallbackCipher.doFinal(encBytes)
+                        } catch (_: Exception) {
+                            throw e
+                        }
+                    }
+
+                    try {
+                        fos.write(plainChunk)
+                        sha256Digest.update(plainChunk)
+                        totalPlaintext += plainChunk.size
+                        chunkIndex++
+                        if (header.plaintextSizeBytes > 0L) {
+                            onProgress((totalPlaintext.toFloat() / header.plaintextSizeBytes).coerceIn(0f, 1f))
+                        }
+                    } finally {
+                        zeroByteArray(plainChunk)
+                    }
+                }
+                if (totalPlaintext != header.plaintextSizeBytes) {
+                    throw IOException("Decrypted size mismatch: expected ${header.plaintextSizeBytes}, got $totalPlaintext")
+                }
+                if (raf.filePointer != raf.length()) {
+                    throw IOException("Unexpected trailing bytes after encrypted chunks at ${raf.filePointer}/${raf.length()}")
+                }
+            }
+
+            fos.flush()
+            runCatching { fos.fd.sync() }
+            fos.close()
+            outStream = null
+
+            if (!destinationFile.exists() || destinationFile.length() != totalPlaintext) {
+                throw IOException("Decrypted output file length mismatch on disk")
+            }
+
+            val actualSha256 = sha256Digest.digest().joinToString("") { "%02x".format(it) }
+            if (!expectedContentSha256.isNullOrBlank() &&
+                !actualSha256.equals(expectedContentSha256, ignoreCase = true)
+            ) {
+                throw IOException("Decrypted vault content SHA-256 mismatch")
+            }
+
+            return DecryptionResult(
+                plaintextSizeBytes = totalPlaintext,
+                contentSha256 = actualSha256
+            )
+        } catch (e: Exception) {
+            runCatching { outStream?.close() }
+            outStream = null
+            runCatching { if (destinationFile.exists()) destinationFile.delete() }
+            if (e is IOException) throw e
+            if (e is InterruptedException) throw e
+            throw IOException("Failed to decrypt encrypted vault video", e)
+        } finally {
+            runCatching { outStream?.close() }
             runCatching { zeroByteArray(dek.encoded) }
             runCatching { dek.destroy() }
         }

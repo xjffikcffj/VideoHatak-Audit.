@@ -3,7 +3,10 @@ package com.videohatak.player.core.vault.repository
 import android.content.Context
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.os.Build
+import android.os.Environment
 import android.os.StatFs
+import android.provider.MediaStore
 import android.provider.OpenableColumns
 import com.videohatak.player.core.vault.crypto.VaultBase64
 import com.videohatak.player.core.vault.crypto.VaultCryptoManager
@@ -32,6 +35,25 @@ sealed interface VaultImportOutcome {
     data class AlreadyInVault(val existingVideo: VaultVideo, val integrityVerified: Boolean) : VaultImportOutcome
     data object Cancelled : VaultImportOutcome
     data class Failed(val reason: String) : VaultImportOutcome
+}
+
+sealed interface VaultRestoreOutcome {
+    data class Restored(
+        val video: VaultVideo,
+        val restoredUri: Uri,
+        val verifiedSha256: String,
+        val verifiedSizeBytes: Long
+    ) : VaultRestoreOutcome
+
+    data class RequiresLegacyWritePermission(
+        val permission: String,
+        val videoId: Long
+    ) : VaultRestoreOutcome
+
+    data class Failed(
+        val reason: String,
+        val vaultEntryPreserved: Boolean = true
+    ) : VaultRestoreOutcome
 }
 
 interface VaultRepository {
@@ -67,7 +89,28 @@ interface VaultRepository {
             else -> VaultImportOutcome.Failed(vaultError.value ?: "فشل تشفير الفيديو إلى الخزنة")
         }
     }
+    suspend fun importMediaVideoDetailed(
+        sourceUri: Uri,
+        displayName: String? = null,
+        originalFileName: String? = null,
+        originalRelativePath: String? = null,
+        onProgress: (Float) -> Unit = {},
+        isCancelled: () -> Boolean = { false }
+    ): VaultImportOutcome {
+        return importVideoDetailed(
+            sourceUri = sourceUri,
+            displayName = displayName ?: originalFileName,
+            onProgress = onProgress,
+            isCancelled = isCancelled
+        )
+    }
     suspend fun renameVideo(videoId: Long, newTitle: String): Boolean
+    suspend fun restoreVaultVideo(id: Long): VaultRestoreOutcome {
+        return VaultRestoreOutcome.Failed(
+            reason = "استعادة الفيديو إلى المكتبة غير مدعومة في هذا المزوّد",
+            vaultEntryPreserved = true
+        )
+    }
     suspend fun deleteVaultVideo(id: Long): Boolean
     fun getVideoById(id: Long): VaultVideo?
     fun resolveEncryptedFile(video: VaultVideo): File
@@ -78,7 +121,12 @@ class VaultRepositoryImpl internal constructor(
     private val cryptoManager: VaultCryptoManager = VaultCryptoManager(),
     private val dbHelper: VaultDatabaseStore = VaultDatabaseHelper(context),
     private val contentSha256Computer: ((InputStream) -> String)? = null,
-    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val publicMediaExporter: PublicMediaExporter = MediaStorePublicMediaExporter(
+        context = context,
+        contentResolver = context.contentResolver,
+        cryptoManager = cryptoManager
+    )
 ) : VaultRepository {
 
     companion object {
@@ -269,7 +317,10 @@ class VaultRepositoryImpl internal constructor(
         internalFileName: String,
         mimeType: String,
         contentSha256: String = "",
-        legacySourceFingerprint: String = ""
+        legacySourceFingerprint: String = "",
+        originalFileName: String = "",
+        originalRelativePath: String = "",
+        originalSizeBytes: Long = 0L
     ): String {
         val json = JSONObject().apply {
             put("title", displayName)
@@ -280,6 +331,15 @@ class VaultRepositoryImpl internal constructor(
             }
             if (legacySourceFingerprint.isNotBlank()) {
                 put("src", legacySourceFingerprint)
+            }
+            if (originalFileName.isNotBlank()) {
+                put("originalFileName", originalFileName)
+            }
+            if (originalRelativePath.isNotBlank()) {
+                put("originalRelativePath", originalRelativePath)
+            }
+            if (originalSizeBytes > 0L) {
+                put("originalSizeBytes", originalSizeBytes)
             }
         }
         return cryptoManager.encryptMetadata(json.toString())
@@ -415,13 +475,55 @@ class VaultRepositoryImpl internal constructor(
         displayName: String?,
         onProgress: (Float) -> Unit,
         isCancelled: () -> Boolean
+    ): VaultImportOutcome = importVideoDetailedInternal(
+        sourceUri = sourceUri,
+        displayName = displayName,
+        explicitOriginalFileName = null,
+        explicitOriginalRelativePath = null,
+        onProgress = onProgress,
+        isCancelled = isCancelled
+    )
+
+    override suspend fun importMediaVideoDetailed(
+        sourceUri: Uri,
+        displayName: String?,
+        originalFileName: String?,
+        originalRelativePath: String?,
+        onProgress: (Float) -> Unit,
+        isCancelled: () -> Boolean
+    ): VaultImportOutcome = importVideoDetailedInternal(
+        sourceUri = sourceUri,
+        displayName = displayName,
+        explicitOriginalFileName = originalFileName,
+        explicitOriginalRelativePath = originalRelativePath,
+        onProgress = onProgress,
+        isCancelled = isCancelled
+    )
+
+    private suspend fun importVideoDetailedInternal(
+        sourceUri: Uri,
+        displayName: String?,
+        explicitOriginalFileName: String?,
+        explicitOriginalRelativePath: String?,
+        onProgress: (Float) -> Unit,
+        isCancelled: () -> Boolean
     ): VaultImportOutcome = withContext(ioDispatcher) {
         val uniqueName = "vault_${UUID.randomUUID()}"
         val fileName = "$uniqueName.enc"
         val destFile = File(vaultDir, fileName)
         val stagingFile = File(vaultDir, "$fileName.stage")
         val stagingInnerTempName = "${stagingFile.name}.tmp"
-        val resolvedName = displayName?.ifBlank { null } ?: queryFileName(sourceUri) ?: "$uniqueName.mp4"
+        val queriedMeta = querySourceMediaMetadata(sourceUri)
+        val resolvedOriginalFileName = explicitOriginalFileName?.trim()?.takeIf { it.isNotBlank() }
+            ?: queriedMeta.first
+            ?: queryFileName(sourceUri)?.trim()?.takeIf { it.isNotBlank() }
+            ?: displayName?.trim()?.takeIf { it.isNotBlank() }
+            ?: "$uniqueName.mp4"
+        val resolvedName = displayName?.trim()?.takeIf { it.isNotBlank() }
+            ?: resolvedOriginalFileName
+        val resolvedOriginalRelativePath = explicitOriginalRelativePath?.trim()?.takeIf { it.isNotBlank() }
+            ?: queriedMeta.second
+            ?: ""
         val estimatedSize = try {
             context.contentResolver.openFileDescriptor(sourceUri, "r")?.use { it.statSize } ?: 0L
         } catch (_: Exception) { 0L }
@@ -496,7 +598,10 @@ class VaultRepositoryImpl internal constructor(
                 displayName = resolvedName,
                 internalFileName = fileName,
                 mimeType = metadata.mimeType,
-                contentSha256 = sourceContentSha256
+                contentSha256 = sourceContentSha256,
+                originalFileName = resolvedOriginalFileName,
+                originalRelativePath = resolvedOriginalRelativePath,
+                originalSizeBytes = encResult.plaintextSizeBytes
             )
             val ivBase64 = VaultBase64.encodeNoWrap(encResult.encryptedDek)
 
@@ -640,13 +745,30 @@ class VaultRepositoryImpl internal constructor(
                 ?.let { enc -> runCatching { JSONObject(cryptoManager.decryptMetadata(enc)) }.getOrNull() }
             val existingContentSha256 = existingJson?.optString("contentSha256").orEmpty()
             val existingLegacySrc = existingJson?.optString("src").orEmpty()
+            val existingOriginalFileName = existingJson?.optString("originalFileName").orEmpty()
+            val existingOriginalRelPath = existingJson?.optString("originalRelativePath").orEmpty()
+            val existingOriginalSize = existingJson?.optLong("originalSizeBytes", decoded.originalSizeBytes)
+                ?.takeIf { it > 0L }
+                ?: decoded.originalSizeBytes
+            val existingExt = existingOriginalFileName.substringAfterLast('.', "")
+                .takeIf { existingOriginalFileName.contains('.') && it.isNotBlank() }
+                ?: decoded.displayName.substringAfterLast('.', "")
+                    .takeIf { decoded.displayName.contains('.') && it.isNotBlank() }
+            val updatedOriginalFileName = if (cleanTitle.contains('.') || existingExt.isNullOrBlank()) {
+                cleanTitle
+            } else {
+                "$cleanTitle.$existingExt"
+            }
             val rows = try {
                 val newEncryptedMeta = encodeMetadata(
                     displayName = cleanTitle,
                     internalFileName = internalFile,
                     mimeType = decoded.mimeType,
                     contentSha256 = existingContentSha256,
-                    legacySourceFingerprint = existingLegacySrc
+                    legacySourceFingerprint = existingLegacySrc,
+                    originalFileName = updatedOriginalFileName,
+                    originalRelativePath = existingOriginalRelPath,
+                    originalSizeBytes = existingOriginalSize
                 )
                 dbHelper.updateEncryptedMetadata(
                     id = videoId,
@@ -666,6 +788,167 @@ class VaultRepositoryImpl internal constructor(
             } else {
                 _vaultError.value = "فشل تحديث اسم المقطع داخل قاعدة بيانات الخزنة"
                 false
+            }
+        }
+    }
+
+    override suspend fun restoreVaultVideo(id: Long): VaultRestoreOutcome = withContext(ioDispatcher) {
+        repoMutex.withLock {
+            if (!_isUnlocked.value) {
+                val msg = "يرجى فتح الخزنة أولًا قبل إزالة الفيديو واستعادته"
+                return@withContext VaultRestoreOutcome.Failed(msg, vaultEntryPreserved = true)
+            }
+
+            // 1. Read database record & decrypt metadata
+            val rawRow = dbHelper.getVideoById(id)
+                ?: return@withContext VaultRestoreOutcome.Failed(
+                    "تعذر العثور على سجل الفيديو داخل الخزنة",
+                    vaultEntryPreserved = true
+                )
+
+            val metaJson = rawRow.encryptedMetaBase64
+                ?.takeIf { it.isNotBlank() }
+                ?.let { enc ->
+                    try {
+                        JSONObject(cryptoManager.decryptMetadata(enc))
+                    } catch (_: Exception) {
+                        val msg = "تعذر فك تشفير بيانات الفيديو داخل الخزنة — تم الإبقاء على النسخة المشفرة بأمان"
+                        _vaultError.value = msg
+                        return@withContext VaultRestoreOutcome.Failed(msg, vaultEntryPreserved = true)
+                    }
+                }
+
+            val decodedVideo = decodeVaultRow(rawRow)
+                ?: run {
+                    val msg = "تعذر قراءة بيانات الفيديو المشفرة — لم يتم حذف أي بيانات"
+                    _vaultError.value = msg
+                    return@withContext VaultRestoreOutcome.Failed(msg, vaultEntryPreserved = true)
+                }
+
+            val expectedSha256 = metaJson?.optString("contentSha256").orEmpty()
+            val originalFileName = metaJson?.optString("originalFileName").orEmpty()
+                .ifBlank { decodedVideo.displayName }
+            val originalRelativePath = metaJson?.optString("originalRelativePath").orEmpty()
+                .takeIf { it.isNotBlank() }
+            val expectedSize = metaJson?.optLong("originalSizeBytes", rawRow.originalSizeBytes)
+                ?.takeIf { it > 0L }
+                ?: rawRow.originalSizeBytes.takeIf { it > 0L }
+
+            // 2. Verify encrypted file exists and is readable
+            val encryptedFile = resolveEncryptedFile(decodedVideo)
+            if (!encryptedFile.exists() || !encryptedFile.isFile || !encryptedFile.canRead() || encryptedFile.length() <= 0L) {
+                val msg = "الملف المشفر مفقود أو تالف داخل الخزنة — تم الحفاظ على السجل بدون تغيير"
+                _vaultError.value = msg
+                return@withContext VaultRestoreOutcome.Failed(msg, vaultEntryPreserved = true)
+            }
+
+            // 3-5. Decrypt via VaultCryptoManager to secure app-private temp file & verify SHA-256 + size
+            val tempDir = File(context.cacheDir, "vault_restore_tmp").apply {
+                if (!exists()) mkdirs()
+            }
+            val decryptedTempFile = File(tempDir, "restore_${UUID.randomUUID()}.tmp")
+
+            try {
+                val decryptionResult = try {
+                    cryptoManager.decryptFileToFile(
+                        encryptedFile = encryptedFile,
+                        destinationFile = decryptedTempFile,
+                        expectedContentSha256 = expectedSha256.takeIf { it.isNotBlank() },
+                        expectedSizeBytes = expectedSize
+                    )
+                } catch (e: Exception) {
+                    val msg = e.localizedMessage?.takeIf { it.isNotBlank() }?.let {
+                        "فشل فك التشفير أو التحقق من سلامة الفيديو ($it) — بقي الملف محفوظًا داخل الخزنة"
+                    } ?: "فشل فك التشفير أو التحقق من سلامة الفيديو — بقي الملف محفوظًا داخل الخزنة"
+                    _vaultError.value = msg
+                    return@withContext VaultRestoreOutcome.Failed(msg, vaultEntryPreserved = true)
+                }
+
+                // 6-8. Insert into MediaStore (IS_PENDING=1 -> write -> IS_PENDING=0) & verify readable URI + SHA-256
+                val exportOutcome = publicMediaExporter.exportVideo(
+                    PublicExportRequest(
+                        decryptedTempFile = decryptedTempFile,
+                        title = decodedVideo.displayName,
+                        displayName = originalFileName,
+                        mimeType = decodedVideo.mimeType,
+                        relativePath = originalRelativePath,
+                        expectedSizeBytes = decryptionResult.plaintextSizeBytes,
+                        expectedSha256 = decryptionResult.contentSha256,
+                        durationMs = decodedVideo.durationMs,
+                        width = decodedVideo.width,
+                        height = decodedVideo.height
+                    )
+                )
+
+                when (exportOutcome) {
+                    is PublicExportOutcome.RequiresLegacyWritePermission -> {
+                        return@withContext VaultRestoreOutcome.RequiresLegacyWritePermission(
+                            permission = exportOutcome.permission,
+                            videoId = id
+                        )
+                    }
+                    is PublicExportOutcome.Failed -> {
+                        _vaultError.value = exportOutcome.reason
+                        return@withContext VaultRestoreOutcome.Failed(
+                            reason = exportOutcome.reason,
+                            vaultEntryPreserved = true
+                        )
+                    }
+                    is PublicExportOutcome.Exported -> {
+                        // 9. ONLY AFTER full verification in public MediaStore, invoke playback stop hook & delete Vault copy
+                        try {
+                            beforeDeleteHook?.invoke(id)
+                        } catch (ce: kotlinx.coroutines.CancellationException) {
+                            throw ce
+                        } catch (_: Throwable) {
+                        }
+
+                        var stagedFile: File? = null
+                        if (encryptedFile.exists()) {
+                            val candidate = File(
+                                encryptedFile.parentFile ?: vaultDir,
+                                "${encryptedFile.name}.${System.currentTimeMillis()}.pending_delete"
+                            )
+                            val stagedOk = runCatching { encryptedFile.renameTo(candidate) }.getOrDefault(false)
+                            if (!stagedOk) {
+                                val msg = "تمت استعادة الفيديو إلى المكتبة، لكن تعذر تنظيف النسخة المشفرة من الخزنة"
+                                _vaultError.value = msg
+                                return@withContext VaultRestoreOutcome.Failed(msg, vaultEntryPreserved = true)
+                            }
+                            stagedFile = candidate
+                        }
+
+                        val deletedRows = runCatching { dbHelper.deleteVideo(id) }.getOrDefault(0)
+                        if (deletedRows <= 0) {
+                            if (stagedFile != null && stagedFile.exists() && !encryptedFile.exists()) {
+                                runCatching { stagedFile.renameTo(encryptedFile) }
+                            }
+                            val msg = "تمت استعادة الفيديو إلى المكتبة، لكن تعذر إزالة السجل من قاعدة بيانات الخزنة"
+                            _vaultError.value = msg
+                            return@withContext VaultRestoreOutcome.Failed(msg, vaultEntryPreserved = true)
+                        }
+
+                        if (stagedFile != null && stagedFile.exists()) {
+                            runCatching { stagedFile.delete() }
+                        }
+                        _vaultError.value = null
+                        recordActivity()
+                        refreshLocked()
+
+                        return@withContext VaultRestoreOutcome.Restored(
+                            video = decodedVideo,
+                            restoredUri = exportOutcome.mediaUri,
+                            verifiedSha256 = exportOutcome.verifiedSha256,
+                            verifiedSizeBytes = exportOutcome.verifiedSizeBytes
+                        )
+                    }
+                }
+            } finally {
+                runCatching {
+                    if (decryptedTempFile.exists()) {
+                        decryptedTempFile.delete()
+                    }
+                }
             }
         }
     }
@@ -718,6 +1001,62 @@ class VaultRepositoryImpl internal constructor(
         if (!_isUnlocked.value) return null
         val row = dbHelper.getVideoById(id) ?: return null
         return decodeVaultRow(row)
+    }
+
+    private fun querySourceMediaMetadata(uri: Uri): Pair<String?, String?> {
+        if (uri.scheme != "content") {
+            val path = uri.path
+            val fileName = path?.let { File(it).name } ?: uri.lastPathSegment
+            val relPath = path?.let { deriveRelativePathFromDataPath(it) }
+            return fileName to relPath
+        }
+        return try {
+            val cols = buildList {
+                add(MediaStore.Video.Media.DISPLAY_NAME)
+                add(OpenableColumns.DISPLAY_NAME)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    add(MediaStore.Video.Media.RELATIVE_PATH)
+                }
+                @Suppress("DEPRECATION")
+                add(MediaStore.Video.Media.DATA)
+            }.toTypedArray()
+
+            context.contentResolver.query(uri, cols, null, null, null)?.use { cursor ->
+                if (!cursor.moveToFirst()) return null to null
+                val nameCol = cursor.getColumnIndex(MediaStore.Video.Media.DISPLAY_NAME)
+                    .takeIf { it >= 0 }
+                    ?: cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                val name = if (nameCol >= 0) cursor.getString(nameCol)?.takeIf { it.isNotBlank() } else null
+
+                val relCol = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    cursor.getColumnIndex(MediaStore.Video.Media.RELATIVE_PATH)
+                } else -1
+                val relRaw = if (relCol >= 0) cursor.getString(relCol)?.takeIf { it.isNotBlank() } else null
+
+                @Suppress("DEPRECATION")
+                val dataCol = cursor.getColumnIndex(MediaStore.Video.Media.DATA)
+                val dataPath = if (dataCol >= 0) cursor.getString(dataCol)?.takeIf { it.isNotBlank() } else null
+
+                val resolvedRel = relRaw ?: dataPath?.let { deriveRelativePathFromDataPath(it) }
+                name to resolvedRel
+            } ?: (null to null)
+        } catch (_: Exception) {
+            null to null
+        }
+    }
+
+    private fun deriveRelativePathFromDataPath(filePath: String): String? {
+        val parent = File(filePath).parent ?: return null
+        val normalized = parent.replace('\\', '/')
+        val markers = listOf("/${Environment.DIRECTORY_MOVIES}", "/${Environment.DIRECTORY_DCIM}")
+        for (marker in markers) {
+            val idx = normalized.indexOf(marker, ignoreCase = true)
+            if (idx >= 0) {
+                val rel = normalized.substring(idx + 1).trimEnd('/')
+                if (rel.isNotBlank()) return "$rel/"
+            }
+        }
+        return null
     }
 
     private fun queryFileName(uri: Uri): String? {

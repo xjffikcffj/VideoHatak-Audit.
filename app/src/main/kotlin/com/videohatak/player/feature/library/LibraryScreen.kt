@@ -117,6 +117,7 @@ import com.videohatak.player.feature.settings.BackupImportConfirmDialog
 import com.videohatak.player.feature.settings.SettingsScreen
 import com.videohatak.player.feature.trash.TrashScreen
 import com.videohatak.player.feature.vault.VaultImportState
+import com.videohatak.player.feature.vault.VaultRestoreState
 import com.videohatak.player.feature.vault.VaultScreen
 
 @OptIn(ExperimentalFoundationApi::class)
@@ -226,6 +227,9 @@ fun LibraryScreen(
     onVaultDismissError: () -> Unit = {},
     onVaultVideoClick: (VaultVideo) -> Unit,
     onVaultRenameVideo: (Long, String) -> Unit,
+    vaultRestoreState: VaultRestoreState = VaultRestoreState.Idle,
+    onVaultRestoreVideo: (Long) -> Unit = {},
+    onVaultRestoreVideos: (Set<Long>) -> Unit = { ids -> ids.forEach(onVaultRestoreVideo) },
     onVaultDeleteVideo: (Long) -> Unit,
     onVaultDeleteVideos: (Set<Long>) -> Unit = { ids -> ids.forEach(onVaultDeleteVideo) },
     onVaultUserInteraction: () -> Unit = {},
@@ -1332,6 +1336,9 @@ fun LibraryScreen(
                             onDismissError = onVaultDismissError,
                             onVideoClick = onVaultVideoClick,
                             onRenameVideo = onVaultRenameVideo,
+                            restoreState = vaultRestoreState,
+                            onRestoreVideo = onVaultRestoreVideo,
+                            onRestoreVideos = onVaultRestoreVideos,
                             onDeleteVideo = onVaultDeleteVideo,
                             onDeleteVideos = onVaultDeleteVideos,
                             onUserInteraction = onVaultUserInteraction,

@@ -31,7 +31,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.DeleteForever
+import androidx.compose.material.icons.filled.DriveFileMove
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LockOpen
@@ -81,9 +83,12 @@ import com.videohatak.player.core.vault.model.VaultVideo
 import com.videohatak.player.core.vault.security.VaultAutoLockTimeout
 import com.videohatak.player.core.vault.security.VaultPinHasher
 import com.videohatak.player.feature.vault.components.BatchDeleteVaultVideosDialog
+import com.videohatak.player.feature.vault.components.BatchRestoreVaultVideosDialog
 import com.videohatak.player.feature.vault.components.DeleteVaultVideoConfirmationDialog
 import com.videohatak.player.feature.vault.components.ImportVideoProgressDialog
 import com.videohatak.player.feature.vault.components.RenameVaultVideoDialog
+import com.videohatak.player.feature.vault.components.RestoreVaultVideoConfirmationDialog
+import com.videohatak.player.feature.vault.components.RestoreVideoProgressDialog
 import com.videohatak.player.feature.vault.components.VaultPinUnlockDialog
 import com.videohatak.player.feature.vault.components.VaultSecurityInfoDialog
 import com.videohatak.player.feature.vault.components.VaultSecuritySettingsDialog
@@ -118,6 +123,9 @@ fun VaultScreen(
     onDismissError: () -> Unit = {},
     onVideoClick: (VaultVideo) -> Unit,
     onRenameVideo: (Long, String) -> Unit,
+    restoreState: VaultRestoreState = VaultRestoreState.Idle,
+    onRestoreVideo: (Long) -> Unit = {},
+    onRestoreVideos: (Set<Long>) -> Unit = { ids -> ids.forEach(onRestoreVideo) },
     onDeleteVideo: (Long) -> Unit,
     onDeleteVideos: (Set<Long>) -> Unit = { ids -> ids.forEach(onDeleteVideo) },
     onUserInteraction: () -> Unit = {},
@@ -125,11 +133,13 @@ fun VaultScreen(
 ) {
     val palette = LocalVideoHatakPalette.current
     var videoToRename by remember { mutableStateOf<VaultVideo?>(null) }
+    var videoToRestore by remember { mutableStateOf<VaultVideo?>(null) }
     var videoToDelete by remember { mutableStateOf<VaultVideo?>(null) }
     var showSecurityInfo by remember { mutableStateOf(false) }
     var showPinUnlockDialog by remember { mutableStateOf(false) }
     var showSecuritySettingsDialog by remember { mutableStateOf(false) }
     var selectedVideoIds by remember { mutableStateOf<Set<Long>>(emptySet()) }
+    var showBatchRestoreConfirm by remember { mutableStateOf(false) }
     var showBatchDeleteConfirm by remember { mutableStateOf(false) }
     val isSelectionMode = selectedVideoIds.isNotEmpty()
 
@@ -138,6 +148,9 @@ fun VaultScreen(
             showPinUnlockDialog = false
         } else {
             selectedVideoIds = emptySet()
+            videoToRestore = null
+            videoToDelete = null
+            showBatchRestoreConfirm = false
             showBatchDeleteConfirm = false
         }
     }
@@ -172,6 +185,18 @@ fun VaultScreen(
         )
     }
 
+    val toRestore = videoToRestore
+    if (toRestore != null) {
+        RestoreVaultVideoConfirmationDialog(
+            video = toRestore,
+            onDismiss = { videoToRestore = null },
+            onConfirm = {
+                onRestoreVideo(toRestore.id)
+                videoToRestore = null
+            }
+        )
+    }
+
     val toDelete = videoToDelete
     if (toDelete != null) {
         DeleteVaultVideoConfirmationDialog(
@@ -180,6 +205,19 @@ fun VaultScreen(
             onConfirm = {
                 onDeleteVideo(toDelete.id)
                 videoToDelete = null
+            }
+        )
+    }
+
+    if (showBatchRestoreConfirm && isSelectionMode) {
+        BatchRestoreVaultVideosDialog(
+            selectedCount = selectedVideoIds.size,
+            onDismiss = { showBatchRestoreConfirm = false },
+            onConfirm = {
+                val toExport = selectedVideoIds
+                showBatchRestoreConfirm = false
+                selectedVideoIds = emptySet()
+                onRestoreVideos(toExport)
             }
         )
     }
@@ -227,6 +265,14 @@ fun VaultScreen(
         ImportVideoProgressDialog(
             progress = importState.progress,
             onCancel = onCancelImport
+        )
+    }
+
+    if (restoreState is VaultRestoreState.Restoring) {
+        RestoreVideoProgressDialog(
+            currentTitle = restoreState.currentTitle,
+            completedCount = restoreState.completedCount,
+            totalCount = restoreState.totalCount
         )
     }
 
@@ -483,17 +529,30 @@ fun VaultScreen(
                                     Icon(Icons.Default.SelectAll, contentDescription = "تحديد الكل", tint = palette.accent)
                                 }
                                 OutlinedButton(
+                                    onClick = { showBatchRestoreConfirm = true },
+                                    border = BorderStroke(1.dp, palette.accent.copy(alpha = 0.75f))
+                                ) {
+                                    Icon(
+                                        Icons.Default.DriveFileMove,
+                                        contentDescription = null,
+                                        tint = palette.accent,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("إزالة من الخزنة", color = palette.accent, fontSize = 11.sp)
+                                }
+                                OutlinedButton(
                                     onClick = { showBatchDeleteConfirm = true },
                                     border = BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.65f))
                                 ) {
                                     Icon(
-                                        Icons.Default.Delete,
+                                        Icons.Default.DeleteForever,
                                         contentDescription = null,
                                         tint = MaterialTheme.colorScheme.error,
                                         modifier = Modifier.size(16.dp)
                                     )
                                     Spacer(modifier = Modifier.width(4.dp))
-                                    Text("إزالة المحدد", color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
+                                    Text("حذف نهائي", color = MaterialTheme.colorScheme.error, fontSize = 11.sp)
                                 }
                             }
                         }
@@ -724,6 +783,7 @@ fun VaultScreen(
                                     }
                                 },
                                 onRename = { videoToRename = video },
+                                onRestore = { videoToRestore = video },
                                 onDelete = { videoToDelete = video }
                             )
                         }
@@ -743,6 +803,7 @@ fun VaultVideoCard(
     onClick: () -> Unit,
     onLongClick: () -> Unit = {},
     onRename: () -> Unit,
+    onRestore: () -> Unit = {},
     onDelete: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -893,6 +954,13 @@ fun VaultVideoCard(
                     ) {
                         DropdownMenuItem(
                             text = { Text("تغيير الاسم") },
+                            leadingIcon = {
+                                Icon(
+                                    imageVector = Icons.Default.Edit,
+                                    contentDescription = null,
+                                    tint = palette.accent
+                                )
+                            },
                             onClick = {
                                 showMenu = false
                                 onRename()
@@ -902,7 +970,34 @@ fun VaultVideoCard(
                             text = {
                                 Text(
                                     text = "إزالة من الخزنة",
+                                    color = palette.accent,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            },
+                            leadingIcon = {
+                                Icon(
+                                    imageVector = Icons.Default.DriveFileMove,
+                                    contentDescription = null,
+                                    tint = palette.accent
+                                )
+                            },
+                            onClick = {
+                                showMenu = false
+                                onRestore()
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = {
+                                Text(
+                                    text = "حذف نهائي",
                                     color = MaterialTheme.colorScheme.error
+                                )
+                            },
+                            leadingIcon = {
+                                Icon(
+                                    imageVector = Icons.Default.DeleteForever,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.error
                                 )
                             },
                             onClick = {

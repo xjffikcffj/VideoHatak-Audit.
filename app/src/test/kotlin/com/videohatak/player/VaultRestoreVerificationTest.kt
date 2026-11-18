@@ -19,7 +19,8 @@ import com.videohatak.player.core.vault.model.VaultEntryState
 import com.videohatak.player.core.vault.model.VaultHiddenOriginal
 import com.videohatak.player.core.vault.model.VaultVideo
 import com.videohatak.player.core.vault.repository.MediaStorePublicMediaExporter
-import com.videohatak.player.core.vault.repository.PublicMediaExportResult
+import com.videohatak.player.core.vault.repository.PublicExportOutcome
+import com.videohatak.player.core.vault.repository.PublicExportRequest
 import com.videohatak.player.core.vault.repository.PublicMediaExporter
 import com.videohatak.player.core.vault.repository.VaultDeleteOutcome
 import com.videohatak.player.core.vault.repository.VaultImportOutcome
@@ -133,17 +134,9 @@ class VaultRestoreVerificationTest {
         val crypto = VaultCryptoManager(keyStoreProvider = "TEST_PROVIDER")
         val exportCallCounter = AtomicInteger(0)
         val trackingExporter = object : PublicMediaExporter {
-            override suspend fun exportEncryptedVideo(
-                video: VaultVideo,
-                encryptedFile: File,
-                displayName: String,
-                relativePath: String,
-                mimeType: String,
-                expectedContentSha256: String?,
-                expectedSizeBytes: Long
-            ): PublicMediaExportResult {
+            override suspend fun exportVideo(request: PublicExportRequest): PublicExportOutcome {
                 exportCallCounter.incrementAndGet()
-                return PublicMediaExportResult.Failed("Option A must never invoke PublicMediaExporter")
+                return PublicExportOutcome.Failed("Option A must never invoke PublicMediaExporter")
             }
         }
         val repo = buildRepository(crypto = crypto, dbStore = dbHelper, publicMediaExporter = trackingExporter)

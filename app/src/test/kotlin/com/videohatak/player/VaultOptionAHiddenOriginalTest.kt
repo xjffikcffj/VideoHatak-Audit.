@@ -11,10 +11,10 @@ import android.net.Uri
 import android.os.Environment
 import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
-import com.videohatak.player.core.data.repository.VideoFolder
 import com.videohatak.player.core.data.repository.VideoRepository
-import com.videohatak.player.core.data.repository.VideoSortOrder
+import com.videohatak.player.core.model.VideoFolder
 import com.videohatak.player.core.model.VideoItem
+import com.videohatak.player.core.model.VideoSortOrder
 import com.videohatak.player.core.permission.VideoPermissionStatus
 import com.videohatak.player.core.playlist.db.VideoHatakDatabaseHelper
 import com.videohatak.player.core.playlist.repository.PlaylistRepositoryImpl
@@ -26,7 +26,8 @@ import com.videohatak.player.core.vault.model.VaultEntryState
 import com.videohatak.player.core.vault.model.VaultHiddenMatcher
 import com.videohatak.player.core.vault.model.VaultOriginalStorageType
 import com.videohatak.player.core.vault.model.VaultVideo
-import com.videohatak.player.core.vault.repository.PublicMediaExportResult
+import com.videohatak.player.core.vault.repository.PublicExportOutcome
+import com.videohatak.player.core.vault.repository.PublicExportRequest
 import com.videohatak.player.core.vault.repository.PublicMediaExporter
 import com.videohatak.player.core.vault.repository.VaultDeleteOutcome
 import com.videohatak.player.core.vault.repository.VaultImportOutcome
@@ -34,6 +35,7 @@ import com.videohatak.player.core.vault.repository.VaultRepositoryImpl
 import com.videohatak.player.core.vault.repository.VaultRestoreOutcome
 import com.videohatak.player.feature.library.LibraryViewModel
 import com.videohatak.player.feature.playlist.PlaylistViewModel
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
@@ -41,6 +43,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.resetMain
@@ -263,6 +266,10 @@ class VaultOptionAHiddenOriginalTest {
             vaultHiddenEntries = vaultRepo.hiddenOriginalEntries
         )
 
+        val uiStateCollectJob = launch(start = CoroutineStart.UNDISPATCHED) {
+            libVm.uiState.collect {}
+        }
+
         libVm.updatePermissionState(VideoPermissionStatus.FullAccess)
         plRepo.toggleFavoriteDetailed(v1)
         plRepo.toggleFavoriteDetailed(v2)
@@ -292,6 +299,7 @@ class VaultOptionAHiddenOriginalTest {
         advanceUntilIdle()
         assertEquals(listOf(102L), plVm.favoriteItems.value.map { it.videoId })
 
+        uiStateCollectJob.cancel()
         db.close()
         plDb.close()
     }
@@ -372,17 +380,9 @@ class VaultOptionAHiddenOriginalTest {
         val crypto = VaultCryptoManager(keyStoreProvider = "TEST_PROVIDER")
         val exportCalls = AtomicInteger(0)
         val exporter = object : PublicMediaExporter {
-            override suspend fun exportEncryptedVideo(
-                video: VaultVideo,
-                encryptedFile: File,
-                displayName: String,
-                relativePath: String,
-                mimeType: String,
-                expectedContentSha256: String?,
-                expectedSizeBytes: Long
-            ): PublicMediaExportResult {
+            override suspend fun exportVideo(request: PublicExportRequest): PublicExportOutcome {
                 exportCalls.incrementAndGet()
-                return PublicMediaExportResult.Failed("Unexpected exporter call")
+                return PublicExportOutcome.Failed("Unexpected exporter call")
             }
         }
         val repo = VaultRepositoryImpl(testApp(), crypto, db, ioDispatcher = testDispatcher, publicMediaExporter = exporter)

@@ -1,6 +1,7 @@
 package com.videohatak.player.feature.vault
 
 import android.content.Context
+import android.content.IntentSender
 import android.net.Uri
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.ViewModel
@@ -9,8 +10,10 @@ import androidx.lifecycle.viewModelScope
 import com.videohatak.player.core.vault.biometric.VaultBiometricHelper
 import com.videohatak.player.core.vault.model.VaultHiddenOriginal
 import com.videohatak.player.core.vault.model.VaultVideo
+import com.videohatak.player.core.vault.repository.VaultBatchOriginalDeleteOutcome
 import com.videohatak.player.core.vault.repository.VaultDeleteOutcome
 import com.videohatak.player.core.vault.repository.VaultImportOutcome
+import com.videohatak.player.core.vault.repository.VaultOriginalDeleteOutcome
 import com.videohatak.player.core.vault.repository.VaultRepository
 import com.videohatak.player.core.vault.repository.VaultRestoreOutcome
 import com.videohatak.player.core.vault.security.PinChangeResult
@@ -40,6 +43,14 @@ sealed interface VaultUiEvent {
     data class RequestLegacyWritePermission(
         val permission: String,
         val pendingRestoreIds: List<Long>
+    ) : VaultUiEvent
+    data class RequestOriginalDeleteConsent(
+        val intentSender: IntentSender,
+        val vaultIds: List<Long>
+    ) : VaultUiEvent
+    data class RequestLegacyOriginalDeletePermission(
+        val permission: String,
+        val vaultIds: List<Long>
     ) : VaultUiEvent
 }
 
@@ -394,7 +405,7 @@ class VaultViewModel(
     fun importVideoFromUri(
         sourceUri: Uri,
         displayName: String? = null,
-        deleteOriginal: Boolean = false,
+        deleteOriginal: Boolean = true,
         onComplete: (Boolean) -> Unit = {}
     ) {
         importJob?.cancel()
@@ -425,7 +436,9 @@ class VaultViewModel(
                 is VaultImportOutcome.Imported -> {
                     _importState.value = VaultImportState.Success
                     refresh()
-                    if (!deleteOriginal) {
+                    if (deleteOriginal) {
+                        deleteOriginalsInternal(listOf(outcome.video.id), encryptedFailedCount = 0)
+                    } else {
                         _events.tryEmit(VaultUiEvent.ShowMessage("تمت إضافة الفيديو إلى الخزنة وإخفاؤه من المكتبة بنجاح"))
                     }
                     onComplete(true)
@@ -434,8 +447,12 @@ class VaultViewModel(
                     if (outcome.integrityVerified) {
                         _importState.value = VaultImportState.Success
                         refresh()
-                        if (!deleteOriginal) {
+                        if (deleteOriginal && !outcome.existingVideo.isOriginalDeletedProtected) {
+                            deleteOriginalsInternal(listOf(outcome.existingVideo.id), encryptedFailedCount = 0)
+                        } else if (!deleteOriginal) {
                             _events.tryEmit(VaultUiEvent.ShowMessage("هذا الفيديو محفوظ ومشفّر مسبقًا داخل الخزنة"))
+                        } else {
+                            _events.tryEmit(VaultUiEvent.ShowMessage("هذا الفيديو محمي مسبقًا داخل الخزنة الخاصة"))
                         }
                         onComplete(true)
                     } else {
@@ -470,9 +487,227 @@ class VaultViewModel(
         importVideoFromUri(
             sourceUri = uri,
             displayName = title,
-            deleteOriginal = false,
+            deleteOriginal = true,
             onComplete = onComplete
         )
+    }
+
+    fun importVideosToPrivateVault(
+        uris: List<Uri>,
+        onComplete: () -> Unit = {}
+    ) {
+        if (uris.isEmpty()) {
+            onComplete()
+            return
+        }
+        importJob?.cancel()
+        isImportCancelled = false
+        repository.recordActivity(nowMsProvider())
+
+        importJob = viewModelScope.launch {
+            val total = uris.size
+            val vaultIdsToDeleteOriginal = mutableListOf<Long>()
+            var alreadyProtectedCount = 0
+            var failedCount = 0
+            var lastError: String? = null
+
+            for ((index, uri) in uris.withIndex()) {
+                if (isImportCancelled) break
+                _importState.value = VaultImportState.Encrypting(
+                    currentBytes = 0L,
+                    totalBytes = 0L,
+                    progress = (index.toFloat() / total.coerceAtLeast(1)).coerceIn(0f, 0.99f)
+                )
+                when (
+                    val outcome = repository.importVideoDetailed(
+                        sourceUri = uri,
+                        displayName = null,
+                        onProgress = { itemProgress ->
+                            val overall = ((index + itemProgress) / total.coerceAtLeast(1)).coerceIn(0f, 1f)
+                            _importState.update {
+                                if (it is VaultImportState.Encrypting) {
+                                    it.copy(progress = overall)
+                                } else it
+                            }
+                        },
+                        isCancelled = { isImportCancelled }
+                    )
+                ) {
+                    is VaultImportOutcome.Imported -> {
+                        vaultIdsToDeleteOriginal.add(outcome.video.id)
+                    }
+                    is VaultImportOutcome.AlreadyInVault -> {
+                        if (outcome.integrityVerified) {
+                            if (outcome.existingVideo.isOriginalDeletedProtected) {
+                                alreadyProtectedCount++
+                            } else {
+                                vaultIdsToDeleteOriginal.add(outcome.existingVideo.id)
+                            }
+                        } else {
+                            failedCount++
+                            lastError = "تعذر التحقق من سلامة النسخة الموجودة في الخزنة — لم يتم المساس بالملف الأصلي"
+                        }
+                    }
+                    VaultImportOutcome.Cancelled -> break
+                    is VaultImportOutcome.Failed -> {
+                        failedCount++
+                        lastError = outcome.reason
+                    }
+                }
+            }
+
+            if (isImportCancelled) {
+                _importState.value = VaultImportState.Idle
+                refresh()
+                onComplete()
+                return@launch
+            }
+
+            if (vaultIdsToDeleteOriginal.isNotEmpty()) {
+                _importState.value = VaultImportState.Success
+                deleteOriginalsInternal(vaultIdsToDeleteOriginal, encryptedFailedCount = failedCount)
+            } else if (alreadyProtectedCount > 0 && failedCount == 0) {
+                _importState.value = VaultImportState.Success
+                refresh()
+                _events.tryEmit(VaultUiEvent.ShowMessage("الفيديو المختار محمي ومشفّر مسبقًا داخل الخزنة الخاصة"))
+            } else if (failedCount > 0) {
+                _importState.value = VaultImportState.Error(
+                    lastError ?: "فشل تشفير ونقل الفيديو إلى الخزنة — بقيت الملفات الأصلية سليمة"
+                )
+            } else {
+                _importState.value = VaultImportState.Idle
+            }
+            onComplete()
+        }
+    }
+
+    fun deleteOriginalsForVaultEntries(
+        vaultIds: List<Long>,
+        encryptedFailedCount: Int = 0
+    ) {
+        if (vaultIds.isEmpty()) {
+            if (encryptedFailedCount > 0) {
+                _events.tryEmit(
+                    VaultUiEvent.ShowMessage("تعذر تشفير ونقل الفيديو إلى الخزنة — بقيت الملفات الأصلية سليمة")
+                )
+            }
+            return
+        }
+        viewModelScope.launch {
+            deleteOriginalsInternal(vaultIds, encryptedFailedCount)
+        }
+    }
+
+    private suspend fun deleteOriginalsInternal(
+        vaultIds: List<Long>,
+        encryptedFailedCount: Int
+    ) {
+        val outcome = repository.deleteOriginalsForVaultEntries(vaultIds)
+        emitBatchOriginalDeleteFeedback(outcome, encryptedFailedCount)
+    }
+
+    fun onOriginalDeleteConsentResult(granted: Boolean, vaultIds: List<Long>) {
+        if (vaultIds.isEmpty()) return
+        viewModelScope.launch {
+            val outcome = repository.finalizeOriginalsAfterConsent(vaultIds, granted)
+            emitBatchOriginalDeleteFeedback(outcome, encryptedFailedCount = 0)
+        }
+    }
+
+    fun onLegacyOriginalDeletePermissionResult(granted: Boolean, vaultIds: List<Long>) {
+        if (vaultIds.isEmpty()) return
+        if (!granted) {
+            val msg = "لم يُمنح إذن تعديل التخزين لحذف الأصل — بقيت النسخة المشفرة محمية في الخزنة ويمكنك إعادة المحاولة لاحقًا"
+            _actionError.value = msg
+            _events.tryEmit(VaultUiEvent.ShowMessage(msg))
+            return
+        }
+        deleteOriginalsForVaultEntries(vaultIds)
+    }
+
+    fun retryDeleteOriginal(vaultId: Long) {
+        viewModelScope.launch {
+            _actionError.value = null
+            when (val outcome = repository.deleteOriginalForVaultEntry(vaultId)) {
+                is VaultOriginalDeleteOutcome.DeletedVerified -> {
+                    _events.tryEmit(VaultUiEvent.LibraryMediaUpdated)
+                    _events.tryEmit(VaultUiEvent.ShowMessage("تم حذف النسخة الأصلية غير المشفرة والتحقق من إزالتها بنجاح"))
+                }
+                is VaultOriginalDeleteOutcome.RequiresUserConsent -> {
+                    _events.tryEmit(
+                        VaultUiEvent.RequestOriginalDeleteConsent(
+                            intentSender = outcome.intentSender,
+                            vaultIds = listOf(vaultId)
+                        )
+                    )
+                }
+                is VaultOriginalDeleteOutcome.RequiresLegacyWritePermission -> {
+                    _events.tryEmit(
+                        VaultUiEvent.RequestLegacyOriginalDeletePermission(
+                            permission = outcome.permission,
+                            vaultIds = listOf(vaultId)
+                        )
+                    )
+                }
+                is VaultOriginalDeleteOutcome.Failed -> {
+                    _actionError.value = outcome.reason
+                    _events.tryEmit(VaultUiEvent.ShowMessage(outcome.reason))
+                }
+            }
+        }
+    }
+
+    private fun emitBatchOriginalDeleteFeedback(
+        outcome: VaultBatchOriginalDeleteOutcome,
+        encryptedFailedCount: Int
+    ) {
+        val deletedCount = outcome.deletedVerifiedIds.size + outcome.alreadyProtectedIds.size
+        if (deletedCount > 0 || outcome.awaitingConsentIds.isNotEmpty() || outcome.failedReasons.isNotEmpty()) {
+            _events.tryEmit(VaultUiEvent.LibraryMediaUpdated)
+        }
+        val consentSender = outcome.consentIntentSender
+        if (consentSender != null && outcome.awaitingConsentIds.isNotEmpty()) {
+            _events.tryEmit(
+                VaultUiEvent.RequestOriginalDeleteConsent(
+                    intentSender = consentSender,
+                    vaultIds = outcome.awaitingConsentIds
+                )
+            )
+            return
+        }
+        val legacyPerm = outcome.legacyPermissionRequired
+        if (legacyPerm != null && outcome.legacyPermissionVaultIds.isNotEmpty()) {
+            _events.tryEmit(
+                VaultUiEvent.RequestLegacyOriginalDeletePermission(
+                    permission = legacyPerm,
+                    vaultIds = outcome.legacyPermissionVaultIds
+                )
+            )
+            return
+        }
+
+        val failedDeleteCount = outcome.failedReasons.size
+        val firstFailure = outcome.failedReasons.values.firstOrNull()
+        val msg = when {
+            deletedCount > 0 && failedDeleteCount == 0 && encryptedFailedCount == 0 ->
+                if (deletedCount == 1) {
+                    "تم تشفير الفيديو وحذف النسخة الأصلية من الجهاز بنجاح"
+                } else {
+                    "تم تشفير $deletedCount فيديو وحذف نسخها الأصلية من الجهاز بنجاح"
+                }
+            deletedCount > 0 && failedDeleteCount > 0 ->
+                "تم نقل $deletedCount فيديو بنجاح، وتعذر حذف أصل $failedDeleteCount وبقيت نسختها المشفرة محمية"
+            failedDeleteCount > 0 -> {
+                _actionError.value = firstFailure
+                firstFailure ?: "تم حفظ النسخة المشفرة في الخزنة، وتعذر حذف النسخة الأصلية — يمكنك إعادة المحاولة من داخل الخزنة"
+            }
+            encryptedFailedCount > 0 ->
+                "تعذر تشفير ونقل $encryptedFailedCount فيديو — بقيت الملفات الأصلية سليمة"
+            else -> null
+        }
+        if (msg != null) {
+            _events.tryEmit(VaultUiEvent.ShowMessage(msg))
+        }
     }
 
     fun cancelImport() {

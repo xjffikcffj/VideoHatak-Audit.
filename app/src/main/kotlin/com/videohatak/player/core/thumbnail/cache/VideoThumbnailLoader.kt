@@ -31,7 +31,7 @@ object VideoThumbnailLoader {
         }
     }
 
-    fun getCached(videoId: Long): Bitmap? = memoryCache.get(videoId)
+    fun getCached(videoId: Long): Bitmap? = memoryCache.get(videoId)?.takeIf { !it.isRecycled }
 
     suspend fun loadThumbnail(context: Context, videoId: Long, contentUri: Uri): Bitmap? {
         if (MediaNotificationPrivacy.isVaultUri(contentUri)) {
@@ -49,9 +49,9 @@ object VideoThumbnailLoader {
                     } else {
                         extractFrameFallback(context, contentUri)
                     }
-                } catch (_: Exception) {
+                } catch (_: Throwable) {
                     extractFrameFallback(context, contentUri)
-                }
+                }?.takeIf { !it.isRecycled }
 
                 if (bitmap != null) {
                     memoryCache.put(videoId, bitmap)
@@ -72,12 +72,12 @@ object VideoThumbnailLoader {
                 retriever.getFrameAtTime(1_000_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                     ?.let { raw -> ThumbnailRetriever.downscaleIfNeeded(raw, 320, 180) }
             }
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             null
         } finally {
             try {
                 retriever.release()
-            } catch (_: Exception) {
+            } catch (_: Throwable) {
             }
         }
     }

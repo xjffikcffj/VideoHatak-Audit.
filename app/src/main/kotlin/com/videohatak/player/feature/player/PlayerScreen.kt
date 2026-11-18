@@ -745,7 +745,11 @@ fun PlayerScreen(
                     } else {
                         val legacyPerm = PermissionHelper.getLegacyWritePermission()
                         if (legacyPerm != null && !PermissionHelper.hasLegacyWritePermission(context)) {
-                            legacyWritePermissionLauncher.launch(legacyPerm)
+                            runCatching {
+                                legacyWritePermissionLauncher.launch(legacyPerm)
+                            }.onFailure {
+                                statusBannerText = "تعذر فتح نافذة طلب إذن التخزين"
+                            }
                         } else {
                             performFrameCapture()
                         }
@@ -949,7 +953,12 @@ fun PlayerScreen(
                     pendingExportSubtitleContent = viewModel.exportTrackAsText(track, format)
                     val ext = if (format == SubtitleFormat.WEBVTT) "vtt" else "srt"
                     val base = track.name.substringBeforeLast('.').ifBlank { "subtitle" }
-                    subtitleExportLauncher.launch("${base}_edited.$ext")
+                    runCatching {
+                        subtitleExportLauncher.launch("${base}_edited.$ext")
+                    }.onFailure {
+                        pendingExportSubtitleContent = null
+                        statusBannerText = "تعذر فتح نافذة تصدير ملف الترجمة على هذا الجهاز"
+                    }
                 },
                 onDismiss = { trackForLocalEdit = null }
             )
@@ -987,7 +996,12 @@ fun PlayerScreen(
                 onExportTranslated = { exportedContent, format ->
                     pendingExportSubtitleContent = exportedContent
                     val ext = if (format == SubtitleFormat.WEBVTT) "vtt" else "srt"
-                    subtitleExportLauncher.launch("${activeVideoItem.safeTitle}_translated.$ext")
+                    runCatching {
+                        subtitleExportLauncher.launch("${activeVideoItem.safeTitle}_translated.$ext")
+                    }.onFailure {
+                        pendingExportSubtitleContent = null
+                        statusBannerText = "تعذر فتح نافذة تصدير الترجمة على هذا الجهاز"
+                    }
                 },
                 onDismiss = { showSmartTranslationDialog = false },
                 engineMode = translationEngineMode,

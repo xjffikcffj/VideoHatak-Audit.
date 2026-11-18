@@ -777,10 +777,15 @@ class LocalVideoRepositoryImpl(
         try {
             if (uri.scheme == ContentResolver.SCHEME_FILE) {
                 val file = uri.path?.let { File(it) }
-                if (file == null || !file.exists() || file.delete()) {
+                if (file == null || !file.exists()) {
                     return UriDeleteAttempt.Deleted
                 }
-                return UriDeleteAttempt.Failed
+                val deleted = runCatching { file.delete() }.getOrDefault(false)
+                return if (deleted && !file.exists()) {
+                    UriDeleteAttempt.Deleted
+                } else {
+                    UriDeleteAttempt.Failed
+                }
             }
 
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q && isMediaStoreUri(uri)) {
@@ -796,28 +801,52 @@ class LocalVideoRepositoryImpl(
                 }
                 if (!filePath.isNullOrBlank()) {
                     val file = File(filePath)
-                    if (file.exists()) file.delete()
+                    if (file.exists()) {
+                        runCatching { file.delete() }
+                    }
                 }
             }
 
             if (DocumentsContract.isDocumentUri(context, uri)) {
+                val supportsDelete = runCatching {
+                    contentResolver.query(
+                        uri,
+                        arrayOf(DocumentsContract.Document.COLUMN_FLAGS),
+                        null,
+                        null,
+                        null
+                    )?.use { c ->
+                        val col = c.getColumnIndex(DocumentsContract.Document.COLUMN_FLAGS)
+                        if (col >= 0 && c.moveToFirst()) {
+                            (c.getInt(col) and DocumentsContract.Document.FLAG_SUPPORTS_DELETE) != 0
+                        } else {
+                            true
+                        }
+                    } ?: true
+                }.getOrDefault(true)
+                if (!supportsDelete) {
+                    return UriDeleteAttempt.Failed
+                }
                 val docDeleted = runCatching {
                     DocumentsContract.deleteDocument(contentResolver, uri)
                 }.getOrDefault(false)
-                if (docDeleted) return UriDeleteAttempt.Deleted
+                if (docDeleted && !isUriStillPresent(uri)) {
+                    return UriDeleteAttempt.Deleted
+                }
+                if (!isUriStillPresent(uri)) {
+                    return UriDeleteAttempt.Deleted
+                }
+                return UriDeleteAttempt.Failed
             }
 
             val deletedRows = contentResolver.delete(uri, null, null)
-            if (deletedRows > 0) return UriDeleteAttempt.Deleted
-
-            val stillExists = try {
-                contentResolver.openAssetFileDescriptor(uri, "r")?.use { true } ?: false
-            } catch (_: java.io.FileNotFoundException) {
-                false
-            } catch (_: Exception) {
-                true
+            if (deletedRows > 0 && !isUriStillPresent(uri)) {
+                return UriDeleteAttempt.Deleted
             }
-            if (!stillExists) return UriDeleteAttempt.Deleted
+
+            if (!isUriStillPresent(uri)) {
+                return UriDeleteAttempt.Deleted
+            }
 
             return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && isMediaStoreUri(uri)) {
                 UriDeleteAttempt.NeedsConsent()

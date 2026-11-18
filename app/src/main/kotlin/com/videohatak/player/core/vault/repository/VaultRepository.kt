@@ -1,9 +1,12 @@
 package com.videohatak.player.core.vault.repository
 
+import android.app.RecoverableSecurityException
 import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
+import android.content.IntentSender
 import android.media.MediaMetadataRetriever
+import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -12,6 +15,7 @@ import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.util.Log
+import com.videohatak.player.core.permission.PermissionHelper
 import com.videohatak.player.core.vault.crypto.VaultBase64
 import com.videohatak.player.core.vault.crypto.VaultCryptoManager
 import com.videohatak.player.core.vault.db.VaultDatabaseHelper
@@ -93,6 +97,306 @@ sealed interface VaultDeleteOutcome {
     data class Failed(val reason: String) : VaultDeleteOutcome
 }
 
+sealed interface VaultOriginalDeleteOutcome {
+    data class DeletedVerified(val video: VaultVideo) : VaultOriginalDeleteOutcome
+    data class RequiresUserConsent(
+        val video: VaultVideo,
+        val intentSender: IntentSender,
+        val targetUri: Uri
+    ) : VaultOriginalDeleteOutcome
+    data class RequiresLegacyWritePermission(
+        val permission: String,
+        val vaultId: Long
+    ) : VaultOriginalDeleteOutcome
+    data class Failed(
+        val video: VaultVideo,
+        val reason: String,
+        val encryptedCopyPreserved: Boolean = true
+    ) : VaultOriginalDeleteOutcome
+}
+
+data class VaultBatchOriginalDeleteOutcome(
+    val deletedVerifiedIds: List<Long> = emptyList(),
+    val alreadyProtectedIds: List<Long> = emptyList(),
+    val awaitingConsentIds: List<Long> = emptyList(),
+    val consentIntentSender: IntentSender? = null,
+    val legacyPermissionRequired: String? = null,
+    val legacyPermissionVaultIds: List<Long> = emptyList(),
+    val failedReasons: Map<Long, String> = emptyMap()
+)
+
+internal interface VaultOriginalDeleter {
+    sealed interface SingleDeleteAttempt {
+        data object Deleted : SingleDeleteAttempt
+        data class NeedsUserConsent(val intentSender: IntentSender, val targetUri: Uri) : SingleDeleteAttempt
+        data class NeedsLegacyWritePermission(val permission: String) : SingleDeleteAttempt
+        data class Failed(val reason: String) : SingleDeleteAttempt
+    }
+
+    fun attemptDeleteOriginal(ref: VaultOriginalReference): SingleDeleteAttempt
+    fun isOriginalStillPresent(ref: VaultOriginalReference): Boolean
+    fun createBatchDeleteIntentSender(refs: List<Pair<Long, VaultOriginalReference>>): IntentSender? = null
+}
+
+internal class AndroidVaultOriginalDeleter(
+    private val context: Context,
+    private val sdkIntProvider: () -> Int = { Build.VERSION.SDK_INT }
+) : VaultOriginalDeleter {
+
+    private fun resolveTargetUri(ref: VaultOriginalReference): Uri? {
+        val rawUri = ref.originalUri.trim()
+        if (ref.originalMediaStoreId != null && ref.originalMediaStoreId > 0L) {
+            if (rawUri.isBlank() || rawUri.startsWith("content://media/", ignoreCase = true)) {
+                return ContentUris.withAppendedId(
+                    MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                    ref.originalMediaStoreId
+                )
+            }
+        }
+        if (rawUri.isNotBlank()) {
+            return runCatching { Uri.parse(rawUri) }.getOrNull()
+        }
+        if (ref.originalFilePath.isNotBlank()) {
+            return Uri.fromFile(File(ref.originalFilePath))
+        }
+        return null
+    }
+
+    private fun resolveMediaStoreUri(ref: VaultOriginalReference): Uri? {
+        if (ref.originalMediaStoreId != null && ref.originalMediaStoreId > 0L) {
+            return ContentUris.withAppendedId(
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                ref.originalMediaStoreId
+            )
+        }
+        val raw = ref.originalUri.trim()
+        if (raw.startsWith("content://media/", ignoreCase = true)) {
+            return runCatching { Uri.parse(raw) }.getOrNull()
+        }
+        return null
+    }
+
+    override fun isOriginalStillPresent(ref: VaultOriginalReference): Boolean {
+        val rawUri = ref.originalUri.trim()
+        if (rawUri.isNotBlank()) {
+            val uri = runCatching { Uri.parse(rawUri) }.getOrNull()
+            if (uri != null) {
+                if (uri.scheme.equals("file", ignoreCase = true)) {
+                    val file = uri.path?.let { File(it) }
+                    if (file != null && file.exists()) return true
+                } else if (uri.scheme.equals("content", ignoreCase = true)) {
+                    val hasRow = runCatching {
+                        context.contentResolver.query(uri, arrayOf("_id"), null, null, null)?.use { c ->
+                            c.moveToFirst()
+                        } ?: false
+                    }.getOrDefault(false)
+                    if (hasRow) return true
+                }
+            }
+        }
+        if (ref.originalMediaStoreId != null && ref.originalMediaStoreId > 0L) {
+            val msUri = ContentUris.withAppendedId(
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                ref.originalMediaStoreId
+            )
+            val hasMsRow = runCatching {
+                context.contentResolver.query(msUri, arrayOf(MediaStore.Video.Media._ID), null, null, null)?.use { c ->
+                    c.moveToFirst()
+                } ?: false
+            }.getOrDefault(false)
+            if (hasMsRow) return true
+        }
+        if (ref.originalFilePath.isNotBlank()) {
+            val diskFile = File(ref.originalFilePath)
+            if (diskFile.exists()) return true
+        }
+        return false
+    }
+
+    override fun createBatchDeleteIntentSender(refs: List<Pair<Long, VaultOriginalReference>>): IntentSender? {
+        if (sdkIntProvider() < Build.VERSION_CODES.R) return null
+        val mediaUris = refs.mapNotNull { (_, ref) -> resolveMediaStoreUri(ref) }.distinct()
+        if (mediaUris.isEmpty()) return null
+        return runCatching {
+            MediaStore.createDeleteRequest(context.contentResolver, mediaUris).intentSender
+        }.getOrNull()
+    }
+
+    override fun attemptDeleteOriginal(ref: VaultOriginalReference): VaultOriginalDeleter.SingleDeleteAttempt {
+        val targetUri = resolveTargetUri(ref)
+            ?: return VaultOriginalDeleter.SingleDeleteAttempt.Failed(
+                "لا يوجد مرجع صالح للملف الأصلي على الجهاز — تم الحفاظ على النسخة المشفرة بأمان"
+            )
+
+        if (!isOriginalStillPresent(ref)) {
+            return VaultOriginalDeleter.SingleDeleteAttempt.Deleted
+        }
+
+        val sdkInt = sdkIntProvider()
+
+        if (targetUri.scheme.equals("file", ignoreCase = true)) {
+            val perm = PermissionHelper.getLegacyWritePermissionForSdk(sdkInt)
+            if (perm != null && !PermissionHelper.hasLegacyWritePermission(context)) {
+                return VaultOriginalDeleter.SingleDeleteAttempt.NeedsLegacyWritePermission(perm)
+            }
+            val file = targetUri.path?.let { File(it) }
+            if (file != null && file.exists()) {
+                val deleted = runCatching { file.delete() }.getOrDefault(false)
+                if (!deleted && file.exists()) {
+                    return VaultOriginalDeleter.SingleDeleteAttempt.Failed(
+                        "تعذر حذف الملف الأصلي من وحدة التخزين — بقيت النسخة المشفرة آمنة في الخزنة"
+                    )
+                }
+                if (ref.originalMediaStoreId != null && ref.originalMediaStoreId > 0L) {
+                    val msUri = ContentUris.withAppendedId(
+                        MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                        ref.originalMediaStoreId
+                    )
+                    runCatching { context.contentResolver.delete(msUri, null, null) }
+                } else {
+                    runCatching {
+                        @Suppress("DEPRECATION")
+                        context.contentResolver.delete(
+                            MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                            "${MediaStore.Video.Media.DATA} = ?",
+                            arrayOf(file.absolutePath)
+                        )
+                    }
+                    runCatching {
+                        MediaScannerConnection.scanFile(context, arrayOf(file.absolutePath), null, null)
+                    }
+                }
+            }
+            return if (!isOriginalStillPresent(ref)) {
+                VaultOriginalDeleter.SingleDeleteAttempt.Deleted
+            } else {
+                VaultOriginalDeleter.SingleDeleteAttempt.Failed(
+                    "لم يختفِ الملف الأصلي بعد محاولة الحذف — يمكنك المحاولة مجددًا بأمان"
+                )
+            }
+        }
+
+        val isDocumentUri = runCatching { DocumentsContract.isDocumentUri(context, targetUri) }.getOrDefault(false)
+        if (isDocumentUri) {
+            val supportsDelete = runCatching {
+                context.contentResolver.query(
+                    targetUri,
+                    arrayOf(DocumentsContract.Document.COLUMN_FLAGS),
+                    null,
+                    null,
+                    null
+                )?.use { cursor ->
+                    if (!cursor.moveToFirst()) return@use false
+                    val col = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_FLAGS)
+                    if (col < 0) return@use false
+                    (cursor.getInt(col) and DocumentsContract.Document.FLAG_SUPPORTS_DELETE) != 0
+                } ?: false
+            }.getOrDefault(false)
+
+            if (!supportsDelete) {
+                return VaultOriginalDeleter.SingleDeleteAttempt.Failed(
+                    "مزوّد التخزين الخارجي لا يدعم حذف هذا الملف تلقائيًا — بقيت النسخة المشفرة محفوظة بأمان"
+                )
+            }
+
+            try {
+                val docDeleted = DocumentsContract.deleteDocument(context.contentResolver, targetUri)
+                if (!docDeleted && isOriginalStillPresent(ref)) {
+                    return VaultOriginalDeleter.SingleDeleteAttempt.Failed(
+                        "تعذر حذف الملف من مزوّد المستندات — بقيت النسخة المشفرة محمية في الخزنة"
+                    )
+                }
+            } catch (e: SecurityException) {
+                if (sdkInt >= Build.VERSION_CODES.Q && e is RecoverableSecurityException) {
+                    return VaultOriginalDeleter.SingleDeleteAttempt.NeedsUserConsent(
+                        intentSender = e.userAction.actionIntent.intentSender,
+                        targetUri = targetUri
+                    )
+                }
+                return VaultOriginalDeleter.SingleDeleteAttempt.Failed(
+                    "يتطلب حذف الملف من مزوّد المستندات صلاحية إضافية — بقيت النسخة المشفرة محمية"
+                )
+            } catch (e: Exception) {
+                return VaultOriginalDeleter.SingleDeleteAttempt.Failed(
+                    e.localizedMessage?.takeIf { it.isNotBlank() }
+                        ?: "تعذر حذف الملف الأصلي من مزوّد المستندات"
+                )
+            }
+
+            return if (!isOriginalStillPresent(ref)) {
+                VaultOriginalDeleter.SingleDeleteAttempt.Deleted
+            } else {
+                VaultOriginalDeleter.SingleDeleteAttempt.Failed(
+                    "تم التحقق بعد العملية ووجدنا أن الملف الأصلي ما زال موجودًا"
+                )
+            }
+        }
+
+        // MediaStore or generic content URI
+        val isMediaStore = targetUri.authority == MediaStore.AUTHORITY ||
+            targetUri.toString().startsWith("content://media/", ignoreCase = true) ||
+            (ref.originalMediaStoreId != null && ref.originalMediaStoreId > 0L)
+
+        if (sdkInt < Build.VERSION_CODES.Q) {
+            val perm = PermissionHelper.getLegacyWritePermissionForSdk(sdkInt)
+            if (perm != null && !PermissionHelper.hasLegacyWritePermission(context)) {
+                return VaultOriginalDeleter.SingleDeleteAttempt.NeedsLegacyWritePermission(perm)
+            }
+        }
+
+        try {
+            val deletedRows = context.contentResolver.delete(targetUri, null, null)
+            if (deletedRows > 0 && ref.originalFilePath.isNotBlank()) {
+                val diskFile = File(ref.originalFilePath)
+                if (diskFile.exists()) {
+                    runCatching { diskFile.delete() }
+                }
+            }
+            if (!isOriginalStillPresent(ref)) {
+                return VaultOriginalDeleter.SingleDeleteAttempt.Deleted
+            }
+            if (isMediaStore && sdkInt >= Build.VERSION_CODES.R) {
+                val sender = runCatching {
+                    MediaStore.createDeleteRequest(context.contentResolver, listOf(targetUri)).intentSender
+                }.getOrNull()
+                if (sender != null) {
+                    return VaultOriginalDeleter.SingleDeleteAttempt.NeedsUserConsent(sender, targetUri)
+                }
+            }
+            return VaultOriginalDeleter.SingleDeleteAttempt.Failed(
+                "ما زال الملف الأصلي ظاهرًا بعد محاولة الحذف — يمكنك المحاولة مجددًا دون فقدان النسخة المشفرة"
+            )
+        } catch (se: SecurityException) {
+            if (sdkInt >= Build.VERSION_CODES.R && isMediaStore) {
+                val sender = runCatching {
+                    MediaStore.createDeleteRequest(context.contentResolver, listOf(targetUri)).intentSender
+                }.getOrNull()
+                if (sender != null) {
+                    return VaultOriginalDeleter.SingleDeleteAttempt.NeedsUserConsent(sender, targetUri)
+                }
+            } else if (sdkInt >= Build.VERSION_CODES.Q && se is RecoverableSecurityException) {
+                return VaultOriginalDeleter.SingleDeleteAttempt.NeedsUserConsent(
+                    intentSender = se.userAction.actionIntent.intentSender,
+                    targetUri = targetUri
+                )
+            } else if (sdkInt < Build.VERSION_CODES.Q) {
+                val perm = PermissionHelper.getLegacyWritePermissionForSdk(sdkInt)
+                if (perm != null) {
+                    return VaultOriginalDeleter.SingleDeleteAttempt.NeedsLegacyWritePermission(perm)
+                }
+            }
+            return VaultOriginalDeleter.SingleDeleteAttempt.Failed(
+                "يتطلب حذف الملف الأصلي موافقة النظام — بقيت النسخة المشفرة محمية في الخزنة"
+            )
+        } catch (e: Exception) {
+            return VaultOriginalDeleter.SingleDeleteAttempt.Failed(
+                e.localizedMessage?.takeIf { it.isNotBlank() }
+                    ?: "تعذر حذف الملف الأصلي — بقيت النسخة المشفرة محمية في الخزنة"
+            )
+        }
+    }
+}
+
 interface VaultRepository {
     val vaultVideos: Flow<List<VaultVideo>>
     val isUnlocked: StateFlow<Boolean>
@@ -147,6 +451,32 @@ interface VaultRepository {
             isCancelled = isCancelled
         )
     }
+    suspend fun deleteOriginalForVaultEntry(vaultId: Long): VaultOriginalDeleteOutcome {
+        return VaultOriginalDeleteOutcome.Failed(
+            video = VaultVideo(
+                id = vaultId,
+                displayName = "",
+                originalSizeBytes = 0L,
+                encryptedSizeBytes = 0L,
+                durationMs = 0L,
+                relativeEncryptedPath = "",
+                createdAtEpochMs = 0L
+            ),
+            reason = "حذف النسخة الأصلية غير مدعوم في هذا المزوّد",
+            encryptedCopyPreserved = true
+        )
+    }
+    suspend fun deleteOriginalsForVaultEntries(vaultIds: List<Long>): VaultBatchOriginalDeleteOutcome {
+        return VaultBatchOriginalDeleteOutcome(
+            failedReasons = vaultIds.associateWith { "حذف النسخة الأصلية غير مدعوم في هذا المزوّد" }
+        )
+    }
+    suspend fun finalizeOriginalsAfterConsent(
+        vaultIds: List<Long>,
+        granted: Boolean
+    ): VaultBatchOriginalDeleteOutcome {
+        return VaultBatchOriginalDeleteOutcome()
+    }
     suspend fun renameVideo(videoId: Long, newTitle: String): Boolean
     suspend fun restoreVaultVideo(id: Long): VaultRestoreOutcome {
         return VaultRestoreOutcome.Failed(
@@ -172,9 +502,9 @@ class VaultRepositoryImpl internal constructor(
     private val dbHelper: VaultDatabaseStore = VaultDatabaseHelper(context),
     private val contentSha256Computer: ((InputStream) -> String)? = null,
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
-    @Suppress("unused")
     private val publicMediaExporter: PublicMediaExporter? = null,
-    private val uriPermissionChecker: ((Uri) -> Boolean)? = null
+    private val uriPermissionChecker: ((Uri) -> Boolean)? = null,
+    private val originalDeleter: VaultOriginalDeleter? = null
 ) : VaultRepository {
 
     internal constructor(
@@ -190,7 +520,8 @@ class VaultRepositoryImpl internal constructor(
         contentSha256Computer = contentSha256Computer,
         ioDispatcher = ioDispatcher,
         publicMediaExporter = null,
-        uriPermissionChecker = null
+        uriPermissionChecker = null,
+        originalDeleter = null
     )
 
     companion object {
@@ -211,6 +542,21 @@ class VaultRepositoryImpl internal constructor(
 
     private val vaultDir: File = File(context.filesDir, "vault_encrypted").apply {
         if (!exists()) mkdirs()
+    }
+
+    private val restoreTempDir: File = File(context.cacheDir, "vault_restore_tmp").apply {
+        if (!exists()) mkdirs()
+    }
+
+    private val resolvedOriginalDeleter: VaultOriginalDeleter by lazy {
+        originalDeleter ?: AndroidVaultOriginalDeleter(context)
+    }
+
+    private val resolvedPublicMediaExporter: PublicMediaExporter by lazy {
+        publicMediaExporter ?: MediaStorePublicMediaExporter(
+            context = context,
+            cryptoManager = cryptoManager
+        )
     }
 
     private val _isUnlocked = MutableStateFlow(false)
@@ -387,13 +733,48 @@ class VaultRepositoryImpl internal constructor(
                         }
                     }
                 }
+                VaultEntryState.ORIGIN_DELETE_PENDING -> {
+                    val metaJson = row.encryptedMetaBase64
+                        ?.takeIf { it.isNotBlank() }
+                        ?.let { enc -> runCatching { JSONObject(cryptoManager.decryptMetadata(enc)) }.getOrNull() }
+                    val ref = extractOriginalReference(row, metaJson)
+                    val stillPresent = runCatching { resolvedOriginalDeleter.isOriginalStillPresent(ref) }.getOrDefault(true)
+                    if (!stillPresent && encFile.exists() && encFile.length() > 0L) {
+                        runCatching {
+                            dbHelper.updateOriginalDeletionStatus(
+                                id = row.id,
+                                vaultState = VaultEntryState.ORIGINAL_DELETED_VERIFIED,
+                                isHiddenInLibrary = true,
+                                originalDeleteVerified = true,
+                                stateUpdatedAtMs = System.currentTimeMillis(),
+                                lastError = null
+                            )
+                        }
+                    } else {
+                        runCatching {
+                            dbHelper.updateOriginalDeletionStatus(
+                                id = row.id,
+                                vaultState = VaultEntryState.ORIGINAL_DELETE_FAILED,
+                                isHiddenInLibrary = true,
+                                originalDeleteVerified = false,
+                                stateUpdatedAtMs = System.currentTimeMillis(),
+                                lastError = "انقطعت عملية حذف النسخة الأصلية — بقيت النسخة المشفرة محمية ويمكن إعادة حذف الأصل"
+                            )
+                        }
+                    }
+                }
                 VaultEntryState.RESTORING -> {
-                    // Interrupted restore before un-hide completed: keep original safely hidden & Vault payload intact.
+                    // Interrupted restore before completion: restore safe prior state & keep Vault payload intact.
                     if (encFile.exists() && encFile.length() > 0L) {
+                        val recoveredState = if (row.isOriginalDeletedProtected) {
+                            VaultEntryState.ORIGINAL_DELETED_VERIFIED
+                        } else {
+                            VaultEntryState.ORIGINAL_HIDDEN
+                        }
                         runCatching {
                             dbHelper.updateVaultState(
                                 id = row.id,
-                                vaultState = VaultEntryState.ORIGINAL_HIDDEN,
+                                vaultState = recoveredState,
                                 isHiddenInLibrary = true,
                                 stateUpdatedAtMs = System.currentTimeMillis(),
                                 lastError = row.lastError
@@ -402,7 +783,7 @@ class VaultRepositoryImpl internal constructor(
                     }
                 }
                 VaultEntryState.ORIGINAL_RESTORED_VERIFIED -> {
-                    // Original was verified and un-hidden before crash; finish deferred .enc + DB cleanup safely.
+                    // Original was verified/exported before crash; finish deferred .enc + DB cleanup safely.
                     val staged = File(vaultDir, "${encFile.name}.${System.currentTimeMillis()}.pending_delete")
                     val movedOrGone = !encFile.exists() || runCatching { encFile.renameTo(staged) }.getOrDefault(false)
                     if (movedOrGone) {
@@ -424,6 +805,13 @@ class VaultRepositoryImpl internal constructor(
     }
 
     private fun reconcileVaultStorageLocked(rows: List<VaultVideo>) {
+        if (inFlightRestoreIds.isEmpty()) {
+            restoreTempDir.listFiles()?.forEach { tmpFile ->
+                if (tmpFile.isFile) {
+                    runCatching { tmpFile.delete() }
+                }
+            }
+        }
         val activeFileNames = buildSet {
             rows.forEach { row ->
                 if (row.vaultState != VaultEntryState.ORIGINAL_RESTORED_VERIFIED) {
@@ -1168,6 +1556,9 @@ class VaultRepositoryImpl internal constructor(
     }
 
     private fun ensureHiddenOriginalTransitionIfTracked(row: VaultVideo) {
+        if (row.isOriginalDeletedProtected || row.needsOriginalDeletionAttention) {
+            return
+        }
         if (row.vaultState != VaultEntryState.ORIGINAL_HIDDEN &&
             (row.originalUri.isNotBlank() || row.originalFilePath.isNotBlank() || row.originalMediaStoreId != null)
         ) {
@@ -1483,6 +1874,435 @@ class VaultRepositoryImpl internal constructor(
         }
     }
 
+    override suspend fun deleteOriginalForVaultEntry(
+        vaultId: Long
+    ): VaultOriginalDeleteOutcome = withContext(ioDispatcher) {
+        repoMutex.withLock {
+            val row = dbHelper.getVideoById(vaultId)
+                ?: return@withContext VaultOriginalDeleteOutcome.Failed(
+                    video = VaultVideo(
+                        id = vaultId,
+                        displayName = "",
+                        originalSizeBytes = 0L,
+                        encryptedSizeBytes = 0L,
+                        durationMs = 0L,
+                        relativeEncryptedPath = "",
+                        createdAtEpochMs = 0L
+                    ),
+                    reason = "تعذر العثور على الفيديو داخل قاعدة بيانات الخزنة",
+                    encryptedCopyPreserved = true
+                )
+            val decoded = decodeVaultRow(row) ?: row
+            if (row.isOriginalDeletedProtected) {
+                return@withContext VaultOriginalDeleteOutcome.DeletedVerified(decoded)
+            }
+            val encFile = resolveEncryptedFile(decoded)
+            if (!encFile.exists() || !encFile.isFile || encFile.length() <= 0L || !isEncryptedContainerValid(encFile)) {
+                val msg = "تعذر التحقق من صلاحية النسخة المشفرة قبل حذف الأصل — لم يُحذف الملف الأصلي"
+                _vaultError.value = msg
+                return@withContext VaultOriginalDeleteOutcome.Failed(decoded, msg, encryptedCopyPreserved = true)
+            }
+
+            val metaJson = row.encryptedMetaBase64
+                ?.takeIf { it.isNotBlank() }
+                ?.let { enc -> runCatching { JSONObject(cryptoManager.decryptMetadata(enc)) }.getOrNull() }
+            val ref = extractOriginalReference(row, metaJson)
+
+            runCatching {
+                dbHelper.updateOriginalDeletionStatus(
+                    id = vaultId,
+                    vaultState = VaultEntryState.ORIGIN_DELETE_PENDING,
+                    isHiddenInLibrary = true,
+                    originalDeleteVerified = false,
+                    stateUpdatedAtMs = System.currentTimeMillis(),
+                    lastError = null
+                )
+            }
+
+            when (val attempt = resolvedOriginalDeleter.attemptDeleteOriginal(ref)) {
+                is VaultOriginalDeleter.SingleDeleteAttempt.Deleted -> {
+                    val stillPresent = runCatching { resolvedOriginalDeleter.isOriginalStillPresent(ref) }.getOrDefault(true)
+                    if (!stillPresent) {
+                        runCatching {
+                            dbHelper.updateOriginalDeletionStatus(
+                                id = vaultId,
+                                vaultState = VaultEntryState.ORIGINAL_DELETED_VERIFIED,
+                                isHiddenInLibrary = true,
+                                originalDeleteVerified = true,
+                                stateUpdatedAtMs = System.currentTimeMillis(),
+                                lastError = null
+                            )
+                        }
+                        refreshLocked()
+                        VaultOriginalDeleteOutcome.DeletedVerified(
+                            decoded.copy(
+                                vaultState = VaultEntryState.ORIGINAL_DELETED_VERIFIED,
+                                isHiddenInLibrary = true,
+                                originalDeleteVerified = true,
+                                lastError = null
+                            )
+                        )
+                    } else {
+                        val reason = "ما زال الملف الأصلي موجودًا على الجهاز بعد محاولة الحذف — بقيت النسخة المشفرة محمية"
+                        runCatching {
+                            dbHelper.updateOriginalDeletionStatus(
+                                id = vaultId,
+                                vaultState = VaultEntryState.ORIGINAL_DELETE_FAILED,
+                                isHiddenInLibrary = true,
+                                originalDeleteVerified = false,
+                                stateUpdatedAtMs = System.currentTimeMillis(),
+                                lastError = reason
+                            )
+                        }
+                        refreshLocked()
+                        VaultOriginalDeleteOutcome.Failed(decoded, reason, encryptedCopyPreserved = true)
+                    }
+                }
+                is VaultOriginalDeleter.SingleDeleteAttempt.NeedsUserConsent -> {
+                    val consentMsg = "بانتظار موافقة النظام لحذف النسخة الأصلية غير المشفرة من الجهاز"
+                    runCatching {
+                        dbHelper.updateOriginalDeletionStatus(
+                            id = vaultId,
+                            vaultState = VaultEntryState.AWAITING_ORIGINAL_DELETE_CONSENT,
+                            isHiddenInLibrary = true,
+                            originalDeleteVerified = false,
+                            stateUpdatedAtMs = System.currentTimeMillis(),
+                            lastError = consentMsg
+                        )
+                    }
+                    refreshLocked()
+                    VaultOriginalDeleteOutcome.RequiresUserConsent(
+                        video = decoded.copy(
+                            vaultState = VaultEntryState.AWAITING_ORIGINAL_DELETE_CONSENT,
+                            isHiddenInLibrary = true,
+                            originalDeleteVerified = false,
+                            lastError = consentMsg
+                        ),
+                        intentSender = attempt.intentSender,
+                        targetUri = attempt.targetUri
+                    )
+                }
+                is VaultOriginalDeleter.SingleDeleteAttempt.NeedsLegacyWritePermission -> {
+                    val permMsg = "يتطلب حذف النسخة الأصلية على هذا الإصدار من أندرويد إذن تعديل التخزين"
+                    runCatching {
+                        dbHelper.updateOriginalDeletionStatus(
+                            id = vaultId,
+                            vaultState = VaultEntryState.ORIGINAL_DELETE_FAILED,
+                            isHiddenInLibrary = true,
+                            originalDeleteVerified = false,
+                            stateUpdatedAtMs = System.currentTimeMillis(),
+                            lastError = permMsg
+                        )
+                    }
+                    refreshLocked()
+                    VaultOriginalDeleteOutcome.RequiresLegacyWritePermission(
+                        permission = attempt.permission,
+                        vaultId = vaultId
+                    )
+                }
+                is VaultOriginalDeleter.SingleDeleteAttempt.Failed -> {
+                    runCatching {
+                        dbHelper.updateOriginalDeletionStatus(
+                            id = vaultId,
+                            vaultState = VaultEntryState.ORIGINAL_DELETE_FAILED,
+                            isHiddenInLibrary = true,
+                            originalDeleteVerified = false,
+                            stateUpdatedAtMs = System.currentTimeMillis(),
+                            lastError = attempt.reason
+                        )
+                    }
+                    refreshLocked()
+                    VaultOriginalDeleteOutcome.Failed(
+                        video = decoded.copy(
+                            vaultState = VaultEntryState.ORIGINAL_DELETE_FAILED,
+                            isHiddenInLibrary = true,
+                            originalDeleteVerified = false,
+                            lastError = attempt.reason
+                        ),
+                        reason = attempt.reason,
+                        encryptedCopyPreserved = true
+                    )
+                }
+            }
+        }
+    }
+
+    override suspend fun deleteOriginalsForVaultEntries(
+        vaultIds: List<Long>
+    ): VaultBatchOriginalDeleteOutcome = withContext(ioDispatcher) {
+        if (vaultIds.isEmpty()) return@withContext VaultBatchOriginalDeleteOutcome()
+        repoMutex.withLock {
+            val deletedIds = mutableListOf<Long>()
+            val alreadyProtectedIds = mutableListOf<Long>()
+            val awaitingConsentRefs = mutableListOf<Pair<Long, VaultOriginalReference>>()
+            var fallbackConsentSender: IntentSender? = null
+            var legacyPermission: String? = null
+            val legacyVaultIds = mutableListOf<Long>()
+            val failedReasons = mutableMapOf<Long, String>()
+
+            for (vaultId in vaultIds.distinct()) {
+                val row = dbHelper.getVideoById(vaultId)
+                if (row == null) {
+                    failedReasons[vaultId] = "تعذر العثور على سجل الفيديو داخل الخزنة"
+                    continue
+                }
+                if (row.isOriginalDeletedProtected) {
+                    alreadyProtectedIds.add(vaultId)
+                    continue
+                }
+                val decoded = decodeVaultRow(row) ?: row
+                val encFile = resolveEncryptedFile(decoded)
+                if (!encFile.exists() || !encFile.isFile || encFile.length() <= 0L || !isEncryptedContainerValid(encFile)) {
+                    failedReasons[vaultId] = "تعذر التحقق من صلاحية النسخة المشفرة قبل حذف الأصل"
+                    continue
+                }
+
+                val metaJson = row.encryptedMetaBase64
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { enc -> runCatching { JSONObject(cryptoManager.decryptMetadata(enc)) }.getOrNull() }
+                val ref = extractOriginalReference(row, metaJson)
+
+                runCatching {
+                    dbHelper.updateOriginalDeletionStatus(
+                        id = vaultId,
+                        vaultState = VaultEntryState.ORIGIN_DELETE_PENDING,
+                        isHiddenInLibrary = true,
+                        originalDeleteVerified = false,
+                        stateUpdatedAtMs = System.currentTimeMillis(),
+                        lastError = null
+                    )
+                }
+
+                when (val attempt = resolvedOriginalDeleter.attemptDeleteOriginal(ref)) {
+                    is VaultOriginalDeleter.SingleDeleteAttempt.Deleted -> {
+                        val stillPresent = runCatching { resolvedOriginalDeleter.isOriginalStillPresent(ref) }.getOrDefault(true)
+                        if (!stillPresent) {
+                            runCatching {
+                                dbHelper.updateOriginalDeletionStatus(
+                                    id = vaultId,
+                                    vaultState = VaultEntryState.ORIGINAL_DELETED_VERIFIED,
+                                    isHiddenInLibrary = true,
+                                    originalDeleteVerified = true,
+                                    stateUpdatedAtMs = System.currentTimeMillis(),
+                                    lastError = null
+                                )
+                            }
+                            deletedIds.add(vaultId)
+                        } else {
+                            val reason = "ما زال الملف الأصلي ظاهرًا بعد محاولة الحذف"
+                            runCatching {
+                                dbHelper.updateOriginalDeletionStatus(
+                                    id = vaultId,
+                                    vaultState = VaultEntryState.ORIGINAL_DELETE_FAILED,
+                                    isHiddenInLibrary = true,
+                                    originalDeleteVerified = false,
+                                    stateUpdatedAtMs = System.currentTimeMillis(),
+                                    lastError = reason
+                                )
+                            }
+                            failedReasons[vaultId] = reason
+                        }
+                    }
+                    is VaultOriginalDeleter.SingleDeleteAttempt.NeedsUserConsent -> {
+                        awaitingConsentRefs.add(vaultId to ref)
+                        if (fallbackConsentSender == null) {
+                            fallbackConsentSender = attempt.intentSender
+                        }
+                        runCatching {
+                            dbHelper.updateOriginalDeletionStatus(
+                                id = vaultId,
+                                vaultState = VaultEntryState.AWAITING_ORIGINAL_DELETE_CONSENT,
+                                isHiddenInLibrary = true,
+                                originalDeleteVerified = false,
+                                stateUpdatedAtMs = System.currentTimeMillis(),
+                                lastError = "بانتظار موافقة النظام لحذف النسخة الأصلية من الجهاز"
+                            )
+                        }
+                    }
+                    is VaultOriginalDeleter.SingleDeleteAttempt.NeedsLegacyWritePermission -> {
+                        if (legacyPermission == null) {
+                            legacyPermission = attempt.permission
+                        }
+                        legacyVaultIds.add(vaultId)
+                        runCatching {
+                            dbHelper.updateOriginalDeletionStatus(
+                                id = vaultId,
+                                vaultState = VaultEntryState.ORIGINAL_DELETE_FAILED,
+                                isHiddenInLibrary = true,
+                                originalDeleteVerified = false,
+                                stateUpdatedAtMs = System.currentTimeMillis(),
+                                lastError = "يتطلب حذف النسخة الأصلية إذن الكتابة على التخزين"
+                            )
+                        }
+                    }
+                    is VaultOriginalDeleter.SingleDeleteAttempt.Failed -> {
+                        runCatching {
+                            dbHelper.updateOriginalDeletionStatus(
+                                id = vaultId,
+                                vaultState = VaultEntryState.ORIGINAL_DELETE_FAILED,
+                                isHiddenInLibrary = true,
+                                originalDeleteVerified = false,
+                                stateUpdatedAtMs = System.currentTimeMillis(),
+                                lastError = attempt.reason
+                            )
+                        }
+                        failedReasons[vaultId] = attempt.reason
+                    }
+                }
+            }
+
+            val combinedSender = if (awaitingConsentRefs.isNotEmpty()) {
+                resolvedOriginalDeleter.createBatchDeleteIntentSender(awaitingConsentRefs)
+                    ?: fallbackConsentSender
+            } else {
+                null
+            }
+
+            refreshLocked()
+            VaultBatchOriginalDeleteOutcome(
+                deletedVerifiedIds = deletedIds,
+                alreadyProtectedIds = alreadyProtectedIds,
+                awaitingConsentIds = awaitingConsentRefs.map { it.first },
+                consentIntentSender = combinedSender,
+                legacyPermissionRequired = legacyPermission,
+                legacyPermissionVaultIds = legacyVaultIds,
+                failedReasons = failedReasons
+            )
+        }
+    }
+
+    override suspend fun finalizeOriginalsAfterConsent(
+        vaultIds: List<Long>,
+        granted: Boolean
+    ): VaultBatchOriginalDeleteOutcome = withContext(ioDispatcher) {
+        if (vaultIds.isEmpty()) return@withContext VaultBatchOriginalDeleteOutcome()
+        repoMutex.withLock {
+            val deletedIds = mutableListOf<Long>()
+            val alreadyProtectedIds = mutableListOf<Long>()
+            val awaitingConsentRefs = mutableListOf<Pair<Long, VaultOriginalReference>>()
+            var fallbackConsentSender: IntentSender? = null
+            val failedReasons = mutableMapOf<Long, String>()
+
+            for (vaultId in vaultIds.distinct()) {
+                val row = dbHelper.getVideoById(vaultId) ?: continue
+                if (row.isOriginalDeletedProtected) {
+                    alreadyProtectedIds.add(vaultId)
+                    continue
+                }
+                val metaJson = row.encryptedMetaBase64
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { enc -> runCatching { JSONObject(cryptoManager.decryptMetadata(enc)) }.getOrNull() }
+                val ref = extractOriginalReference(row, metaJson)
+
+                val stillPresentBefore = runCatching { resolvedOriginalDeleter.isOriginalStillPresent(ref) }.getOrDefault(true)
+                if (!stillPresentBefore) {
+                    runCatching {
+                        dbHelper.updateOriginalDeletionStatus(
+                            id = vaultId,
+                            vaultState = VaultEntryState.ORIGINAL_DELETED_VERIFIED,
+                            isHiddenInLibrary = true,
+                            originalDeleteVerified = true,
+                            stateUpdatedAtMs = System.currentTimeMillis(),
+                            lastError = null
+                        )
+                    }
+                    deletedIds.add(vaultId)
+                    continue
+                }
+
+                if (!granted) {
+                    val cancelMsg = "لم تُمنح موافقة حذف الأصل — بقيت النسخة المشفرة محمية في الخزنة مع خيار حذف الأصل لاحقًا"
+                    runCatching {
+                        dbHelper.updateOriginalDeletionStatus(
+                            id = vaultId,
+                            vaultState = VaultEntryState.AWAITING_ORIGINAL_DELETE_CONSENT,
+                            isHiddenInLibrary = true,
+                            originalDeleteVerified = false,
+                            stateUpdatedAtMs = System.currentTimeMillis(),
+                            lastError = cancelMsg
+                        )
+                    }
+                    failedReasons[vaultId] = cancelMsg
+                    continue
+                }
+
+                // On Android 10 (API 29) RecoverableSecurityException grants permission, requiring one retry delete call.
+                when (val retryAttempt = resolvedOriginalDeleter.attemptDeleteOriginal(ref)) {
+                    is VaultOriginalDeleter.SingleDeleteAttempt.Deleted -> {
+                        val stillPresent = runCatching { resolvedOriginalDeleter.isOriginalStillPresent(ref) }.getOrDefault(true)
+                        if (!stillPresent) {
+                            runCatching {
+                                dbHelper.updateOriginalDeletionStatus(
+                                    id = vaultId,
+                                    vaultState = VaultEntryState.ORIGINAL_DELETED_VERIFIED,
+                                    isHiddenInLibrary = true,
+                                    originalDeleteVerified = true,
+                                    stateUpdatedAtMs = System.currentTimeMillis(),
+                                    lastError = null
+                                )
+                            }
+                            deletedIds.add(vaultId)
+                        } else {
+                            val err = "تعذر التحقق من اختفاء الملف الأصلي بعد منح الإذن"
+                            runCatching {
+                                dbHelper.updateOriginalDeletionStatus(
+                                    id = vaultId,
+                                    vaultState = VaultEntryState.ORIGINAL_DELETE_FAILED,
+                                    isHiddenInLibrary = true,
+                                    originalDeleteVerified = false,
+                                    stateUpdatedAtMs = System.currentTimeMillis(),
+                                    lastError = err
+                                )
+                            }
+                            failedReasons[vaultId] = err
+                        }
+                    }
+                    is VaultOriginalDeleter.SingleDeleteAttempt.NeedsUserConsent -> {
+                        awaitingConsentRefs.add(vaultId to ref)
+                        if (fallbackConsentSender == null) {
+                            fallbackConsentSender = retryAttempt.intentSender
+                        }
+                        runCatching {
+                            dbHelper.updateOriginalDeletionStatus(
+                                id = vaultId,
+                                vaultState = VaultEntryState.AWAITING_ORIGINAL_DELETE_CONSENT,
+                                isHiddenInLibrary = true,
+                                originalDeleteVerified = false,
+                                stateUpdatedAtMs = System.currentTimeMillis(),
+                                lastError = "مطلوب تأكيد إضافي لحذف هذا الملف"
+                            )
+                        }
+                    }
+                    is VaultOriginalDeleter.SingleDeleteAttempt.NeedsLegacyWritePermission,
+                    is VaultOriginalDeleter.SingleDeleteAttempt.Failed -> {
+                        val reason = (retryAttempt as? VaultOriginalDeleter.SingleDeleteAttempt.Failed)?.reason
+                            ?: "تعذر حذف النسخة الأصلية بعد منح الإذن"
+                        runCatching {
+                            dbHelper.updateOriginalDeletionStatus(
+                                id = vaultId,
+                                vaultState = VaultEntryState.ORIGINAL_DELETE_FAILED,
+                                isHiddenInLibrary = true,
+                                originalDeleteVerified = false,
+                                stateUpdatedAtMs = System.currentTimeMillis(),
+                                lastError = reason
+                            )
+                        }
+                        failedReasons[vaultId] = reason
+                    }
+                }
+            }
+
+            refreshLocked()
+            VaultBatchOriginalDeleteOutcome(
+                deletedVerifiedIds = deletedIds,
+                alreadyProtectedIds = alreadyProtectedIds,
+                awaitingConsentIds = awaitingConsentRefs.map { it.first },
+                consentIntentSender = fallbackConsentSender,
+                failedReasons = failedReasons
+            )
+        }
+    }
+
     override suspend fun restoreVaultVideo(id: Long): VaultRestoreOutcome = withContext(ioDispatcher) {
         if (!inFlightRestoreIds.add(id)) {
             return@withContext VaultRestoreOutcome.Failed(
@@ -1526,7 +2346,7 @@ class VaultRepositoryImpl internal constructor(
                 val ref = extractOriginalReference(rawRow, metaJson)
                 val encryptedFile = resolveEncryptedFile(decodedVideo)
 
-                // Transition state -> RESTORING (still hidden until original verified intact)
+                // Transition state -> RESTORING (preserve encrypted file safely during restore)
                 runCatching {
                     dbHelper.updateVaultState(
                         id = id,
@@ -1537,7 +2357,202 @@ class VaultRepositoryImpl internal constructor(
                     )
                 }
 
-                // 2. Verify original exists, is accessible, and strictly matches saved size + SHA-256
+                // True Private Vault flow: original was deleted after verified encryption,
+                // so restoring MUST decrypt .enc to app-private cache and export to public storage.
+                if (rawRow.isOriginalDeletedProtected) {
+                    if (!encryptedFile.exists() || !encryptedFile.isFile || encryptedFile.length() <= 0L) {
+                        val msg = "تعذر العثور على الملف المشفر داخل الخزنة لاستعادة الفيديو"
+                        runCatching {
+                            dbHelper.updateOriginalDeletionStatus(
+                                id = id,
+                                vaultState = VaultEntryState.ORIGINAL_DELETED_VERIFIED,
+                                isHiddenInLibrary = true,
+                                originalDeleteVerified = true,
+                                stateUpdatedAtMs = System.currentTimeMillis(),
+                                lastError = msg
+                            )
+                        }
+                        _vaultError.value = msg
+                        refreshLocked()
+                        return@withContext VaultRestoreOutcome.Failed(msg, vaultEntryPreserved = true)
+                    }
+
+                    val tempDecryptedFile = File(
+                        restoreTempDir,
+                        "restore_${id}_${UUID.randomUUID()}.tmp"
+                    )
+                    try {
+                        val expectedSha = ref.originalSha256.takeIf { it.isNotBlank() }
+                        val expectedSize = rawRow.originalSizeBytes.takeIf { it > 0L }
+                        val decResult = cryptoManager.decryptFileToFile(
+                            encryptedFile = encryptedFile,
+                            destinationFile = tempDecryptedFile,
+                            expectedContentSha256 = expectedSha,
+                            expectedSizeBytes = expectedSize
+                        )
+
+                        val exportRequest = PublicExportRequest(
+                            decryptedTempFile = tempDecryptedFile,
+                            title = decodedVideo.displayName,
+                            displayName = ref.originalFileName.ifBlank { decodedVideo.displayName },
+                            mimeType = decodedVideo.mimeType.ifBlank { ref.originalMimeType },
+                            relativePath = ref.originalRelativePath.takeIf { it.isNotBlank() },
+                            expectedSizeBytes = decResult.plaintextSizeBytes,
+                            expectedSha256 = expectedSha ?: decResult.contentSha256,
+                            durationMs = decodedVideo.durationMs,
+                            width = decodedVideo.width,
+                            height = decodedVideo.height
+                        )
+
+                        when (val exportOutcome = resolvedPublicMediaExporter.exportVideo(exportRequest)) {
+                            is PublicExportOutcome.RequiresLegacyWritePermission -> {
+                                runCatching {
+                                    dbHelper.updateOriginalDeletionStatus(
+                                        id = id,
+                                        vaultState = VaultEntryState.ORIGINAL_DELETED_VERIFIED,
+                                        isHiddenInLibrary = true,
+                                        originalDeleteVerified = true,
+                                        stateUpdatedAtMs = System.currentTimeMillis(),
+                                        lastError = "يتطلب إعادة إنشاء الملف العام إذن التخزين"
+                                    )
+                                }
+                                refreshLocked()
+                                return@withContext VaultRestoreOutcome.RequiresLegacyWritePermission(
+                                    permission = exportOutcome.permission,
+                                    videoId = id
+                                )
+                            }
+                            is PublicExportOutcome.Failed -> {
+                                runCatching {
+                                    dbHelper.updateOriginalDeletionStatus(
+                                        id = id,
+                                        vaultState = VaultEntryState.ORIGINAL_DELETED_VERIFIED,
+                                        isHiddenInLibrary = true,
+                                        originalDeleteVerified = true,
+                                        stateUpdatedAtMs = System.currentTimeMillis(),
+                                        lastError = exportOutcome.reason
+                                    )
+                                }
+                                _vaultError.value = exportOutcome.reason
+                                refreshLocked()
+                                return@withContext VaultRestoreOutcome.Failed(
+                                    reason = exportOutcome.reason,
+                                    vaultEntryPreserved = true
+                                )
+                            }
+                            is PublicExportOutcome.Exported -> {
+                                try {
+                                    beforeDeleteHook?.invoke(id)
+                                } catch (ce: kotlinx.coroutines.CancellationException) {
+                                    throw ce
+                                } catch (_: Throwable) {
+                                }
+
+                                val restoredUpdated = runCatching {
+                                    dbHelper.updateOriginalDeletionStatus(
+                                        id = id,
+                                        vaultState = VaultEntryState.ORIGINAL_RESTORED_VERIFIED,
+                                        isHiddenInLibrary = false,
+                                        originalDeleteVerified = true,
+                                        publicRestoredUri = exportOutcome.mediaUri.toString(),
+                                        stateUpdatedAtMs = System.currentTimeMillis(),
+                                        lastError = null
+                                    )
+                                }.getOrDefault(0)
+                                if (restoredUpdated <= 0) {
+                                    val msg = "تعذر تحديث حالة الفيديو المستعاد في قاعدة البيانات — بقيت النسخة المشفرة محمية"
+                                    _vaultError.value = msg
+                                    return@withContext VaultRestoreOutcome.Failed(msg, vaultEntryPreserved = true)
+                                }
+
+                                val stagedFile = File(
+                                    encryptedFile.parentFile ?: vaultDir,
+                                    "${encryptedFile.name}.${System.currentTimeMillis()}.pending_delete"
+                                )
+                                val stagedOk = !encryptedFile.exists() || runCatching { encryptedFile.renameTo(stagedFile) }.getOrDefault(false)
+                                if (!stagedOk) {
+                                    runCatching {
+                                        dbHelper.updateOriginalDeletionStatus(
+                                            id = id,
+                                            vaultState = VaultEntryState.ORIGINAL_DELETED_VERIFIED,
+                                            isHiddenInLibrary = true,
+                                            originalDeleteVerified = true,
+                                            stateUpdatedAtMs = System.currentTimeMillis(),
+                                            lastError = "تعذر عزل النسخة المشفرة بعد الاستعادة"
+                                        )
+                                    }
+                                    refreshLocked()
+                                    val msg = "أُعيد إنشاء الفيديو في المكتبة، لكن تعذر إزالة النسخة المشفرة من الخزنة"
+                                    _vaultError.value = msg
+                                    return@withContext VaultRestoreOutcome.Failed(msg, vaultEntryPreserved = true)
+                                }
+
+                                val deletedRows = runCatching { dbHelper.deleteVideo(id) }.getOrDefault(0)
+                                if (deletedRows <= 0) {
+                                    if (stagedFile.exists() && !encryptedFile.exists()) {
+                                        runCatching { stagedFile.renameTo(encryptedFile) }
+                                    }
+                                    runCatching {
+                                        dbHelper.updateOriginalDeletionStatus(
+                                            id = id,
+                                            vaultState = VaultEntryState.ORIGINAL_DELETED_VERIFIED,
+                                            isHiddenInLibrary = true,
+                                            originalDeleteVerified = true,
+                                            stateUpdatedAtMs = System.currentTimeMillis(),
+                                            lastError = "تعذر حذف السجل بعد الاستعادة"
+                                        )
+                                    }
+                                    refreshLocked()
+                                    val msg = "تعذر إزالة سجل الفيديو من قاعدة بيانات الخزنة بعد تصديره"
+                                    _vaultError.value = msg
+                                    return@withContext VaultRestoreOutcome.Failed(msg, vaultEntryPreserved = true)
+                                }
+
+                                if (stagedFile.exists()) {
+                                    runCatching { stagedFile.delete() }
+                                }
+                                _vaultError.value = null
+                                recordActivity()
+                                refreshLocked()
+
+                                return@withContext VaultRestoreOutcome.Restored(
+                                    video = decodedVideo.copy(
+                                        vaultState = VaultEntryState.ORIGINAL_RESTORED_VERIFIED,
+                                        isHiddenInLibrary = false,
+                                        publicRestoredUri = exportOutcome.mediaUri.toString()
+                                    ),
+                                    restoredUri = exportOutcome.mediaUri,
+                                    verifiedSha256 = exportOutcome.verifiedSha256,
+                                    verifiedSizeBytes = exportOutcome.verifiedSizeBytes
+                                )
+                            }
+                        }
+                    } catch (ce: kotlinx.coroutines.CancellationException) {
+                        throw ce
+                    } catch (e: Exception) {
+                        val reason = e.localizedMessage?.takeIf { it.isNotBlank() }
+                            ?: "فشل فك التشفير أو استعادة الفيديو إلى المكتبة العامة — بقيت النسخة المشفرة محفوظة بأمان"
+                        runCatching {
+                            dbHelper.updateOriginalDeletionStatus(
+                                id = id,
+                                vaultState = VaultEntryState.ORIGINAL_DELETED_VERIFIED,
+                                isHiddenInLibrary = true,
+                                originalDeleteVerified = true,
+                                stateUpdatedAtMs = System.currentTimeMillis(),
+                                lastError = reason
+                            )
+                        }
+                        _vaultError.value = reason
+                        refreshLocked()
+                        return@withContext VaultRestoreOutcome.Failed(reason, vaultEntryPreserved = true)
+                    } finally {
+                        if (tempDecryptedFile.exists()) {
+                            runCatching { tempDecryptedFile.delete() }
+                        }
+                    }
+                }
+
+                // Legacy Option (A) path: original remains hidden in place on disk, verify & unhide without duplicate copy
                 when (val verify = verifyOriginalAtReference(ref)) {
                     is OriginalVerifyResult.Missing -> {
                         runCatching {
@@ -1610,7 +2625,6 @@ class VaultRepositoryImpl internal constructor(
                         return@withContext VaultRestoreOutcome.Failed(verify.reason, vaultEntryPreserved = true)
                     }
                     is OriginalVerifyResult.Verified -> {
-                        // 3. Original verified byte-for-byte in its original location — NO copy/export created!
                         try {
                             beforeDeleteHook?.invoke(id)
                         } catch (ce: kotlinx.coroutines.CancellationException) {
@@ -1618,7 +2632,6 @@ class VaultRepositoryImpl internal constructor(
                         } catch (_: Throwable) {
                         }
 
-                        // 4. Transition to ORIGINAL_RESTORED_VERIFIED and un-hide in library FIRST
                         val unhideRows = runCatching {
                             dbHelper.updateVaultState(
                                 id = id,
@@ -1646,11 +2659,9 @@ class VaultRepositoryImpl internal constructor(
                             hiddenEntries = remainingHidden
                         )
                         if (stillHidden) {
-                            // Another vault entry might still hold this path, or un-hide verification failed
                             _vaultError.value = null
                         }
 
-                        // 5. ONLY AFTER verification & un-hide succeed, stage .enc -> .pending_delete & delete DB record
                         var stagedFile: File? = null
                         if (encryptedFile.exists()) {
                             val candidate = File(
@@ -1659,7 +2670,6 @@ class VaultRepositoryImpl internal constructor(
                             )
                             val stagedOk = runCatching { encryptedFile.renameTo(candidate) }.getOrDefault(false)
                             if (!stagedOk) {
-                                // Revert hidden state safely since cleanup failed
                                 runCatching {
                                     dbHelper.updateVaultState(
                                         id = id,
@@ -1736,28 +2746,32 @@ class VaultRepositoryImpl internal constructor(
                 ?.let { enc -> runCatching { JSONObject(cryptoManager.decryptMetadata(enc)) }.getOrNull() }
             val ref = extractOriginalReference(raw, metaJson)
 
-            // Guard Section 6: NEVER permit permanent deletion of the encrypted copy if it is the SOLE remaining copy
-            // (Exception only for synthetic test fixtures lacking both original metadata/SHA-256 and VHTK encrypted header)
-            val hasTrackedOriginal = ref.originalUri.isNotBlank() ||
-                ref.originalFilePath.isNotBlank() ||
-                ref.originalMediaStoreId != null
-            val hasRealPayload = isEncryptedContainerValid(resolved) || ref.originalSha256.isNotBlank()
+            // Guard Section 6: For Option (A) entries whose original wasn't deleted by True Private Vault,
+            // NEVER permit accidental permanent deletion of the encrypted copy if it is the SOLE remaining copy.
+            // True Private Vault entries (isOriginalDeletedProtected) already deleted the original by design
+            // and require explicit user confirmation for permanent deletion.
+            if (!raw.isOriginalDeletedProtected) {
+                val hasTrackedOriginal = ref.originalUri.isNotBlank() ||
+                    ref.originalFilePath.isNotBlank() ||
+                    ref.originalMediaStoreId != null
+                val hasRealPayload = isEncryptedContainerValid(resolved) || ref.originalSha256.isNotBlank()
 
-            if (hasTrackedOriginal || hasRealPayload) {
-                if (!hasTrackedOriginal) {
-                    val reason = "لا يمكن الحذف النهائي: هذه النسخة المشفرة هي النسخة الوحيدة المتبقية من الفيديو ولا يوجد أصل سليم على الجهاز"
-                    _vaultError.value = reason
-                    return@withContext VaultDeleteOutcome.BlockedSoleRemainingCopy(reason)
-                }
-                when (val origCheck = verifyOriginalAtReference(ref)) {
-                    is OriginalVerifyResult.Verified -> Unit
-                    is OriginalVerifyResult.Missing,
-                    is OriginalVerifyResult.Changed,
-                    is OriginalVerifyResult.PermissionRequired,
-                    is OriginalVerifyResult.Unreadable -> {
-                        val reason = "لا يمكن الحذف النهائي لأن هذه النسخة المشفرة هي النسخة السليمة الوحيدة المتبقية من الفيديو — أصل الفيديو مفقود أو تغيّر أو يتعذر التحقق منه"
+                if (hasTrackedOriginal || hasRealPayload) {
+                    if (!hasTrackedOriginal) {
+                        val reason = "لا يمكن الحذف النهائي: هذه النسخة المشفرة هي النسخة الوحيدة المتبقية من الفيديو ولا يوجد أصل سليم على الجهاز"
                         _vaultError.value = reason
                         return@withContext VaultDeleteOutcome.BlockedSoleRemainingCopy(reason)
+                    }
+                    when (verifyOriginalAtReference(ref)) {
+                        is OriginalVerifyResult.Verified -> Unit
+                        is OriginalVerifyResult.Missing,
+                        is OriginalVerifyResult.Changed,
+                        is OriginalVerifyResult.PermissionRequired,
+                        is OriginalVerifyResult.Unreadable -> {
+                            val reason = "لا يمكن الحذف النهائي لأن هذه النسخة المشفرة هي النسخة السليمة الوحيدة المتبقية من الفيديو — أصل الفيديو مفقود أو تغيّر أو يتعذر التحقق منه"
+                            _vaultError.value = reason
+                            return@withContext VaultDeleteOutcome.BlockedSoleRemainingCopy(reason)
+                        }
                     }
                 }
             }

@@ -96,6 +96,11 @@ fun RestoreVaultVideoConfirmationDialog(
     onConfirm: () -> Unit
 ) {
     val palette = LocalVideoHatakPalette.current
+    val bodyText = if (video.isOriginalDeletedProtected) {
+        "سيتم فك تشفير \"${video.title}\" والتحقق من سلامة بصمته SHA-256 ثم إعادة إنشائه في المكتبة العامة على جهازك، وبعد التأكد من اكتمال الاستعادة فقط تُحذف النسخة المشفرة من الخزنة."
+    } else {
+        "سيتم التحقق من وجود الملف الأصلي لـ \"${video.title}\" وسلامة بصمته SHA-256 ثم إعادة إظهاره في مكتبة VideoHatak كما كان دون إنشاء نسخة مكررة، وبعد التأكد فقط تُزال النسخة المشفرة من الخزنة."
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -105,13 +110,17 @@ fun RestoreVaultVideoConfirmationDialog(
         title = { Text("إزالة من الخزنة الخاصة", fontWeight = FontWeight.Bold) },
         text = {
             Text(
-                "سيتم التحقق من وجود الملف الأصلي لـ \"${video.title}\" وسلامة بصمته SHA-256 ثم إعادة إظهاره في مكتبة VideoHatak كما كان دون إنشاء نسخة مكررة، وبعد التأكد فقط تُزال النسخة المشفرة من الخزنة.",
+                bodyText,
                 color = palette.onSurfaceMuted
             )
         },
         confirmButton = {
             TextButton(onClick = onConfirm) {
-                Text("إزالة وإعادة إظهار", color = palette.accent, fontWeight = FontWeight.Bold)
+                Text(
+                    if (video.isOriginalDeletedProtected) "فك التشفير والاستعادة" else "إزالة وإعادة إظهار",
+                    color = palette.accent,
+                    fontWeight = FontWeight.Bold
+                )
             }
         },
         dismissButton = {
@@ -129,6 +138,11 @@ fun DeleteVaultVideoConfirmationDialog(
     onConfirm: () -> Unit
 ) {
     val palette = LocalVideoHatakPalette.current
+    val warningText = if (video.isOriginalDeletedProtected) {
+        "تحذير مهم: تم حذف النسخة الأصلية من جهازك مسبقًا عند نقل \"${video.title}\" إلى الخزنة. سيؤدي الحذف النهائي الآن إلى مسح النسخة المشفرة الوحيدة نهائيًا دون إمكانية الاسترجاع. هل تريد المتابعة؟"
+    } else {
+        "تحذير: سيؤدي هذا الإجراء إلى حذف النسخة المشفرة من \"${video.title}\" من الخزنة نهائيًا (سيُحظر الحذف إذا كانت هذه النسخة هي النسخة السليمة الوحيدة المتبقية). هل تريد المتابعة؟"
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -138,7 +152,7 @@ fun DeleteVaultVideoConfirmationDialog(
         title = { Text("حذف نهائي من الخزنة", fontWeight = FontWeight.Bold) },
         text = {
             Text(
-                "تحذير: سيؤدي هذا الإجراء إلى حذف النسخة المشفرة من \"${video.title}\" من الخزنة نهائيًا (سيُرفض الحذف إذا كانت هذه النسخة هي النسخة السليمة الوحيدة المتبقية). هل تريد المتابعة؟",
+                warningText,
                 color = palette.onSurfaceMuted
             )
         },
@@ -178,7 +192,7 @@ fun VaultSecurityInfoDialog(
                             "• المفاتيح: يُحفظ مفتاح التشفير الرئيسي داخل Android Keystore على الجهاز لحماية مفاتيح الملفات.\n" +
                             "• بوابة الوصول المستقلة: الخزنة محمية برمز قفل مستقل مرن يدعم الحروف العربية والإنجليزية والأرقام والرموز (بتجزئة PBKDF2 وتقييد المحاولات الخاطئة) دون الاعتماد على قفل شاشة الهاتف، مع خيار إضافي لاستخدام البصمة.\n" +
                             "• الخصوصية التامة: يفعّل التطبيق FLAG_SECURE لمنع لقطات وتسجيل الشاشة، ويعطّل PiP والإشعارات والتشغيل المصغّر وفي الخلفية، ويُوقف التشغيل فور الخروج أو القفل.\n" +
-                            "• الإخفاء والاستعادة العكوسة: عند نقل فيديو إلى الخزنة يُنشأ له نسخ مشفر وتُحفظ بصمته SHA-256 ويُخفى داخل مكتبة VideoHatak دون المساس بالملف الأصلي على الجهاز. وعند اختيار «إزالة من الخزنة» يتحقق التطبيق من وجود الأصل وسلامته ثم يعيد إظهاره في مكانه دون نسخ مكررة، ولا يسمح بحذف النسخة المشفرة نهائيًا إذا كانت هي النسخة السليمة الوحيدة المتبقية.",
+                            "• خزنة خاصة حقيقية: بعد نجاح التشفير والتحقق الكامل من البصمة SHA-256، يحذف التطبيق النسخة الأصلية غير المشفرة من التخزين العام (بعد موافقة النظام عند الحاجة) لتبقى النسخة المشفرة فقط داخل الخزنة. وعند اختيار «إزالة من الخزنة» يفك التشفير ويعيد إنشاء الفيديو في التخزين العام بالتحقق من سلامته قبل مسح النسخة المشفرة.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = palette.onSurfaceMuted
                 )
@@ -247,7 +261,7 @@ fun RestoreVideoProgressDialog(
         containerColor = palette.surface,
         titleContentColor = palette.onSurface,
         textContentColor = palette.onSurface,
-                title = { Text("جارٍ التحقق وإعادة إظهار الفيديو...", fontWeight = FontWeight.Bold) },
+                title = { Text("جارٍ استعادة الفيديو من الخزنة...", fontWeight = FontWeight.Bold) },
         text = {
             Column(modifier = Modifier.fillMaxWidth()) {
                 if (currentTitle.isNotBlank()) {
@@ -260,7 +274,7 @@ fun RestoreVideoProgressDialog(
                     Spacer(modifier = Modifier.height(6.dp))
                 }
                 Text(
-                    text = "يتم التحقق من وجود الملف الأصلي وسلامة بصمته SHA-256 وإعادة إظهاره في المكتبة قبل إزالة النسخة المشفرة.",
+                    text = "يتم فك التشفير والتحقق من سلامة البصمة SHA-256 وإعادة الفيديو إلى المكتبة العامة قبل إزالة النسخة المشفرة.",
                     color = palette.onSurfaceMuted
                 )
                 Spacer(modifier = Modifier.height(14.dp))
@@ -600,16 +614,16 @@ fun BatchRestoreVaultVideosDialog(
         containerColor = palette.surface,
         titleContentColor = palette.onSurface,
         textContentColor = palette.onSurface,
-        title = { Text("إزالة وإعادة إظهار في المكتبة", fontWeight = FontWeight.Bold) },
+        title = { Text("إزالة واستعادة إلى المكتبة", fontWeight = FontWeight.Bold) },
         text = {
             Text(
-                "سيتم التحقق من وجود الأصول وسلامتها (SHA-256) وإعادة إظهار $selectedCount من الفيديوهات في المكتبة كما كانت، ثم إزالة نسخها المشفرة من الخزنة.",
+                "سيتم فك التشفير والتحقق من سلامة البصمة (SHA-256) واستعادة $selectedCount من الفيديوهات إلى المكتبة العامة، ثم إزالة نسخها المشفرة من الخزنة بعد التحقق.",
                 color = palette.onSurfaceMuted
             )
         },
         confirmButton = {
             TextButton(onClick = onConfirm) {
-                Text("إزالة وإعادة إظهار ($selectedCount)", color = palette.accent, fontWeight = FontWeight.Bold)
+                Text("استعادة إلى المكتبة ($selectedCount)", color = palette.accent, fontWeight = FontWeight.Bold)
             }
         },
         dismissButton = {
@@ -636,7 +650,7 @@ fun BatchDeleteVaultVideosDialog(
         title = { Text("حذف نهائي من الخزنة", fontWeight = FontWeight.Bold) },
         text = {
             Text(
-                "تحذير: هل أنت متأكد من الحذف النهائي لـ $selectedCount من النسخ المشفرة في الخزنة؟ سيُحظر حذف أي مقطع إذا كانت النسخة المشفرة هي النسخة السليمة الوحيدة المتبقية.",
+                "تحذير مهم: هل أنت متأكد من الحذف النهائي لـ $selectedCount من النسخ المشفرة في الخزنة؟ المقاطع المحمية التي حُذف أصلها من الجهاز سيتم محوها نهائيًا دون إمكانية الاسترجاع.",
                 color = palette.onSurfaceMuted
             )
         },

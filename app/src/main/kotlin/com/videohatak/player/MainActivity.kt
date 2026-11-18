@@ -213,6 +213,29 @@ class MainActivity : FragmentActivity() {
                 vaultViewModel.onLegacyRestoreWritePermissionResult(granted, ids)
             }
 
+            var pendingOriginalDeleteVaultIds by remember { mutableStateOf<List<Long>>(emptyList()) }
+            val vaultOriginalDeleteConsentLauncher = rememberLauncherForActivityResult(
+                contract = ActivityResultContracts.StartIntentSenderForResult()
+            ) { result ->
+                val ids = pendingOriginalDeleteVaultIds
+                pendingOriginalDeleteVaultIds = emptyList()
+                vaultViewModel.onOriginalDeleteConsentResult(
+                    granted = result.resultCode == RESULT_OK,
+                    vaultIds = ids
+                )
+            }
+
+            val vaultLegacyOriginalDeletePermissionLauncher = rememberLauncherForActivityResult(
+                contract = ActivityResultContracts.RequestPermission()
+            ) { granted ->
+                val ids = pendingOriginalDeleteVaultIds
+                pendingOriginalDeleteVaultIds = emptyList()
+                vaultViewModel.onLegacyOriginalDeletePermissionResult(
+                    granted = granted,
+                    vaultIds = ids
+                )
+            }
+
             LaunchedEffect(Unit) {
                 val initialStatus = PermissionHelper.checkPermissionStatus(this@MainActivity, this@MainActivity)
                 libraryViewModel.onPermissionStatusChanged(initialStatus)
@@ -283,6 +306,28 @@ class MainActivity : FragmentActivity() {
                                 val ids = pendingVaultRestoreIds
                                 pendingVaultRestoreIds = emptyList()
                                 vaultViewModel.onLegacyRestoreWritePermissionResult(false, ids)
+                            }
+                        }
+                        is VaultUiEvent.RequestOriginalDeleteConsent -> {
+                            pendingOriginalDeleteVaultIds = event.vaultIds
+                            runCatching {
+                                vaultOriginalDeleteConsentLauncher.launch(
+                                    IntentSenderRequest.Builder(event.intentSender).build()
+                                )
+                            }.onFailure {
+                                val ids = pendingOriginalDeleteVaultIds
+                                pendingOriginalDeleteVaultIds = emptyList()
+                                vaultViewModel.onOriginalDeleteConsentResult(granted = false, vaultIds = ids)
+                            }
+                        }
+                        is VaultUiEvent.RequestLegacyOriginalDeletePermission -> {
+                            pendingOriginalDeleteVaultIds = event.vaultIds
+                            runCatching {
+                                vaultLegacyOriginalDeletePermissionLauncher.launch(event.permission)
+                            }.onFailure {
+                                val ids = pendingOriginalDeleteVaultIds
+                                pendingOriginalDeleteVaultIds = emptyList()
+                                vaultViewModel.onLegacyOriginalDeletePermissionResult(granted = false, vaultIds = ids)
                             }
                         }
                     }
@@ -411,25 +456,29 @@ class MainActivity : FragmentActivity() {
             }
 
             val vaultImportLauncher = rememberLauncherForActivityResult(
-                contract = ActivityResultContracts.OpenDocument()
-            ) { uri: Uri? ->
-                if (uri != null) {
-                    runCatching {
-                        contentResolver.takePersistableUriPermission(
-                            uri,
-                            Intent.FLAG_GRANT_READ_URI_PERMISSION
-                        )
-                    }
-                    vaultViewModel.importVideoFromUri(
-                        sourceUri = uri,
-                        displayName = null,
-                        deleteOriginal = false
-                    ) { ok ->
-                        if (ok) {
-                            vaultViewModel.refresh()
-                            libraryViewModel.refresh()
-                            playlistViewModel.refresh()
+                contract = ActivityResultContracts.OpenMultipleDocuments()
+            ) { uris: List<Uri> ->
+                if (uris.isNotEmpty()) {
+                    uris.forEach { uri ->
+                        val grantedRw = runCatching {
+                            contentResolver.takePersistableUriPermission(
+                                uri,
+                                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                            )
+                        }.isSuccess
+                        if (!grantedRw) {
+                            runCatching {
+                                contentResolver.takePersistableUriPermission(
+                                    uri,
+                                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                                )
+                            }
                         }
+                    }
+                    vaultViewModel.importVideosToPrivateVault(uris) {
+                        vaultViewModel.refresh()
+                        libraryViewModel.refresh()
+                        playlistViewModel.refresh()
                     }
                 }
             }
@@ -481,7 +530,8 @@ class MainActivity : FragmentActivity() {
                             }
                         )
                     }
-                    var encryptedCount = 0
+                    val verifiedVaultIdsForOriginalDelete = mutableListOf<Long>()
+                    var alreadyProtectedCount = 0
                     var failedCount = 0
                     var lastFailureReason: String? = null
                     try {
@@ -506,11 +556,15 @@ class MainActivity : FragmentActivity() {
                                 )
                             ) {
                                 is VaultImportOutcome.Imported -> {
-                                    encryptedCount++
+                                    verifiedVaultIdsForOriginalDelete.add(outcome.video.id)
                                 }
                                 is VaultImportOutcome.AlreadyInVault -> {
                                     if (outcome.integrityVerified) {
-                                        encryptedCount++
+                                        if (outcome.existingVideo.isOriginalDeletedProtected) {
+                                            alreadyProtectedCount++
+                                        } else {
+                                            verifiedVaultIdsForOriginalDelete.add(outcome.existingVideo.id)
+                                        }
                                     } else {
                                         failedCount++
                                         lastFailureReason = "تعذر التحقق من سلامة النسخة الموجودة في الخزنة — لم يتم المساس بالملف الأصلي"
@@ -530,16 +584,13 @@ class MainActivity : FragmentActivity() {
                     vaultViewModel.refresh()
                     libraryViewModel.refresh()
                     playlistViewModel.refresh()
-                    if (encryptedCount > 0) {
-                        val msg = when {
-                            failedCount > 0 ->
-                                "تم تشفير $encryptedCount فيديو وإخفاؤه من المكتبة، وتعذر نقل $failedCount"
-                            encryptedCount == 1 ->
-                                "تمت إضافة الفيديو إلى الخزنة وإخفاؤه من المكتبة مع بقاء الأصل سليمًا"
-                            else ->
-                                "تمت إضافة $encryptedCount فيديو إلى الخزنة وإخفاؤها من المكتبة مع بقاء الأصول سليمة"
-                        }
-                        snackbarHostState.showSnackbar(msg)
+                    if (verifiedVaultIdsForOriginalDelete.isNotEmpty()) {
+                        vaultViewModel.deleteOriginalsForVaultEntries(
+                            vaultIds = verifiedVaultIdsForOriginalDelete,
+                            encryptedFailedCount = failedCount
+                        )
+                    } else if (alreadyProtectedCount > 0 && failedCount == 0) {
+                        snackbarHostState.showSnackbar("الفيديو محمي ومشفّر مسبقًا داخل الخزنة الخاصة")
                     } else if (failedCount > 0) {
                         snackbarHostState.showSnackbar(
                             lastFailureReason ?: "تعذر تشفير ونقل الفيديو إلى الخزنة — بقيت الملفات الأصلية ظاهرة وسليمة"
@@ -986,6 +1037,7 @@ class MainActivity : FragmentActivity() {
                                 onVaultDeleteVideos = { ids ->
                                     vaultViewModel.deleteVideos(ids)
                                 },
+                                onVaultRetryDeleteOriginal = vaultViewModel::retryDeleteOriginal,
                                 onVaultUserInteraction = vaultViewModel::recordUserActivity,
                                 seekIntervalSeconds = seekIntervalSeconds,
                                 onSelectSeekIntervalSeconds = playerViewModel::setSeekIntervalSeconds,

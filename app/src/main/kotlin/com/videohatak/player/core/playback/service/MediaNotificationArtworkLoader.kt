@@ -40,7 +40,7 @@ object MediaNotificationArtworkLoader {
         val decoded = runCatching {
             BitmapFactory.decodeResource(context.resources, R.drawable.splash_logo)
                 ?: BitmapFactory.decodeResource(context.resources, R.mipmap.ic_launcher)
-        }.getOrNull()
+        }.getOrNull()?.takeIf { !it.isRecycled }
 
         val result = decoded ?: createProgrammaticFallbackBitmap()
         cachedFallback = result
@@ -94,6 +94,30 @@ object MediaNotificationArtworkLoader {
         return bitmap
     }
 
+    internal fun decodeSampledBitmap(bytes: ByteArray, maxSizePx: Int = ARTWORK_SIZE_PX): Bitmap? {
+        if (bytes.isEmpty()) return null
+        val target = maxSizePx.coerceAtLeast(32)
+        return try {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+            var sampleSize = 1
+            if (bounds.outWidth > target || bounds.outHeight > target) {
+                var halfW = bounds.outWidth / 2
+                var halfH = bounds.outHeight / 2
+                while (halfW / sampleSize >= target && halfH / sampleSize >= target) {
+                    sampleSize *= 2
+                }
+            }
+            val decodeOpts = BitmapFactory.Options().apply {
+                inSampleSize = sampleSize
+                inPreferredConfig = Bitmap.Config.RGB_565
+            }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOpts)
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
     private fun extractArtworkBitmap(context: Context, uri: Uri): Bitmap? {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val loaded = runCatching {
@@ -103,7 +127,7 @@ object MediaNotificationArtworkLoader {
                     null
                 )
             }.getOrNull()
-            if (loaded != null) return loaded
+            if (loaded != null && !loaded.isRecycled) return loaded
         }
 
         val retriever = MediaMetadataRetriever()
@@ -115,7 +139,7 @@ object MediaNotificationArtworkLoader {
             }
             val embedded = retriever.embeddedPicture
             if (embedded != null && embedded.isNotEmpty()) {
-                BitmapFactory.decodeByteArray(embedded, 0, embedded.size)
+                decodeSampledBitmap(embedded, ARTWORK_SIZE_PX)
             } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
                 retriever.getScaledFrameAtTime(
                     1_000_000L,
@@ -132,7 +156,7 @@ object MediaNotificationArtworkLoader {
                 retriever.getFrameAtTime(1_000_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                     ?: retriever.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
             }
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             null
         } finally {
             runCatching { retriever.release() }

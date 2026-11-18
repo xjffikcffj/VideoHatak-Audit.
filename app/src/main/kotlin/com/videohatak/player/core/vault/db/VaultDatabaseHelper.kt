@@ -32,6 +32,16 @@ interface VaultDatabaseStore {
         lastError: String? = null
     ): Int = if (getVideoById(id) != null) 1 else 0
 
+    fun updateOriginalDeletionStatus(
+        id: Long,
+        vaultState: VaultEntryState,
+        isHiddenInLibrary: Boolean,
+        originalDeleteVerified: Boolean,
+        publicRestoredUri: String = "",
+        stateUpdatedAtMs: Long = System.currentTimeMillis(),
+        lastError: String? = null
+    ): Int = if (getVideoById(id) != null) 1 else 0
+
     fun getHiddenOriginalEntries(): List<VaultHiddenOriginal> =
         getAllVideos().mapNotNull { it.toHiddenOriginalOrNull() }
 }
@@ -44,7 +54,7 @@ class VaultDatabaseHelper(context: Context) : SQLiteOpenHelper(
 ), VaultDatabaseStore {
     companion object {
         private const val DATABASE_NAME = "videohatak_vault.db"
-        const val DATABASE_VERSION = 4
+        const val DATABASE_VERSION = 5
 
         const val TABLE_VAULT = "vault_videos"
         const val COLUMN_ID = "id"
@@ -72,6 +82,10 @@ class VaultDatabaseHelper(context: Context) : SQLiteOpenHelper(
         const val COLUMN_IS_HIDDEN_IN_LIBRARY = "is_hidden_in_library"
         const val COLUMN_STATE_UPDATED_AT_MS = "state_updated_at_ms"
         const val COLUMN_LAST_ERROR = "last_error"
+
+        // True Private Vault deletion & restore tracking columns (v5)
+        const val COLUMN_ORIGINAL_DELETE_VERIFIED = "original_delete_verified"
+        const val COLUMN_PUBLIC_RESTORED_URI = "public_restored_uri"
     }
 
     override fun onCreate(db: SQLiteDatabase) {
@@ -104,7 +118,9 @@ class VaultDatabaseHelper(context: Context) : SQLiteOpenHelper(
                 $COLUMN_VAULT_STATE TEXT NOT NULL DEFAULT 'ENCRYPTED_VERIFIED',
                 $COLUMN_IS_HIDDEN_IN_LIBRARY INTEGER NOT NULL DEFAULT 0,
                 $COLUMN_STATE_UPDATED_AT_MS INTEGER NOT NULL DEFAULT 0,
-                $COLUMN_LAST_ERROR TEXT NOT NULL DEFAULT ''
+                $COLUMN_LAST_ERROR TEXT NOT NULL DEFAULT '',
+                $COLUMN_ORIGINAL_DELETE_VERIFIED INTEGER NOT NULL DEFAULT 0,
+                $COLUMN_PUBLIC_RESTORED_URI TEXT NOT NULL DEFAULT ''
             )
             """.trimIndent()
         )
@@ -180,6 +196,17 @@ class VaultDatabaseHelper(context: Context) : SQLiteOpenHelper(
                     }
                 }
             }
+            if (oldVersion < 5 && newVersion >= 5) {
+                val v5Columns = listOf(
+                    COLUMN_ORIGINAL_DELETE_VERIFIED to "INTEGER NOT NULL DEFAULT 0",
+                    COLUMN_PUBLIC_RESTORED_URI to "TEXT NOT NULL DEFAULT ''"
+                )
+                for ((colName, colDef) in v5Columns) {
+                    if (!db.hasColumn(TABLE_VAULT, colName)) {
+                        db.execSQL("ALTER TABLE $TABLE_VAULT ADD COLUMN $colName $colDef")
+                    }
+                }
+            }
             db.setTransactionSuccessful()
         } finally {
             db.endTransaction()
@@ -232,6 +259,8 @@ class VaultDatabaseHelper(context: Context) : SQLiteOpenHelper(
             put(COLUMN_IS_HIDDEN_IN_LIBRARY, if (video.isHiddenInLibrary) 1 else 0)
             put(COLUMN_STATE_UPDATED_AT_MS, video.stateUpdatedAtMs)
             put(COLUMN_LAST_ERROR, video.lastError ?: "")
+            put(COLUMN_ORIGINAL_DELETE_VERIFIED, if (video.originalDeleteVerified) 1 else 0)
+            put(COLUMN_PUBLIC_RESTORED_URI, video.publicRestoredUri)
         }
         return db.insertWithOnConflict(TABLE_VAULT, null, values, SQLiteDatabase.CONFLICT_REPLACE)
     }
@@ -270,6 +299,29 @@ class VaultDatabaseHelper(context: Context) : SQLiteOpenHelper(
         return db.update(TABLE_VAULT, values, "$COLUMN_ID = ?", arrayOf(id.toString()))
     }
 
+    override fun updateOriginalDeletionStatus(
+        id: Long,
+        vaultState: VaultEntryState,
+        isHiddenInLibrary: Boolean,
+        originalDeleteVerified: Boolean,
+        publicRestoredUri: String,
+        stateUpdatedAtMs: Long,
+        lastError: String?
+    ): Int {
+        val db = writableDatabase
+        val values = ContentValues().apply {
+            put(COLUMN_VAULT_STATE, vaultState.storageValue)
+            put(COLUMN_IS_HIDDEN_IN_LIBRARY, if (isHiddenInLibrary) 1 else 0)
+            put(COLUMN_ORIGINAL_DELETE_VERIFIED, if (originalDeleteVerified) 1 else 0)
+            if (publicRestoredUri.isNotBlank()) {
+                put(COLUMN_PUBLIC_RESTORED_URI, publicRestoredUri)
+            }
+            put(COLUMN_STATE_UPDATED_AT_MS, stateUpdatedAtMs)
+            put(COLUMN_LAST_ERROR, lastError ?: "")
+        }
+        return db.update(TABLE_VAULT, values, "$COLUMN_ID = ?", arrayOf(id.toString()))
+    }
+
     override fun getHiddenOriginalEntries(): List<VaultHiddenOriginal> {
         val list = mutableListOf<VaultHiddenOriginal>()
         val db = readableDatabase
@@ -283,7 +335,7 @@ class VaultDatabaseHelper(context: Context) : SQLiteOpenHelper(
                 COLUMN_STORAGE_TYPE,
                 COLUMN_VAULT_STATE
             ),
-            "$COLUMN_IS_HIDDEN_IN_LIBRARY = 1 OR $COLUMN_VAULT_STATE IN ('ORIGINAL_HIDDEN', 'RESTORING', 'RESTORE_FAILED', 'ORIGINAL_MISSING', 'ORIGINAL_CHANGED', 'REQUIRES_PERMISSION')",
+            "$COLUMN_IS_HIDDEN_IN_LIBRARY = 1 OR $COLUMN_VAULT_STATE IN ('ORIGINAL_HIDDEN', 'ORIGIN_DELETE_PENDING', 'AWAITING_ORIGINAL_DELETE_CONSENT', 'ORIGINAL_DELETE_FAILED', 'ORIGINAL_DELETED_VERIFIED', 'RESTORING', 'RESTORE_FAILED', 'ORIGINAL_MISSING', 'ORIGINAL_CHANGED', 'REQUIRES_PERMISSION')",
             null,
             null,
             null,
@@ -375,6 +427,8 @@ class VaultDatabaseHelper(context: Context) : SQLiteOpenHelper(
         val hiddenIdx = cursor.getColumnIndex(COLUMN_IS_HIDDEN_IN_LIBRARY)
         val stateUpdatedIdx = cursor.getColumnIndex(COLUMN_STATE_UPDATED_AT_MS)
         val lastErrorIdx = cursor.getColumnIndex(COLUMN_LAST_ERROR)
+        val origDelVerifiedIdx = cursor.getColumnIndex(COLUMN_ORIGINAL_DELETE_VERIFIED)
+        val pubRestoredUriIdx = cursor.getColumnIndex(COLUMN_PUBLIC_RESTORED_URI)
 
         val createdAt = cursor.getLong(cursor.getColumnIndexOrThrow(COLUMN_CREATED_AT))
         return VaultVideo(
@@ -407,7 +461,9 @@ class VaultDatabaseHelper(context: Context) : SQLiteOpenHelper(
             stateUpdatedAtMs = if (stateUpdatedIdx != -1) {
                 cursor.getLong(stateUpdatedIdx).takeIf { it > 0L } ?: createdAt
             } else createdAt,
-            lastError = if (lastErrorIdx != -1) cursor.getString(lastErrorIdx)?.ifBlank { null } else null
+            lastError = if (lastErrorIdx != -1) cursor.getString(lastErrorIdx)?.ifBlank { null } else null,
+            originalDeleteVerified = if (origDelVerifiedIdx != -1) cursor.getInt(origDelVerifiedIdx) == 1 else false,
+            publicRestoredUri = if (pubRestoredUriIdx != -1) cursor.getString(pubRestoredUriIdx).orEmpty() else ""
         )
     }
 

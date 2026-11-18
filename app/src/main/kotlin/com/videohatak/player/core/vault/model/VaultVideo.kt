@@ -9,6 +9,10 @@ enum class VaultEntryState(val storageValue: String) {
     ENCRYPTING("ENCRYPTING"),
     ENCRYPTED_VERIFIED("ENCRYPTED_VERIFIED"),
     ORIGINAL_HIDDEN("ORIGINAL_HIDDEN"),
+    ORIGIN_DELETE_PENDING("ORIGIN_DELETE_PENDING"),
+    AWAITING_ORIGINAL_DELETE_CONSENT("AWAITING_ORIGINAL_DELETE_CONSENT"),
+    ORIGINAL_DELETE_FAILED("ORIGINAL_DELETE_FAILED"),
+    ORIGINAL_DELETED_VERIFIED("ORIGINAL_DELETED_VERIFIED"),
     HIDE_FAILED("HIDE_FAILED"),
     RESTORING("RESTORING"),
     ORIGINAL_RESTORED_VERIFIED("ORIGINAL_RESTORED_VERIFIED"),
@@ -20,6 +24,10 @@ enum class VaultEntryState(val storageValue: String) {
     val shouldHideOriginalInLibrary: Boolean
         get() = when (this) {
             ORIGINAL_HIDDEN,
+            ORIGIN_DELETE_PENDING,
+            AWAITING_ORIGINAL_DELETE_CONSENT,
+            ORIGINAL_DELETE_FAILED,
+            ORIGINAL_DELETED_VERIFIED,
             RESTORING,
             RESTORE_FAILED,
             ORIGINAL_MISSING,
@@ -190,10 +198,18 @@ data class VaultVideo(
     val vaultState: VaultEntryState = VaultEntryState.ENCRYPTED_VERIFIED,
     val isHiddenInLibrary: Boolean = false,
     val stateUpdatedAtMs: Long = createdAtEpochMs,
-    val lastError: String? = null
+    val lastError: String? = null,
+    val originalDeleteVerified: Boolean = false,
+    val publicRestoredUri: String = ""
 ) {
     val title: String get() = displayName
     val fileSizeBytes: Long get() = encryptedSizeBytes
+    val isOriginalDeletedProtected: Boolean
+        get() = originalDeleteVerified || vaultState == VaultEntryState.ORIGINAL_DELETED_VERIFIED
+    val needsOriginalDeletionAttention: Boolean
+        get() = vaultState == VaultEntryState.AWAITING_ORIGINAL_DELETE_CONSENT ||
+            vaultState == VaultEntryState.ORIGINAL_DELETE_FAILED ||
+            vaultState == VaultEntryState.ORIGIN_DELETE_PENDING
 
     fun toHiddenOriginalOrNull(): VaultHiddenOriginal? {
         if (!isHiddenInLibrary && !vaultState.shouldHideOriginalInLibrary) return null

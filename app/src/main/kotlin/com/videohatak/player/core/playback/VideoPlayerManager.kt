@@ -6,6 +6,7 @@ import android.util.Log
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
 import androidx.media3.datasource.DefaultDataSource
@@ -307,13 +308,29 @@ class VideoPlayerManager internal constructor(
                     ?: mediaItem.mediaMetadata.title?.toString()
                     ?: ""
                 lastReportedPositionMs = 0L
+                val audioOnlyActive = _uiState.value.isAudioOnlyMode || runCatching {
+                    C.TRACK_TYPE_VIDEO in exoPlayer.trackSelectionParameters.disabledTrackTypes
+                }.getOrDefault(false)
+                if (audioOnlyActive) {
+                    runCatching {
+                        val currentParams = exoPlayer.trackSelectionParameters
+                        if (C.TRACK_TYPE_VIDEO !in currentParams.disabledTrackTypes) {
+                            exoPlayer.trackSelectionParameters = currentParams
+                                .buildUpon()
+                                .setTrackTypeDisabled(C.TRACK_TYPE_VIDEO, true)
+                                .build()
+                        }
+                    }
+                }
                 _uiState.update {
                     it.copy(
                         mediaUri = uri,
                         title = title,
                         currentPositionMs = 0L,
-                        hasNextMediaItem = exoPlayer.hasNextMediaItem(),
-                        hasPreviousMediaItem = exoPlayer.hasPreviousMediaItem()
+                        errorMessage = null,
+                        isAudioOnlyMode = audioOnlyActive,
+                        hasNextMediaItem = runCatching { hasResolvableNextMediaItem() }.getOrDefault(exoPlayer.hasNextMediaItem()),
+                        hasPreviousMediaItem = runCatching { hasResolvablePreviousMediaItem() }.getOrDefault(exoPlayer.hasPreviousMediaItem())
                     )
                 }
                 if (isRealTransition && !isRepeat) {
@@ -337,11 +354,12 @@ class VideoPlayerManager internal constructor(
                     _uiState.update {
                         it.copy(
                             isBuffering = false,
+                            errorMessage = null,
                             durationMs = durationMs,
                             currentPositionMs = exoPlayer.currentPosition.coerceAtLeast(0L),
                             bufferedPositionMs = exoPlayer.bufferedPosition.coerceAtLeast(0L),
-                            hasNextMediaItem = exoPlayer.hasNextMediaItem(),
-                            hasPreviousMediaItem = exoPlayer.hasPreviousMediaItem()
+                            hasNextMediaItem = runCatching { hasResolvableNextMediaItem() }.getOrDefault(exoPlayer.hasNextMediaItem()),
+                            hasPreviousMediaItem = runCatching { hasResolvablePreviousMediaItem() }.getOrDefault(exoPlayer.hasPreviousMediaItem())
                         )
                     }
                 }
@@ -357,6 +375,18 @@ class VideoPlayerManager internal constructor(
                 Player.STATE_IDLE -> {
                     _uiState.update { it.copy(isBuffering = false) }
                 }
+            }
+        }
+
+        override fun onPlayerError(error: PlaybackException) {
+            Log.e(TAG, "ExoPlayer playback error: ${error.errorCodeName}", error)
+            stopProgressPolling()
+            _uiState.update {
+                it.copy(
+                    isPlaying = false,
+                    isBuffering = false,
+                    errorMessage = "تعذر تشغيل هذا المقطع (${error.errorCodeName})"
+                )
             }
         }
 
@@ -623,24 +653,128 @@ class VideoPlayerManager internal constructor(
         _uiState.update { it.copy(resumeMode = mode) }
     }
 
-    fun nextTrack(): Boolean {
-        if (exoPlayer.hasNextMediaItem()) {
-            exoPlayer.seekToNextMediaItem()
-            return true
-        }
-        return false
+    fun hasResolvableNextMediaItem(): Boolean {
+        val player = _exoPlayer ?: return false
+        return runCatching {
+            val count = player.mediaItemCount
+            if (count <= 0) return@runCatching false
+            if (player.hasNextMediaItem()) return@runCatching true
+            val mode = _uiState.value.playbackMode
+            (mode == PlaybackMode.REPEAT_PLAYLIST || mode == PlaybackMode.SHUFFLE_ALL) && count > 1
+        }.getOrDefault(false)
     }
 
-    fun previousTrack(): Boolean {
-        if (exoPlayer.hasPreviousMediaItem()) {
-            exoPlayer.seekToPreviousMediaItem()
-            return true
-        }
-        return false
+    fun hasResolvablePreviousMediaItem(): Boolean {
+        val player = _exoPlayer ?: return false
+        return runCatching {
+            val count = player.mediaItemCount
+            if (count <= 0) return@runCatching false
+            if (player.hasPreviousMediaItem()) return@runCatching true
+            val mode = _uiState.value.playbackMode
+            (mode == PlaybackMode.REPEAT_PLAYLIST || mode == PlaybackMode.SHUFFLE_ALL) && count > 1
+        }.getOrDefault(false)
+    }
+
+    fun nextTrack(resumePlaybackIfPausedOrEnded: Boolean = false): Boolean {
+        val player = _exoPlayer ?: return false
+        return runCatching {
+            val count = player.mediaItemCount
+            if (count <= 0) return@runCatching false
+            val shouldResume = resumePlaybackIfPausedOrEnded ||
+                player.playWhenReady ||
+                player.isPlaying ||
+                player.playbackState == Player.STATE_ENDED
+
+            var moved = false
+            if (player.hasNextMediaItem()) {
+                player.seekToNextMediaItem()
+                moved = true
+            } else {
+                val curIdx = player.currentMediaItemIndex
+                if (curIdx in 0 until (count - 1)) {
+                    player.seekTo(curIdx + 1, 0L)
+                    moved = true
+                } else {
+                    val mode = _uiState.value.playbackMode
+                    if ((mode == PlaybackMode.REPEAT_PLAYLIST || mode == PlaybackMode.SHUFFLE_ALL) && count > 0) {
+                        player.seekTo(0, 0L)
+                        moved = true
+                    }
+                }
+            }
+            if (moved) {
+                if (player.playbackState == Player.STATE_IDLE) {
+                    player.prepare()
+                }
+                if (shouldResume && !player.isPlaying) {
+                    player.play()
+                }
+                _uiState.update {
+                    it.copy(
+                        errorMessage = null,
+                        hasNextMediaItem = hasResolvableNextMediaItem(),
+                        hasPreviousMediaItem = hasResolvablePreviousMediaItem()
+                    )
+                }
+            }
+            moved
+        }.getOrDefault(false)
+    }
+
+    fun previousTrack(resumePlaybackIfPausedOrEnded: Boolean = false): Boolean {
+        val player = _exoPlayer ?: return false
+        return runCatching {
+            val count = player.mediaItemCount
+            if (count <= 0) return@runCatching false
+            val shouldResume = resumePlaybackIfPausedOrEnded ||
+                player.playWhenReady ||
+                player.isPlaying ||
+                player.playbackState == Player.STATE_ENDED
+
+            var moved = false
+            if (player.hasPreviousMediaItem()) {
+                player.seekToPreviousMediaItem()
+                moved = true
+            } else {
+                val curIdx = player.currentMediaItemIndex
+                if (curIdx > 0) {
+                    player.seekTo(curIdx - 1, 0L)
+                    moved = true
+                } else {
+                    val mode = _uiState.value.playbackMode
+                    if ((mode == PlaybackMode.REPEAT_PLAYLIST || mode == PlaybackMode.SHUFFLE_ALL) && count > 1) {
+                        player.seekTo(count - 1, 0L)
+                        moved = true
+                    }
+                }
+            }
+            if (moved) {
+                if (player.playbackState == Player.STATE_IDLE) {
+                    player.prepare()
+                }
+                if (shouldResume && !player.isPlaying) {
+                    player.play()
+                }
+                _uiState.update {
+                    it.copy(
+                        errorMessage = null,
+                        hasNextMediaItem = hasResolvableNextMediaItem(),
+                        hasPreviousMediaItem = hasResolvablePreviousMediaItem()
+                    )
+                }
+            }
+            moved
+        }.getOrDefault(false)
     }
 
     fun play() {
-        exoPlayer.play()
+        val player = _exoPlayer ?: return
+        runCatching {
+            if (player.playbackState == Player.STATE_IDLE) {
+                player.prepare()
+            }
+            player.play()
+        }
     }
 
     fun pause() {
@@ -932,9 +1066,15 @@ class VideoPlayerManager internal constructor(
         progressJob?.cancel()
         progressJob = scope.launch {
             while (isActive) {
-                val pos = exoPlayer.currentPosition.coerceAtLeast(0L)
-                val dur = exoPlayer.duration.coerceAtLeast(0L)
-                val buf = exoPlayer.bufferedPosition.coerceAtLeast(0L)
+                val player = _exoPlayer ?: break
+                val snapshot = runCatching {
+                    Triple(
+                        player.currentPosition.coerceAtLeast(0L),
+                        player.duration.coerceAtLeast(0L),
+                        player.bufferedPosition.coerceAtLeast(0L)
+                    )
+                }.getOrNull() ?: break
+                val (pos, dur, buf) = snapshot
                 _uiState.update {
                     it.copy(
                         currentPositionMs = pos,

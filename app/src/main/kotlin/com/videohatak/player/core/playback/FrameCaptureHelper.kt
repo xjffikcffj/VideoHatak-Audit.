@@ -154,10 +154,10 @@ object FrameCaptureHelper {
             } else {
                 result
             }
-        } catch (e: Exception) {
-            FrameCaptureResult.Error(e.localizedMessage ?: "تعذر حفظ لقطة الفيديو")
+        } catch (t: Throwable) {
+            FrameCaptureResult.Error(t.localizedMessage ?: "تعذر حفظ لقطة الفيديو")
         } finally {
-            onComplete()
+            runCatching { onComplete() }
         }
     }
 
@@ -227,12 +227,13 @@ object FrameCaptureHelper {
             retriever.setDataSource(context, uri)
             val timeUs = (positionMs.coerceAtLeast(0L)) * 1000L
             retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
-        } catch (_: Exception) {
+                ?.takeIf { !it.isRecycled }
+        } catch (_: Throwable) {
             null
         } finally {
             try {
                 retriever.release()
-            } catch (_: Exception) {
+            } catch (_: Throwable) {
             }
         }
     }

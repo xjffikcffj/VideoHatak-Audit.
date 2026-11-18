@@ -232,6 +232,7 @@ fun LibraryScreen(
     onVaultRestoreVideos: (Set<Long>) -> Unit = { ids -> ids.forEach(onVaultRestoreVideo) },
     onVaultDeleteVideo: (Long) -> Unit,
     onVaultDeleteVideos: (Set<Long>) -> Unit = { ids -> ids.forEach(onVaultDeleteVideo) },
+    onVaultRetryDeleteOriginal: (Long) -> Unit = {},
     onVaultUserInteraction: () -> Unit = {},
     seekIntervalSeconds: Int = PlaybackPreferencesRepository.DEFAULT_SEEK_INTERVAL_SECONDS,
     onSelectSeekIntervalSeconds: (Int) -> Unit = {},
@@ -1341,6 +1342,7 @@ fun LibraryScreen(
                             onRestoreVideos = onVaultRestoreVideos,
                             onDeleteVideo = onVaultDeleteVideo,
                             onDeleteVideos = onVaultDeleteVideos,
+                            onRetryDeleteOriginal = onVaultRetryDeleteOriginal,
                             onUserInteraction = onVaultUserInteraction,
                             modifier = Modifier.weight(1f)
                         )

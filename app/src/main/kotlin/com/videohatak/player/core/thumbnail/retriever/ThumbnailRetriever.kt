@@ -73,12 +73,12 @@ class ThumbnailRetriever(private val context: Context) {
                         retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                             ?.let { raw -> downscaleIfNeeded(raw, targetWidth, targetHeight) }
                     }
-                } catch (_: Exception) {
+                } catch (_: Throwable) {
                     null
                 } finally {
                     try {
                         retriever.release()
-                    } catch (_: Exception) { }
+                    } catch (_: Throwable) { }
                 }
             }
         }

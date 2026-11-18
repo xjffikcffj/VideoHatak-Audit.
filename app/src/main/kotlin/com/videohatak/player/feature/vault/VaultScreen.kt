@@ -128,6 +128,7 @@ fun VaultScreen(
     onRestoreVideos: (Set<Long>) -> Unit = { ids -> ids.forEach(onRestoreVideo) },
     onDeleteVideo: (Long) -> Unit,
     onDeleteVideos: (Set<Long>) -> Unit = { ids -> ids.forEach(onDeleteVideo) },
+    onRetryDeleteOriginal: (Long) -> Unit = {},
     onUserInteraction: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
@@ -731,7 +732,7 @@ fun VaultScreen(
                         )
                         Spacer(modifier = Modifier.height(6.dp))
                         Text(
-                            text = "اضغط على «نقل إلى الخزنة» لتشفير نسخة من الفيديو داخل الخزنة وإخفائه داخل VideoHatak فقط مع إبقاء الملف الأصلي سليمًا في موقعه.",
+                            text = "اضغط على «نقل إلى الخزنة» لتشفير الفيديو داخل الخزنة الخاصة وحذف النسخة الأصلية غير المشفرة من الجهاز بأمان، مع إمكانية فك التشفير والاستعادة للمكتبة في أي وقت.",
                             style = MaterialTheme.typography.bodySmall,
                             color = palette.onSurfaceMuted,
                             textAlign = TextAlign.Center,
@@ -784,7 +785,8 @@ fun VaultScreen(
                                 },
                                 onRename = { videoToRename = video },
                                 onRestore = { videoToRestore = video },
-                                onDelete = { videoToDelete = video }
+                                onDelete = { videoToDelete = video },
+                                onRetryDeleteOriginal = { onRetryDeleteOriginal(video.id) }
                             )
                         }
                     }
@@ -805,6 +807,7 @@ fun VaultVideoCard(
     onRename: () -> Unit,
     onRestore: () -> Unit = {},
     onDelete: () -> Unit,
+    onRetryDeleteOriginal: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val palette = LocalVideoHatakPalette.current
@@ -937,6 +940,40 @@ fun VaultVideoCard(
                         style = MaterialTheme.typography.labelSmall,
                         color = palette.onSurfaceMuted
                     )
+                    if (video.needsOriginalDeletionAttention) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Text(
+                                text = "الأصل ما زال على الجهاز",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.error,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Surface(
+                                shape = RoundedCornerShape(4.dp),
+                                color = palette.accent.copy(alpha = 0.16f),
+                                modifier = Modifier.clickable(onClick = onRetryDeleteOriginal)
+                            ) {
+                                Text(
+                                    text = "حذف الأصل الآن",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = palette.accent,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                )
+                            }
+                        }
+                    } else if (video.isOriginalDeletedProtected) {
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = "محمي بالكامل • حُذف الأصل",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = palette.accent
+                        )
+                    }
                 }
 
                 Box {
@@ -952,6 +989,28 @@ fun VaultVideoCard(
                         expanded = showMenu,
                         onDismissRequest = { showMenu = false }
                     ) {
+                        if (video.needsOriginalDeletionAttention) {
+                            DropdownMenuItem(
+                                text = {
+                                    Text(
+                                        text = "حذف الأصل الآن",
+                                        color = MaterialTheme.colorScheme.error,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = Icons.Default.DeleteForever,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.error
+                                    )
+                                },
+                                onClick = {
+                                    showMenu = false
+                                    onRetryDeleteOriginal()
+                                }
+                            )
+                        }
                         DropdownMenuItem(
                             text = { Text("تغيير الاسم") },
                             leadingIcon = {

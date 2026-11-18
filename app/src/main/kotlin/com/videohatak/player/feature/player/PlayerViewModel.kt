@@ -197,8 +197,8 @@ class PlayerViewModel(
                     playerManager = playerManager,
                     playbackPreferences = playbackPreferences,
                     positionManager = positionManager,
-                    subtitlePreferences = SubtitlePreferencesRepository(application),
-                    thumbnailManager = ThumbnailPreviewManager(application)
+                    subtitlePreferences = runCatching { SubtitlePreferencesRepository(application) }.getOrNull(),
+                    thumbnailManager = runCatching { ThumbnailPreviewManager(application) }.getOrNull()
                 ) as T
             }
         }
@@ -322,11 +322,17 @@ class PlayerViewModel(
             }
             ResumeMode.RESUME -> {
                 _pendingResumePrompt.value = null
-                val savedPos = playbackPreferences.getSavedVideoPosition(
-                    targetUri,
-                    durationMs,
-                    legacyVideoId = legacyVideoId
-                )
+                val savedPos = try {
+                    playbackPreferences.getSavedVideoPosition(
+                        targetUri,
+                        durationMs,
+                        legacyVideoId = legacyVideoId
+                    )
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Exception) {
+                    0L
+                }
                 playerManager.applyRestoredPosition(targetUri, targetGeneration, savedPos)
             }
         }
@@ -482,6 +488,10 @@ class PlayerViewModel(
                     durationMs = startVideo.durationMs,
                     legacyVideoId = startVideo.id
                 )
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Exception) {
+                _subtitleFeedbackMessage.value = "تعذر تحميل قائمة التشغيل"
             } finally {
                 _isPlaylistLoadPending.value = false
             }

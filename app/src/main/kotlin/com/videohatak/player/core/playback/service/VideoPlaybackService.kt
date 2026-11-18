@@ -9,11 +9,14 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.os.Build
+import android.util.Log
 import androidx.annotation.OptIn
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
+import androidx.media3.common.ForwardingPlayer
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.session.MediaSession
@@ -34,6 +37,7 @@ class VideoPlaybackService : MediaSessionService() {
     private var mediaSession: MediaSession? = null
     private var attachedPlayer: Player? = null
     private var isForegroundStarted = false
+    private var lastNotificationActionError: String? = null
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var artworkLoadJob: Job? = null
@@ -41,6 +45,7 @@ class VideoPlaybackService : MediaSessionService() {
     private var currentArtworkBitmap: Bitmap? = null
 
     companion object {
+        private const val TAG = "VideoPlaybackService"
         private const val CHANNEL_ID = "videohatak_playback_channel"
         private const val NOTIFICATION_ID = 1001
 
@@ -92,6 +97,107 @@ class VideoPlaybackService : MediaSessionService() {
             if (mediaItemCount <= 0) return false
             return playbackState == Player.STATE_READY || playbackState == Player.STATE_BUFFERING
         }
+
+        internal fun shouldRetainActiveServiceOnCommand(
+            mediaItemCount: Int,
+            playbackState: Int,
+            isPlaying: Boolean,
+            playWhenReady: Boolean,
+            isVaultPrivate: Boolean
+        ): Boolean {
+            if (isVaultPrivate || mediaItemCount <= 0) return false
+            return playbackState == Player.STATE_READY ||
+                playbackState == Player.STATE_BUFFERING ||
+                isPlaying ||
+                playWhenReady
+        }
+    }
+
+    private fun buildSessionForwardingPlayer(
+        playerManager: VideoPlayerManager,
+        delegate: Player
+    ): ForwardingPlayer = object : ForwardingPlayer(delegate) {
+        override fun getAvailableCommands(): Player.Commands {
+            val base = super.getAvailableCommands()
+            if (isVaultPlaybackActive(delegate) || delegate.mediaItemCount <= 0) {
+                return base
+            }
+            val builder = base.buildUpon()
+                .add(COMMAND_PLAY_PAUSE)
+                .add(COMMAND_STOP)
+            if (playerManager.hasResolvableNextMediaItem() || delegate.hasNextMediaItem()) {
+                builder.add(COMMAND_SEEK_TO_NEXT)
+                builder.add(COMMAND_SEEK_TO_NEXT_MEDIA_ITEM)
+            }
+            if (playerManager.hasResolvablePreviousMediaItem() || delegate.hasPreviousMediaItem()) {
+                builder.add(COMMAND_SEEK_TO_PREVIOUS)
+                builder.add(COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM)
+            }
+            return builder.build()
+        }
+
+        override fun hasNextMediaItem(): Boolean =
+            playerManager.hasResolvableNextMediaItem() || super.hasNextMediaItem()
+
+        override fun hasPreviousMediaItem(): Boolean =
+            playerManager.hasResolvablePreviousMediaItem() || super.hasPreviousMediaItem()
+
+        override fun seekToNext() {
+            if (!isVaultPlaybackActive(delegate)) {
+                playerManager.nextTrack(resumePlaybackIfPausedOrEnded = true)
+                refreshNotificationFromState(delegate)
+            }
+        }
+
+        override fun seekToNextMediaItem() {
+            if (!isVaultPlaybackActive(delegate)) {
+                playerManager.nextTrack(resumePlaybackIfPausedOrEnded = true)
+                refreshNotificationFromState(delegate)
+            }
+        }
+
+        override fun seekToPrevious() {
+            if (!isVaultPlaybackActive(delegate)) {
+                playerManager.previousTrack(resumePlaybackIfPausedOrEnded = true)
+                refreshNotificationFromState(delegate)
+            }
+        }
+
+        override fun seekToPreviousMediaItem() {
+            if (!isVaultPlaybackActive(delegate)) {
+                playerManager.previousTrack(resumePlaybackIfPausedOrEnded = true)
+                refreshNotificationFromState(delegate)
+            }
+        }
+
+        override fun play() {
+            if (!isVaultPlaybackActive(delegate)) {
+                playerManager.play()
+            }
+        }
+
+        override fun pause() {
+            playerManager.pause()
+        }
+
+        override fun stop() {
+            playerManager.stopPlayback()
+            stopForegroundServiceCleanly()
+            stopSelf()
+        }
+    }
+
+    private fun refreshNotificationFromState(player: Player) {
+        if (isVaultPlaybackActive(player) || player.mediaItemCount <= 0) {
+            stopForegroundServiceCleanly()
+            return
+        }
+        val keepForeground = shouldKeepForegroundNotification(
+            mediaItemCount = player.mediaItemCount,
+            playbackState = player.playbackState,
+            isVaultPrivate = false
+        ) || player.isPlaying || player.playWhenReady
+        updateNotification(player, keepForeground = keepForeground)
     }
 
     private val playerListener = object : Player.Listener {
@@ -103,7 +209,8 @@ class VideoPlaybackService : MediaSessionService() {
                 stopForegroundServiceCleanly()
                 return
             }
-            updateNotification(player, shouldStayForeground(player))
+            val keepFg = shouldStayForeground(player) || (player.mediaItemCount > 0 && player.playWhenReady)
+            updateNotification(player, keepFg)
         }
 
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
@@ -116,7 +223,8 @@ class VideoPlaybackService : MediaSessionService() {
             if (mediaItem != null) {
                 currentArtworkUriKey = null
                 currentArtworkBitmap = null
-                updateNotification(player, shouldStayForeground(player))
+                val keepFg = shouldStayForeground(player) || player.playWhenReady || player.isPlaying
+                updateNotification(player, keepFg)
             }
         }
 
@@ -127,13 +235,40 @@ class VideoPlaybackService : MediaSessionService() {
                 stopSelf()
                 return
             }
-            if (playbackState == Player.STATE_IDLE && player.mediaItemCount == 0) {
-                stopForegroundServiceCleanly()
-            } else if (playbackState == Player.STATE_BUFFERING || playbackState == Player.STATE_READY) {
-                updateNotification(player, shouldStayForeground(player))
-            } else if (playbackState == Player.STATE_ENDED) {
-                stopForegroundServiceCleanly()
+            when {
+                playbackState == Player.STATE_IDLE && player.mediaItemCount == 0 -> {
+                    stopForegroundServiceCleanly()
+                }
+                playbackState == Player.STATE_BUFFERING || playbackState == Player.STATE_READY -> {
+                    updateNotification(player, keepForeground = true)
+                }
+                playbackState == Player.STATE_ENDED -> {
+                    // During track switches/Next button press, playWhenReady stays true briefly while preparing next item.
+                    if (player.mediaItemCount > 0 && player.playWhenReady) {
+                        updateNotification(player, keepForeground = true)
+                    } else {
+                        stopForegroundServiceCleanly()
+                    }
+                }
             }
+        }
+
+        override fun onPlayerError(error: PlaybackException) {
+            val player = attachedPlayer ?: return
+            Log.e(TAG, "Player error inside VideoPlaybackService: ${error.errorCodeName}", error)
+            if (isVaultPlaybackActive(player) || player.mediaItemCount <= 0) {
+                stopForegroundServiceCleanly()
+                return
+            }
+            val manager = runCatching { VideoPlayerManager.getInstance(applicationContext) }.getOrNull()
+            if (manager != null && manager.hasResolvableNextMediaItem()) {
+                val advanced = manager.nextTrack(resumePlaybackIfPausedOrEnded = player.playWhenReady)
+                if (advanced) {
+                    updateNotification(player, keepForeground = true)
+                    return
+                }
+            }
+            stopForegroundServiceCleanly()
         }
     }
 
@@ -162,7 +297,8 @@ class VideoPlaybackService : MediaSessionService() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
-        mediaSession = MediaSession.Builder(this, exoPlayer)
+        val forwardingPlayer = buildSessionForwardingPlayer(playerManager, exoPlayer)
+        mediaSession = MediaSession.Builder(this, forwardingPlayer)
             .setSessionActivity(sessionActivityPendingIntent)
             .build()
 
@@ -185,7 +321,10 @@ class VideoPlaybackService : MediaSessionService() {
             return
         }
         if (player.mediaItemCount > 0 || startInForegroundRequired) {
-            updateNotification(player, keepForeground = startInForegroundRequired || shouldStayForeground(player))
+            updateNotification(
+                player,
+                keepForeground = startInForegroundRequired || shouldStayForeground(player) || player.playWhenReady
+            )
         }
     }
 
@@ -211,27 +350,34 @@ class VideoPlaybackService : MediaSessionService() {
             }
             ACTION_NEXT -> {
                 if (player.mediaItemCount > 0) {
-                    playerManager.nextTrack()
+                    playerManager.nextTrack(resumePlaybackIfPausedOrEnded = true)
                 }
             }
             ACTION_PREVIOUS -> {
                 if (player.mediaItemCount > 0) {
-                    playerManager.previousTrack()
+                    playerManager.previousTrack(resumePlaybackIfPausedOrEnded = true)
                 }
             }
             ACTION_STOP -> {
+                if (!isForegroundStarted && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    postTransientSilentCleanupForeground()
+                }
                 playerManager.stopPlayback()
                 stopForegroundServiceCleanly()
-                stopSelf()
+                stopSelfResult(startId)
                 return START_NOT_STICKY
             }
         }
 
-        val hasActiveMedia = player.mediaItemCount > 0 &&
-            player.playbackState != Player.STATE_IDLE &&
-            player.playbackState != Player.STATE_ENDED
-        if (hasActiveMedia || player.isPlaying || player.playWhenReady) {
-            updateNotification(player, keepForeground = shouldStayForeground(player) || !isForegroundStarted)
+        val keepActive = shouldRetainActiveServiceOnCommand(
+            mediaItemCount = player.mediaItemCount,
+            playbackState = player.playbackState,
+            isPlaying = player.isPlaying,
+            playWhenReady = player.playWhenReady,
+            isVaultPrivate = isVaultPlaybackActive(player)
+        )
+        if (keepActive) {
+            updateNotification(player, keepForeground = true)
             return START_STICKY
         } else {
             if (!isForegroundStarted && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -265,16 +411,19 @@ class VideoPlaybackService : MediaSessionService() {
         return mediaSession
     }
 
+    internal fun buildServiceActionPendingIntent(action: String, requestCode: Int): PendingIntent =
+        serviceActionPendingIntent(action, requestCode)
+
     private fun serviceActionPendingIntent(action: String, requestCode: Int): PendingIntent {
         val intent = Intent(this, VideoPlaybackService::class.java).apply {
             this.action = action
         }
-        return PendingIntent.getService(
-            this,
-            requestCode,
-            intent,
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
+        val flags = PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            PendingIntent.getForegroundService(this, requestCode, intent, flags)
+        } else {
+            PendingIntent.getService(this, requestCode, intent, flags)
+        }
     }
 
     private fun updateNotification(player: Player, keepForeground: Boolean) {
@@ -320,8 +469,9 @@ class VideoPlaybackService : MediaSessionService() {
             return fallback
         }
 
-        if (currentArtworkUriKey == uriKey && currentArtworkBitmap != null && !currentArtworkBitmap!!.isRecycled) {
-            return currentArtworkBitmap!!
+        val existingValid = currentArtworkBitmap?.takeIf { !it.isRecycled }
+        if (currentArtworkUriKey == uriKey && existingValid != null) {
+            return existingValid
         }
 
         val immediate = MediaNotificationArtworkLoader.resolveImmediateArtwork(
@@ -363,7 +513,8 @@ class VideoPlaybackService : MediaSessionService() {
                         isPlaying = player.isPlaying || (player.playWhenReady && player.playbackState == Player.STATE_BUFFERING),
                         artwork = loaded
                     )
-                    postNotification(refreshed, keepForeground = shouldStayForeground(player))
+                    val keepFg = shouldStayForeground(player) || player.isPlaying || player.playWhenReady
+                    postNotification(refreshed, keepForeground = keepFg)
                 }
             }
         }
@@ -458,8 +609,20 @@ class VideoPlaybackService : MediaSessionService() {
             } else {
                 0
             }
-            ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, fgType)
-            isForegroundStarted = true
+            val started = runCatching {
+                ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, fgType)
+                true
+            }.onFailure { err ->
+                lastNotificationActionError = err.localizedMessage
+                Log.e(TAG, "Failed to post foreground playback notification", err)
+            }.getOrDefault(false)
+            if (started) {
+                isForegroundStarted = true
+            } else {
+                runCatching {
+                    getSystemService(NotificationManager::class.java)?.notify(NOTIFICATION_ID, notification)
+                }
+            }
         } else {
             stopForegroundServiceCleanly()
         }

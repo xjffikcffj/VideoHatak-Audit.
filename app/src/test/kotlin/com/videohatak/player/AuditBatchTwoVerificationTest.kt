@@ -193,7 +193,7 @@ class AuditBatchTwoVerificationTest {
 
     private suspend fun drainAsync(timeoutMs: Long = 5_000L, condition: suspend () -> Boolean) {
         val deadline = System.currentTimeMillis() + timeoutMs
-        while (!condition()) {
+        while (true) {
             testDispatcher.scheduler.advanceUntilIdle()
             if (condition()) return
             if (System.currentTimeMillis() >= deadline) {
@@ -947,6 +947,66 @@ class AuditBatchTwoVerificationTest {
         assertEquals(listOf("hook:$rowId", "db.deleteVideo:$rowId"), operationLog.toList())
         assertTrue(vm.vaultVideos.first().isEmpty())
         assertTrue("Unreferenced orphan file must stay preserved", orphanFile.exists())
+    }
+
+    @Test
+    fun scenario8c_vaultViewModelVideosUpdatesImmediatelyOnDeleteAcrossConcurrentRefresh() = runBlocking {
+        val context: Context = testApp()
+        val vaultDir = File(context.filesDir, "vault_encrypted")
+        vaultDir.deleteRecursively()
+        vaultDir.mkdirs()
+
+        val delegateDb = FakeVaultDbStore()
+        val crypto = VaultCryptoManager(keyStoreProvider = "TEST_PROVIDER")
+        val repo = VaultRepositoryImpl(context, crypto, delegateDb)
+        repo.setUnlocked(true)
+
+        val encName = "vault_concurrent_vm.enc"
+        val encFile = File(vaultDir, encName).apply { writeBytes(byteArrayOf(5, 6, 7, 8)) }
+        val encMeta = crypto.encryptMetadata("""{"title":"فيديو التزامن","file":"$encName","mime":"video/mp4"}""")
+        val rowId = delegateDb.insertVideo(
+            VaultVideo(
+                id = 0L,
+                displayName = "مقطع خاص مشفر",
+                originalSizeBytes = 4L,
+                encryptedSizeBytes = 4L,
+                durationMs = 3_000L,
+                mimeType = "application/octet-stream",
+                width = 640,
+                height = 480,
+                relativeEncryptedPath = encName,
+                createdAtEpochMs = 300L,
+                ivBase64 = "aXY=",
+                encryptedMetaBase64 = encMeta
+            )
+        )
+        repo.refresh()
+
+        val scope = createScope()
+        val secPrefs = VaultSecurityPreferences(createDataStore(scope, "sc8c_vs_"))
+        val vm = createManagedViewModel {
+            VaultViewModel(
+                repository = repo,
+                biometricHelper = VaultBiometricHelper(testApp()),
+                securityPreferences = secPrefs
+            )
+        }
+
+        // Verify ViewModel starts synchronized with populated repo without waiting for extra stateIn hop
+        assertEquals(1, vm.vaultVideos.value.size)
+
+        // Launch concurrent refreshes alongside deleteVideo and assert final ViewModel state is empty and stays empty
+        vm.refresh()
+        vm.deleteVideo(rowId)
+        vm.refresh()
+
+        drainAsync {
+            delegateDb.getVideoById(rowId) == null &&
+                !encFile.exists() &&
+                repo.vaultVideos.value.isEmpty()
+        }
+        assertTrue(vm.vaultVideos.value.isEmpty())
+        assertTrue(vm.vaultVideos.first().isEmpty())
     }
 
     // -------------------------------------------------------------------------

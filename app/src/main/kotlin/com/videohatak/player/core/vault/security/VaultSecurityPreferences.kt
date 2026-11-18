@@ -13,6 +13,8 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.security.MessageDigest
 import java.security.SecureRandom
 import javax.crypto.SecretKeyFactory
@@ -155,6 +157,7 @@ sealed interface PinVerifyResult {
     data object Success : PinVerifyResult
     data class InvalidPin(val failedAttempts: Int) : PinVerifyResult
     data class LockedOut(val remainingMs: Long, val failedAttempts: Int) : PinVerifyResult
+    data object StorageFailure : PinVerifyResult
 }
 
 sealed interface PinChangeResult {
@@ -188,6 +191,14 @@ class VaultSecurityPreferences(
 ) : VaultSecurityBackupStore {
     constructor(context: Context) : this(context.vaultSecurityDataStore)
 
+    private val stateMutex = Mutex()
+
+    @Volatile
+    private var fallbackFailedAttempts: Int = 0
+
+    @Volatile
+    private var fallbackLockoutUntilMs: Long = 0L
+
     private val pinHashKey = stringPreferencesKey("vault_pin_hash_v1")
     private val pinSaltKey = stringPreferencesKey("vault_pin_salt_v1")
     private val pinAlgoKey = stringPreferencesKey("vault_pin_algo_v1")
@@ -203,12 +214,20 @@ class VaultSecurityPreferences(
         VaultAutoLockTimeout.fromName(prefs[autoLockKey])
     }
 
-    suspend fun hasPinConfigured(): Boolean {
+    suspend fun hasPinConfigured(): Boolean = stateMutex.withLock {
+        hasPinConfiguredLocked()
+    }
+
+    private suspend fun hasPinConfiguredLocked(): Boolean {
         val prefs = dataStore.data.first()
         return !prefs[pinHashKey].isNullOrBlank() && !prefs[pinSaltKey].isNullOrBlank()
     }
 
-    suspend fun setPin(pin: String): Boolean {
+    suspend fun setPin(pin: String): Boolean = stateMutex.withLock {
+        setPinLocked(pin)
+    }
+
+    private suspend fun setPinLocked(pin: String): Boolean {
         if (!VaultPinHasher.isValidPinFormat(pin)) return false
         val record = try {
             VaultPinHasher.hashPinWithAlgorithm(pin)
@@ -223,6 +242,8 @@ class VaultSecurityPreferences(
                 prefs[failedAttemptsKey] = 0
                 prefs[lockoutUntilKey] = 0L
             }
+            fallbackFailedAttempts = 0
+            fallbackLockoutUntilMs = 0L
             true
         } catch (ce: CancellationException) {
             throw ce
@@ -231,28 +252,54 @@ class VaultSecurityPreferences(
         }
     }
 
-    suspend fun getRemainingLockoutMs(nowMs: Long = System.currentTimeMillis()): Long {
+    suspend fun getRemainingLockoutMs(nowMs: Long = System.currentTimeMillis()): Long = stateMutex.withLock {
         val prefs = dataStore.data.first()
-        val lockoutUntil = prefs[lockoutUntilKey] ?: 0L
-        return (lockoutUntil - nowMs).coerceAtLeast(0L)
+        val lockoutUntil = maxOf(prefs[lockoutUntilKey] ?: 0L, fallbackLockoutUntilMs)
+        return@withLock (lockoutUntil - nowMs).coerceAtLeast(0L)
     }
 
     suspend fun resetPinLockout() {
-        dataStore.edit { prefs ->
-            prefs[failedAttemptsKey] = 0
-            prefs[lockoutUntilKey] = 0L
+        stateMutex.withLock {
+            resetPinLockoutLocked()
+        }
+    }
+
+    private suspend fun resetPinLockoutLocked() {
+        fallbackFailedAttempts = 0
+        fallbackLockoutUntilMs = 0L
+        try {
+            dataStore.edit { prefs ->
+                prefs[failedAttemptsKey] = 0
+                prefs[lockoutUntilKey] = 0L
+            }
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Exception) {
         }
     }
 
     suspend fun verifyPinWithRateLimit(
         pin: String,
         nowMs: Long = System.currentTimeMillis()
+    ): PinVerifyResult = stateMutex.withLock {
+        verifyPinWithRateLimitLocked(pin, nowMs)
+    }
+
+    private suspend fun verifyPinWithRateLimitLocked(
+        pin: String,
+        nowMs: Long
     ): PinVerifyResult {
-        val prefs = dataStore.data.first()
+        val prefs = try {
+            dataStore.data.first()
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Exception) {
+            return PinVerifyResult.StorageFailure
+        }
         val storedHash = prefs[pinHashKey] ?: return PinVerifyResult.InvalidPin(0)
         val storedSalt = prefs[pinSaltKey] ?: return PinVerifyResult.InvalidPin(0)
-        val currentAttempts = prefs[failedAttemptsKey] ?: 0
-        val lockoutUntil = prefs[lockoutUntilKey] ?: 0L
+        val currentAttempts = maxOf(prefs[failedAttemptsKey] ?: 0, fallbackFailedAttempts)
+        val lockoutUntil = maxOf(prefs[lockoutUntilKey] ?: 0L, fallbackLockoutUntilMs)
 
         if (lockoutUntil > nowMs) {
             return PinVerifyResult.LockedOut(
@@ -264,13 +311,10 @@ class VaultSecurityPreferences(
         val storedAlgo = prefs[pinAlgoKey] ?: VaultPinHasher.ALGORITHM_SHA256
         val isMatch = VaultPinHasher.verifyPin(pin, storedHash, storedSalt, storedAlgo)
         if (isMatch) {
-            if (currentAttempts > 0 || lockoutUntil > 0L) {
-                try {
-                    resetPinLockout()
-                } catch (ce: CancellationException) {
-                    throw ce
-                } catch (_: Exception) {
-                }
+            fallbackFailedAttempts = 0
+            fallbackLockoutUntilMs = 0L
+            if ((prefs[failedAttemptsKey] ?: 0) > 0 || (prefs[lockoutUntilKey] ?: 0L) > 0L) {
+                resetPinLockoutLocked()
             }
             return PinVerifyResult.Success
         }
@@ -278,9 +322,17 @@ class VaultSecurityPreferences(
         val newAttempts = currentAttempts + 1
         val lockoutDurationMs = VaultPinLockoutPolicy.computeLockoutDurationMs(newAttempts)
         val newLockoutUntil = if (lockoutDurationMs > 0L) nowMs + lockoutDurationMs else 0L
-        dataStore.edit { editPrefs ->
-            editPrefs[failedAttemptsKey] = newAttempts
-            editPrefs[lockoutUntilKey] = newLockoutUntil
+        fallbackFailedAttempts = newAttempts
+        fallbackLockoutUntilMs = newLockoutUntil
+        try {
+            dataStore.edit { editPrefs ->
+                editPrefs[failedAttemptsKey] = newAttempts
+                editPrefs[lockoutUntilKey] = newLockoutUntil
+            }
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Exception) {
+            // Keep monotonic in-memory rate-limit counters intact even when DataStore writes fail.
         }
 
         return if (lockoutDurationMs > 0L) {
@@ -302,23 +354,43 @@ class VaultSecurityPreferences(
         if (!VaultPinHasher.isValidPinFormat(newPin)) {
             return PinChangeResult.InvalidNewPinFormat
         }
-        if (!hasPinConfigured()) {
-            return if (setPin(newPin)) PinChangeResult.Success else PinChangeResult.StorageFailure
-        }
-        return when (val verify = verifyPinWithRateLimit(currentPin, nowMs)) {
-            is PinVerifyResult.Success -> {
-                if (setPin(newPin)) {
-                    PinChangeResult.Success
-                } else {
-                    PinChangeResult.StorageFailure
+        return try {
+            stateMutex.withLock {
+                val configured = try {
+                    hasPinConfiguredLocked()
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Exception) {
+                    return@withLock PinChangeResult.StorageFailure
+                }
+                if (!configured) {
+                    return@withLock if (setPinLocked(newPin)) {
+                        PinChangeResult.Success
+                    } else {
+                        PinChangeResult.StorageFailure
+                    }
+                }
+                when (val verify = verifyPinWithRateLimitLocked(currentPin, nowMs)) {
+                    is PinVerifyResult.Success -> {
+                        if (setPinLocked(newPin)) {
+                            PinChangeResult.Success
+                        } else {
+                            PinChangeResult.StorageFailure
+                        }
+                    }
+                    is PinVerifyResult.InvalidPin -> PinChangeResult.InvalidCurrentPin(verify.failedAttempts)
+                    is PinVerifyResult.LockedOut -> PinChangeResult.LockedOut(verify.remainingMs, verify.failedAttempts)
+                    is PinVerifyResult.StorageFailure -> PinChangeResult.StorageFailure
                 }
             }
-            is PinVerifyResult.InvalidPin -> PinChangeResult.InvalidCurrentPin(verify.failedAttempts)
-            is PinVerifyResult.LockedOut -> PinChangeResult.LockedOut(verify.remainingMs, verify.failedAttempts)
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Exception) {
+            PinChangeResult.StorageFailure
         }
     }
 
-    suspend fun clearPin() {
+    suspend fun clearPin() = stateMutex.withLock {
         dataStore.edit { prefs ->
             prefs.remove(pinHashKey)
             prefs.remove(pinSaltKey)
@@ -326,6 +398,8 @@ class VaultSecurityPreferences(
             prefs.remove(failedAttemptsKey)
             prefs.remove(lockoutUntilKey)
         }
+        fallbackFailedAttempts = 0
+        fallbackLockoutUntilMs = 0L
     }
 
     override suspend fun setAutoLockTimeout(timeout: VaultAutoLockTimeout) {

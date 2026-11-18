@@ -438,9 +438,34 @@ class UserFixesVerificationTest {
         assertTrue(changeMsg.contains("تعذر"))
         assertTrue("No success event may be emitted when PIN storage write fails", vaultMessages.isEmpty())
 
-        // Old PIN must still unlock and new PIN must be rejected
+        // Old PIN must still unlock and new PIN must be rejected without crashing on failed attempt writes
         assertEquals(PinVerifyResult.Success, prefs.verifyPinWithRateLimit("OldPin#2026", nowMs = 4000L))
-        assertTrue(prefs.verifyPinWithRateLimit("NewPin#2026", nowMs = 5000L) is PinVerifyResult.InvalidPin)
+        val bad1 = prefs.verifyPinWithRateLimit("NewPin#2026", nowMs = 5000L)
+        assertTrue(bad1 is PinVerifyResult.InvalidPin && bad1.failedAttempts == 1)
+
+        // Wrong current PIN during changePin under write failure returns InvalidCurrentPin cleanly
+        val wrongCurrentChange = prefs.changePin("WrongPin#2026", "NewPin#2026", nowMs = 5100L)
+        assertTrue(wrongCurrentChange is PinChangeResult.InvalidCurrentPin && wrongCurrentChange.failedAttempts == 2)
+
+        // Third wrong attempt still enforces rate-limit lockout via monotonic fallback state
+        val bad3 = prefs.verifyPinWithRateLimit("NewPin#2026", nowMs = 5200L)
+        assertTrue(bad3 is PinVerifyResult.LockedOut && bad3.failedAttempts == 3)
+
+        // After lockout window expires, old PIN still unlocks cleanly
+        assertEquals(PinVerifyResult.Success, prefs.verifyPinWithRateLimit("OldPin#2026", nowMs = 40_000L))
+
+        // Simulated DataStore READ failure yields StorageFailure cleanly instead of leaking IOException
+        val failingReadDataStore = object : DataStore<Preferences> {
+            override val data: Flow<Preferences> = kotlinx.coroutines.flow.flow {
+                throw IOException("Simulated DataStore read failure")
+            }
+            override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+                throw IOException("Simulated DataStore write failure")
+            }
+        }
+        val unreadablePrefs = VaultSecurityPreferences(failingReadDataStore)
+        assertEquals(PinVerifyResult.StorageFailure, unreadablePrefs.verifyPinWithRateLimit("OldPin#2026", nowMs = 1000L))
+        assertEquals(PinChangeResult.StorageFailure, unreadablePrefs.changePin("OldPin#2026", "NewPin#2026", nowMs = 1000L))
 
         // Encrypted vault payload remains intact & readable
         val outBuf = ByteArray(payload.size)

@@ -137,7 +137,7 @@ class VaultRepositoryImpl internal constructor(
         private set
 
     private val _vaultVideos = MutableStateFlow<List<VaultVideo>>(emptyList())
-    override val vaultVideos: Flow<List<VaultVideo>> = _vaultVideos.asStateFlow()
+    override val vaultVideos: StateFlow<List<VaultVideo>> = _vaultVideos.asStateFlow()
 
     private val _vaultCount = MutableStateFlow(
         runCatching { dbHelper.getVideoCount() }.getOrDefault(0)

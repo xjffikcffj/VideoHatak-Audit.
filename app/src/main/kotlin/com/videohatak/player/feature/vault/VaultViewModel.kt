@@ -42,8 +42,10 @@ class VaultViewModel(
     beforeDeleteVideo: (suspend (Long) -> Unit)? = null
 ) : ViewModel() {
 
-    val vaultVideos: StateFlow<List<VaultVideo>> = repository.vaultVideos
-        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+    @Suppress("UNCHECKED_CAST")
+    val vaultVideos: StateFlow<List<VaultVideo>> =
+        (repository.vaultVideos as? StateFlow<List<VaultVideo>>)
+            ?: repository.vaultVideos.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     val videos: StateFlow<List<VaultVideo>> = vaultVideos
 
@@ -227,6 +229,10 @@ class VaultViewModel(
                     _biometricError.value = "تم تعليق المحاولة مؤقتًا بعد عدة أخطاء — انتظر $waitSec ثانية"
                     onResult(false)
                 }
+                is PinVerifyResult.StorageFailure -> {
+                    _biometricError.value = "تعذر قراءة بيانات أمان الخزنة من التخزين"
+                    onResult(false)
+                }
             }
         }
     }
@@ -310,7 +316,14 @@ class VaultViewModel(
                 onComplete(false, "تعذر الوصول إلى إعدادات أمان الخزنة")
                 return@launch
             }
-            when (val changeResult = prefs.changePin(currentPin, newPin, nowMsProvider())) {
+            val changeResult = try {
+                prefs.changePin(currentPin, newPin, nowMsProvider())
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                throw ce
+            } catch (_: Exception) {
+                PinChangeResult.StorageFailure
+            }
+            when (changeResult) {
                 is PinChangeResult.Success -> {
                     repository.recordActivity(nowMsProvider())
                     val okMsg = "تم تغيير رمز قفل الخزنة بنجاح"

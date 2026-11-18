@@ -5,6 +5,14 @@ import com.videohatak.player.core.playlist.model.Playlist
 import com.videohatak.player.core.playlist.model.PlaylistItem
 import kotlinx.coroutines.flow.Flow
 
+data class PlaylistAddOutcome(
+    val targetPlaylistCount: Int = 0,
+    val addedCount: Int = 0,
+    val duplicateCount: Int = 0,
+    val failedCount: Int = 0,
+    val playlistTitles: List<String> = emptyList()
+)
+
 interface PlaylistRepository {
     companion object {
         const val FAVORITES_PLAYLIST_TITLE = "المفضلة ⭐"
@@ -24,8 +32,13 @@ interface PlaylistRepository {
     suspend fun deletePlaylist(id: Long): Boolean
     suspend fun getPlaylistItems(playlistId: Long): List<PlaylistItem>
     suspend fun getPlaylistWithItems(playlistId: Long): Pair<Playlist, List<PlaylistItem>>?
+    suspend fun ensureFavoritesPlaylist(): Playlist? = null
     suspend fun addVideoToPlaylists(video: VideoItem, playlistIds: List<Long>)
     suspend fun removeVideoFromPlaylist(itemId: Long, playlistId: Long)
+    suspend fun removeVideoFromPlaylistDetailed(itemId: Long, playlistId: Long): Boolean {
+        removeVideoFromPlaylist(itemId, playlistId)
+        return true
+    }
     suspend fun moveItem(playlistId: Long, fromIndex: Int, toIndex: Int)
     suspend fun relinkMissingItems(playlistId: Long): Int
     suspend fun isFavorite(video: VideoItem): Boolean = false
@@ -33,8 +46,25 @@ interface PlaylistRepository {
     suspend fun getFavoriteVideoKeys(): Pair<Set<Long>, Set<String>> = emptySet<Long>() to emptySet()
     suspend fun getFavoritesPlaylistWithItems(): Pair<Playlist, List<PlaylistItem>>? = null
     suspend fun addVideosToPlaylists(videos: List<VideoItem>, playlistIds: List<Long>): Int = 0
+    suspend fun addVideosToPlaylistsDetailed(
+        videos: List<VideoItem>,
+        playlistIds: List<Long>
+    ): PlaylistAddOutcome {
+        val added = addVideosToPlaylists(videos, playlistIds)
+        return PlaylistAddOutcome(
+            targetPlaylistCount = playlistIds.distinct().size,
+            addedCount = added
+        )
+    }
     suspend fun removeVideosFromPlaylist(itemIds: List<Long>, playlistId: Long): Int = 0
     suspend fun addVideosToFavorites(videos: List<VideoItem>): Int = 0
+    suspend fun addVideosToFavoritesDetailed(videos: List<VideoItem>): PlaylistAddOutcome {
+        val added = addVideosToFavorites(videos)
+        return PlaylistAddOutcome(
+            targetPlaylistCount = 1,
+            addedCount = added
+        )
+    }
     suspend fun removeVideosFromFavorites(videos: List<VideoItem>): Int = 0
     suspend fun removeVideoByIdOrUriFromPlaylist(
         playlistId: Long,

@@ -200,9 +200,13 @@ class EngineeringFixesVerificationTest {
     @Test
     fun vaultPinHasher_hashesWithSaltAndRejectsWrongPinOrInvalidFormat() {
         assertFalse(VaultPinHasher.isValidPinFormat("123"))
-        assertFalse(VaultPinHasher.isValidPinFormat("12a4"))
-        assertFalse(VaultPinHasher.isValidPinFormat("1234567890123"))
+        assertFalse(VaultPinHasher.isValidPinFormat("    "))
+        assertFalse(VaultPinHasher.isValidPinFormat("ab\ncd"))
+        assertFalse(VaultPinHasher.isValidPinFormat("a".repeat(129)))
         assertTrue(VaultPinHasher.isValidPinFormat("1234"))
+        assertTrue(VaultPinHasher.isValidPinFormat("12a4"))
+        assertTrue(VaultPinHasher.isValidPinFormat("1234567890123"))
+        assertTrue(VaultPinHasher.isValidPinFormat("خزنتي_2026!@#"))
         assertTrue(VaultPinHasher.isValidPinFormat("123456789012"))
 
         val (hash1, salt1) = VaultPinHasher.hashPin("4829")
@@ -214,6 +218,10 @@ class EngineeringFixesVerificationTest {
         assertTrue(VaultPinHasher.verifyPin("4829", hash2, salt2))
         assertFalse(VaultPinHasher.verifyPin("4820", hash1, salt1))
         assertFalse(VaultPinHasher.verifyPin("4829", "invalid_base64$$", salt1))
+
+        val (flexHash, flexSalt) = VaultPinHasher.hashPin("كلمة_مرور#2026")
+        assertTrue(VaultPinHasher.verifyPin("كلمة_مرور#2026", flexHash, flexSalt))
+        assertFalse(VaultPinHasher.verifyPin("كلمة_مرور#2025", flexHash, flexSalt))
     }
 
     @Test

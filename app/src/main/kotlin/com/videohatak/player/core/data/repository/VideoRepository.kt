@@ -632,7 +632,7 @@ class LocalVideoRepositoryImpl(
 
         if (pendingConsentUris.isEmpty()) {
             return@withContext if (failedCount > 0 && deletedCount == 0) {
-                VideoFileOperationResult.Error("تم حفظ الفيديو في الخزنة، لكن تعذر حذف النسخة الأصلية من الجهاز")
+                VideoFileOperationResult.Error("تعذر إزالة النسخة العامة من المعرض")
             } else {
                 VideoFileOperationResult.Success
             }
@@ -652,7 +652,7 @@ class LocalVideoRepositoryImpl(
                     val pi = MediaStore.createDeleteRequest(contentResolver, mediaUris)
                     VideoFileOperationResult.RequiresPermission(pi.intentSender, op)
                 } catch (e: Exception) {
-                    VideoFileOperationResult.Error(e.localizedMessage ?: "تعذر طلب صلاحية حذف النسخة الأصلية")
+                    VideoFileOperationResult.Error(e.localizedMessage ?: "تعذر طلب إذن إزالة النسخة العامة بعد النقل للخزنة")
                 }
             }
         }
@@ -661,7 +661,7 @@ class LocalVideoRepositoryImpl(
             return@withContext VideoFileOperationResult.RequiresPermission(recoverableIntentSender, op)
         }
 
-        VideoFileOperationResult.Error("تم حفظ الفيديو في الخزنة، لكن تعذر حذف النسخة الأصلية من موقعها الحالي")
+        VideoFileOperationResult.Error("بقيت النسخة العامة في موقعها")
     }
 
     override suspend fun completeVaultOriginalsDeleteAfterPermission(
@@ -679,7 +679,7 @@ class LocalVideoRepositoryImpl(
                 }
             }
             return@withContext if (remainingNotDeleted > 0) {
-                VideoFileOperationResult.Error("تعذر حذف بعض الملفات الأصلية بعد منح الإذن ($remainingNotDeleted)")
+                VideoFileOperationResult.Error("تعذر إزالة بعض النسخ العامة بعد النقل إلى الخزنة ($remainingNotDeleted)")
             } else {
                 VideoFileOperationResult.Success
             }

@@ -7,5 +7,9 @@ enum class LibraryTab(val titleArabic: String) {
     PLAYLISTS("قوائم التشغيل"),
     TRASH("سلة المحذوفات"),
     SETTINGS("الإعدادات"),
-    VAULT("الخزنة الخاصة")
+    VAULT("الخزنة الخاصة");
+
+    companion object {
+        val bottomBarTabs: List<LibraryTab> = listOf(VIDEOS, FOLDERS, PLAYLISTS, SETTINGS)
+    }
 }

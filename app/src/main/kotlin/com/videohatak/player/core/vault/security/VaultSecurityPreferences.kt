@@ -61,8 +61,13 @@ object VaultPinHasher {
 
     private val secureRandom = SecureRandom()
 
+    const val MIN_PASSCODE_LENGTH = 4
+    const val MAX_PASSCODE_LENGTH = 128
+
     fun isValidPinFormat(pin: String): Boolean {
-        return pin.length in 4..12 && pin.all { it.isDigit() }
+        return pin.length in MIN_PASSCODE_LENGTH..MAX_PASSCODE_LENGTH &&
+            pin.any { !it.isWhitespace() } &&
+            pin.none { it == '\n' || it == '\r' }
     }
 
     fun isAlgorithmSupported(algorithm: String): Boolean {
@@ -84,7 +89,7 @@ object VaultPinHasher {
         pin: String,
         preferredAlgorithm: String = selectPreferredAlgorithm()
     ): PinHashRecord {
-        require(isValidPinFormat(pin)) { "PIN must be 4 to 12 numeric digits" }
+        require(isValidPinFormat(pin)) { "Passcode must be 4 to 128 characters and not blank" }
         val salt = ByteArray(SALT_BYTES).apply { secureRandom.nextBytes(this) }
         var effectiveAlgorithm = preferredAlgorithm
         val derived = try {
@@ -149,6 +154,14 @@ sealed interface PinVerifyResult {
     data object Success : PinVerifyResult
     data class InvalidPin(val failedAttempts: Int) : PinVerifyResult
     data class LockedOut(val remainingMs: Long, val failedAttempts: Int) : PinVerifyResult
+}
+
+sealed interface PinChangeResult {
+    data object Success : PinChangeResult
+    data object InvalidNewPinFormat : PinChangeResult
+    data class InvalidCurrentPin(val failedAttempts: Int) : PinChangeResult
+    data class LockedOut(val remainingMs: Long, val failedAttempts: Int) : PinChangeResult
+    data object StorageFailure : PinChangeResult
 }
 
 object VaultPinLockoutPolicy {
@@ -267,6 +280,30 @@ class VaultSecurityPreferences(
 
     suspend fun verifyPin(pin: String): Boolean {
         return verifyPinWithRateLimit(pin) is PinVerifyResult.Success
+    }
+
+    suspend fun changePin(
+        currentPin: String,
+        newPin: String,
+        nowMs: Long = System.currentTimeMillis()
+    ): PinChangeResult {
+        if (!VaultPinHasher.isValidPinFormat(newPin)) {
+            return PinChangeResult.InvalidNewPinFormat
+        }
+        if (!hasPinConfigured()) {
+            return if (setPin(newPin)) PinChangeResult.Success else PinChangeResult.StorageFailure
+        }
+        return when (val verify = verifyPinWithRateLimit(currentPin, nowMs)) {
+            is PinVerifyResult.Success -> {
+                if (setPin(newPin)) {
+                    PinChangeResult.Success
+                } else {
+                    PinChangeResult.StorageFailure
+                }
+            }
+            is PinVerifyResult.InvalidPin -> PinChangeResult.InvalidCurrentPin(verify.failedAttempts)
+            is PinVerifyResult.LockedOut -> PinChangeResult.LockedOut(verify.remainingMs, verify.failedAttempts)
+        }
     }
 
     suspend fun clearPin() {

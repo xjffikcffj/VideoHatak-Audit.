@@ -409,7 +409,7 @@ fun SettingsScreen(
                                     color = palette.onSurface
                                 )
                                 Text(
-                                    text = "AES-256-GCM • محمية برمز PIN مستقل ($vaultVideoCount فيديو)",
+                                    text = "AES-256-GCM • محمية برمز قفل مستقل ($vaultVideoCount فيديو)",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = palette.onSurfaceMuted
                                 )

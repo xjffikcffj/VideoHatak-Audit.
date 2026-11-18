@@ -24,6 +24,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
@@ -35,7 +36,8 @@ sealed interface LibraryUiEvent {
 
 class LibraryViewModel(
     private val videoRepository: VideoRepository,
-    private val trashRepository: TrashRepository? = null
+    private val trashRepository: TrashRepository? = null,
+    private val scrollStore: LibraryScrollStore? = null
 ) : ViewModel() {
 
     private val _permissionStatus = MutableStateFlow<VideoPermissionStatus>(VideoPermissionStatus.NotRequested)
@@ -55,6 +57,27 @@ class LibraryViewModel(
     val sortOrder = MutableStateFlow(SortOrder.DATE_DESC)
     val currentTab = MutableStateFlow(LibraryTab.VIDEOS)
     val selectedFolder = MutableStateFlow<VideoFolder?>(null)
+
+    private val _videosScrollPosition = MutableStateFlow(LibraryScrollPosition())
+    val videosScrollPosition: StateFlow<LibraryScrollPosition> = _videosScrollPosition.asStateFlow()
+
+    private val _isVideosScrollLoaded = MutableStateFlow(scrollStore == null)
+    val isVideosScrollLoaded: StateFlow<Boolean> = _isVideosScrollLoaded.asStateFlow()
+
+    private val _foldersScrollPosition = MutableStateFlow(LibraryScrollPosition())
+    val foldersScrollPosition: StateFlow<LibraryScrollPosition> = _foldersScrollPosition.asStateFlow()
+
+    init {
+        if (scrollStore != null) {
+            viewModelScope.launch {
+                try {
+                    _videosScrollPosition.value = scrollStore.videosScrollPosition.first()
+                } finally {
+                    _isVideosScrollLoaded.value = true
+                }
+            }
+        }
+    }
 
     val trashItems: StateFlow<List<TrashItem>> =
         trashRepository?.trashItems ?: MutableStateFlow(emptyList())
@@ -141,7 +164,29 @@ class LibraryViewModel(
     }
 
     fun onTabSelected(tab: LibraryTab) {
-        currentTab.value = tab
+        currentTab.value = if (tab == LibraryTab.FAVORITES) LibraryTab.PLAYLISTS else tab
+    }
+
+    fun saveVideosScrollPosition(index: Int, offset: Int) {
+        val next = LibraryScrollPosition(
+            firstVisibleItemIndex = index.coerceAtLeast(0),
+            firstVisibleItemScrollOffset = offset.coerceAtLeast(0)
+        )
+        if (_videosScrollPosition.value != next) {
+            _videosScrollPosition.value = next
+        }
+        if (scrollStore != null) {
+            viewModelScope.launch {
+                scrollStore.saveVideosScrollPosition(next)
+            }
+        }
+    }
+
+    fun saveFoldersScrollPosition(index: Int, offset: Int) {
+        _foldersScrollPosition.value = LibraryScrollPosition(
+            firstVisibleItemIndex = index.coerceAtLeast(0),
+            firstVisibleItemScrollOffset = offset.coerceAtLeast(0)
+        )
     }
 
     fun onFolderSelected(folder: VideoFolder) {
@@ -249,10 +294,11 @@ class LibraryViewModel(
         viewModelScope.launch {
             if (sourceUris.isEmpty()) {
                 loadVideos()
-                val msg = if (encryptedFailedCount > 0) {
-                    "تم تشفير وحفظ $encryptedCount في الخزنة، وتعذر استيراد $encryptedFailedCount"
-                } else {
-                    "تم حفظ $encryptedCount فيديو في الخزنة الخاصة"
+                val msg = when {
+                    encryptedFailedCount > 0 ->
+                        "تمت إضافة $encryptedCount فيديو إلى الخزنة بنجاح، وتعذر نقل $encryptedFailedCount"
+                    encryptedCount == 1 -> "تمت إضافة الفيديو إلى الخزنة بنجاح"
+                    else -> "تمت إضافة $encryptedCount فيديو إلى الخزنة بنجاح"
                 }
                 _events.tryEmit(LibraryUiEvent.ShowMessage(msg))
                 return@launch
@@ -260,12 +306,11 @@ class LibraryViewModel(
             when (val res = videoRepository.deleteVaultOriginals(sourceUris, encryptedCount)) {
                 is VideoFileOperationResult.Success -> {
                     loadVideos()
-                    val msg = if (encryptedFailedCount > 0) {
-                        "تم نقل $encryptedCount فيديو إلى الخزنة وحذف الأصل (تعذر نقل $encryptedFailedCount)"
-                    } else if (encryptedCount == 1) {
-                        "تم نقل الفيديو إلى الخزنة الخاصة وحذف الملف الأصلي"
-                    } else {
-                        "تم نقل $encryptedCount فيديو إلى الخزنة الخاصة وحذف الملفات الأصلية"
+                    val msg = when {
+                        encryptedFailedCount > 0 ->
+                            "تمت إضافة $encryptedCount فيديو إلى الخزنة بنجاح، وتعذر نقل $encryptedFailedCount"
+                        encryptedCount == 1 -> "تمت إضافة الفيديو إلى الخزنة بنجاح"
+                        else -> "تمت إضافة $encryptedCount فيديو إلى الخزنة بنجاح"
                     }
                     _events.tryEmit(LibraryUiEvent.ShowMessage(msg))
                 }
@@ -280,7 +325,7 @@ class LibraryViewModel(
                 is VideoFileOperationResult.Error -> {
                     loadVideos()
                     _events.tryEmit(
-                        LibraryUiEvent.ShowMessage("تم حفظ النسخة المشفرة في الخزنة ($encryptedCount)، لكن ${res.message}")
+                        LibraryUiEvent.ShowMessage("تمت إضافة النسخة المشفرة إلى الخزنة ($encryptedCount) بنجاح، لكن ${res.message}")
                     )
                 }
             }
@@ -561,7 +606,7 @@ class LibraryViewModel(
                         loadVideos()
                         _events.tryEmit(
                             LibraryUiEvent.ShowMessage(
-                                "تم حفظ النسخة المشفرة في الخزنة (${op.encryptedCount})، ولم يتم حذف الملفات الأصلية لعدم منح الإذن"
+                                "تمت إضافة النسخة المشفرة إلى الخزنة (${op.encryptedCount}) بنجاح، وبقيت النسخة العامة في المعرض لعدم منح إذن إزالتها"
                             )
                         )
                     }
@@ -600,9 +645,9 @@ class LibraryViewModel(
                         is VideoFileOperationResult.Success -> {
                             loadVideos()
                             val msg = if (op.encryptedCount == 1) {
-                                "تم نقل الفيديو إلى الخزنة الخاصة وحذف الملف الأصلي"
+                                "تمت إضافة الفيديو إلى الخزنة بنجاح"
                             } else {
-                                "تم نقل ${op.encryptedCount} فيديو إلى الخزنة الخاصة وحذف الملفات الأصلية"
+                                "تمت إضافة ${op.encryptedCount} فيديو إلى الخزنة بنجاح"
                             }
                             _events.tryEmit(LibraryUiEvent.ShowMessage(msg))
                         }
@@ -618,7 +663,7 @@ class LibraryViewModel(
                             loadVideos()
                             _events.tryEmit(
                                 LibraryUiEvent.ShowMessage(
-                                    "تم حفظ النسخة المشفرة (${op.encryptedCount}) في الخزنة، لكن ${res.message}"
+                                    "تمت إضافة النسخة المشفرة (${op.encryptedCount}) إلى الخزنة بنجاح، لكن ${res.message}"
                                 )
                             )
                         }
@@ -724,12 +769,13 @@ class LibraryViewModel(
     companion object {
         fun provideFactory(
             videoRepository: VideoRepository,
-            trashRepository: TrashRepository? = null
+            trashRepository: TrashRepository? = null,
+            scrollStore: LibraryScrollStore? = null
         ): ViewModelProvider.Factory =
             object : ViewModelProvider.Factory {
                 @Suppress("UNCHECKED_CAST")
                 override fun <T : ViewModel> create(modelClass: Class<T>): T {
-                    return LibraryViewModel(videoRepository, trashRepository) as T
+                    return LibraryViewModel(videoRepository, trashRepository, scrollStore) as T
                 }
             }
     }

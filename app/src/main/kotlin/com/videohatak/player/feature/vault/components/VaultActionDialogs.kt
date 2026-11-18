@@ -13,7 +13,12 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -32,6 +37,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import com.videohatak.player.core.designsystem.theme.LocalVideoHatakPalette
 import com.videohatak.player.core.vault.model.VaultVideo
@@ -96,16 +102,16 @@ fun DeleteVaultVideoConfirmationDialog(
         containerColor = palette.surface,
         titleContentColor = palette.onSurface,
         textContentColor = palette.onSurface,
-        title = { Text("حذف من الخزنة المشفرة", fontWeight = FontWeight.Bold) },
+        title = { Text("إزالة من الخزنة الخاصة", fontWeight = FontWeight.Bold) },
         text = {
             Text(
-                "هل أنت متأكد من حذف \"${video.title}\" من الخزنة الخاصة؟ سيتم حذف النسخة المشفرة نهائيًا.",
+                "هل أنت متأكد من إزالة \"${video.title}\" من الخزنة الخاصة؟ سيتم حذف النسخة المشفرة من داخل الخزنة نهائيًا.",
                 color = palette.onSurfaceMuted
             )
         },
         confirmButton = {
             TextButton(onClick = onConfirm) {
-                Text("حذف نهائي", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
+                Text("إزالة من الخزنة", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
             }
         },
         dismissButton = {
@@ -137,9 +143,9 @@ fun VaultSecurityInfoDialog(
                 Text(
                     text = "• التشفير: يتم تشفير مقاطع الفيديو والبيانات الوصفية محليًا بتشفير AES-256-GCM.\n" +
                             "• المفاتيح: يُحفظ مفتاح التشفير الرئيسي داخل Android Keystore على الجهاز لحماية مفاتيح الملفات.\n" +
-                            "• بوابة الوصول المستقلة: الخزنة محمية برمز PIN مستقل (بتجزئة PBKDF2-HMAC-SHA256 وتقييد المحاولات الخاطئة) دون الاعتماد على قفل شاشة الهاتف، مع خيار إضافي لاستخدام البصمة.\n" +
+                            "• بوابة الوصول المستقلة: الخزنة محمية برمز قفل مستقل مرن يدعم الحروف العربية والإنجليزية والأرقام والرموز (بتجزئة PBKDF2 وتقييد المحاولات الخاطئة) دون الاعتماد على قفل شاشة الهاتف، مع خيار إضافي لاستخدام البصمة.\n" +
                             "• الخصوصية التامة: يفعّل التطبيق FLAG_SECURE لمنع لقطات وتسجيل الشاشة، ويعطّل PiP والإشعارات والتشغيل المصغّر وفي الخلفية، ويُوقف التشغيل فور الخروج أو القفل.\n" +
-                            "• النقل إلى الخزنة: عند نقل فيديو إلى الخزنة يتم تشفيره والتحقق من سلامة النسخة المشفرة أولًا، ثم حذف النسخة الأصلية من الجهاز بأمان.",
+                            "• النقل إلى الخزنة: عند نقل فيديو إلى الخزنة يتم تشفيره والتحقق من سلامة النسخة المشفرة وقابليتها لفك التشفير أولًا، ثم تُزال النسخة العامة من المعرض والمكتبة بأمان دون ترك نسخة مكررة.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = palette.onSurfaceMuted
                 )
@@ -203,25 +209,35 @@ fun VaultPinUnlockDialog(
 ) {
     val palette = LocalVideoHatakPalette.current
     var pin by remember { mutableStateOf("") }
+    var isPasscodeVisible by remember { mutableStateOf(false) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = palette.surface,
         titleContentColor = palette.onSurface,
         textContentColor = palette.onSurface,
-        title = { Text("فتح الخزنة برمز PIN", fontWeight = FontWeight.Bold) },
+        title = { Text("فتح الخزنة الخاصة", fontWeight = FontWeight.Bold) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(
                     value = pin,
                     onValueChange = { input ->
-                        if (input.length <= 12 && input.all { it.isDigit() }) {
+                        if (input.length <= VaultPinHasher.MAX_PASSCODE_LENGTH && input.none { it == '\n' || it == '\r' }) {
                             pin = input
                         }
                     },
-                    label = { Text("أدخل رمز PIN") },
-                    visualTransformation = PasswordVisualTransformation(),
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                    label = { Text("أدخل رمز قفل الخزنة") },
+                    visualTransformation = if (isPasscodeVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                    trailingIcon = {
+                        IconButton(onClick = { isPasscodeVisible = !isPasscodeVisible }) {
+                            Icon(
+                                imageVector = if (isPasscodeVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                contentDescription = if (isPasscodeVisible) "إخفاء الرمز" else "إظهار الرمز",
+                                tint = palette.onSurfaceMuted
+                            )
+                        }
+                    },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -257,7 +273,7 @@ fun VaultSecuritySettingsDialog(
     onSetPin: (String) -> Unit = {},
     onChangePin: (currentPin: String, newPin: String, onResult: (Boolean, String) -> Unit) -> Unit = { _, newPin, cb ->
         onSetPin(newPin)
-        cb(true, "تم حفظ رمز PIN بنجاح")
+        cb(true, "تم تغيير رمز قفل الخزنة بنجاح")
     },
     onRemovePin: () -> Unit = {},
     onSelectTimeout: (VaultAutoLockTimeout) -> Unit,
@@ -267,6 +283,9 @@ fun VaultSecuritySettingsDialog(
     var currentPin by remember { mutableStateOf("") }
     var newPin by remember { mutableStateOf("") }
     var confirmPin by remember { mutableStateOf("") }
+    var showCurrent by remember { mutableStateOf(false) }
+    var showNew by remember { mutableStateOf(false) }
+    var showConfirm by remember { mutableStateOf(false) }
     var pinFeedback by remember { mutableStateOf<String?>(null) }
     var isPinFeedbackError by remember { mutableStateOf(false) }
 
@@ -275,7 +294,7 @@ fun VaultSecuritySettingsDialog(
         containerColor = palette.surface,
         titleContentColor = palette.onSurface,
         textContentColor = palette.onSurface,
-        title = { Text("إعدادات أمان الخزنة", fontWeight = FontWeight.Bold) },
+        title = { Text("تغيير رمز الخزنة والأمان", fontWeight = FontWeight.Bold) },
         text = {
             Column(
                 modifier = Modifier
@@ -285,40 +304,84 @@ fun VaultSecuritySettingsDialog(
             ) {
                 Text(
                     text = if (hasPin) {
-                        "تغيير رمز PIN المستقل للخزنة (يتطلب الرمز الحالي)"
+                        "تغيير رمز قفل الخزنة (يتطلب إدخال الرمز الحالي)"
                     } else {
-                        "تعيين رمز PIN مستقل للخزنة (4 إلى 12 رقمًا)"
+                        "تعيين رمز قفل مستقل للخزنة (4 أحرف فأكثر)"
                     },
                     style = MaterialTheme.typography.labelLarge,
                     color = palette.accent,
                     fontWeight = FontWeight.Bold
                 )
+                Text(
+                    text = "يدعم الرمز الحروف العربية والإنجليزية والأرقام والرموز، وتبقى جميع ملفاتك المشفرة داخل الخزنة محفوظة وآمنة عند تغييره.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = palette.onSurfaceMuted
+                )
                 if (hasPin) {
                     OutlinedTextField(
                         value = currentPin,
-                        onValueChange = { if (it.length <= 12 && it.all { c -> c.isDigit() }) currentPin = it },
-                        label = { Text("رمز PIN الحالي") },
-                        visualTransformation = PasswordVisualTransformation(),
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                        onValueChange = { input ->
+                            if (input.length <= VaultPinHasher.MAX_PASSCODE_LENGTH && input.none { it == '\n' || it == '\r' }) {
+                                currentPin = input
+                            }
+                        },
+                        label = { Text("رمز قفل الخزنة الحالي") },
+                        visualTransformation = if (showCurrent) VisualTransformation.None else PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        trailingIcon = {
+                            IconButton(onClick = { showCurrent = !showCurrent }) {
+                                Icon(
+                                    imageVector = if (showCurrent) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                    contentDescription = if (showCurrent) "إخفاء الرمز" else "إظهار الرمز",
+                                    tint = palette.onSurfaceMuted
+                                )
+                            }
+                        },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
                 }
                 OutlinedTextField(
                     value = newPin,
-                    onValueChange = { if (it.length <= 12 && it.all { c -> c.isDigit() }) newPin = it },
-                    label = { Text(if (hasPin) "رمز PIN الجديد" else "رمز PIN (4 إلى 12 رقمًا)") },
-                    visualTransformation = PasswordVisualTransformation(),
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                    onValueChange = { input ->
+                        if (input.length <= VaultPinHasher.MAX_PASSCODE_LENGTH && input.none { it == '\n' || it == '\r' }) {
+                            newPin = input
+                        }
+                    },
+                    label = { Text(if (hasPin) "رمز قفل الخزنة الجديد" else "رمز قفل الخزنة (4 أحرف فأكثر)") },
+                    visualTransformation = if (showNew) VisualTransformation.None else PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                    trailingIcon = {
+                        IconButton(onClick = { showNew = !showNew }) {
+                            Icon(
+                                imageVector = if (showNew) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                contentDescription = if (showNew) "إخفاء الرمز" else "إظهار الرمز",
+                                tint = palette.onSurfaceMuted
+                            )
+                        }
+                    },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
                 OutlinedTextField(
                     value = confirmPin,
-                    onValueChange = { if (it.length <= 12 && it.all { c -> c.isDigit() }) confirmPin = it },
-                    label = { Text("تأكيد رمز PIN") },
-                    visualTransformation = PasswordVisualTransformation(),
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                    onValueChange = { input ->
+                        if (input.length <= VaultPinHasher.MAX_PASSCODE_LENGTH && input.none { it == '\n' || it == '\r' }) {
+                            confirmPin = input
+                        }
+                    },
+                    label = { Text("تأكيد رمز قفل الخزنة الجديد") },
+                    visualTransformation = if (showConfirm) VisualTransformation.None else PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                    trailingIcon = {
+                        IconButton(onClick = { showConfirm = !showConfirm }) {
+                            Icon(
+                                imageVector = if (showConfirm) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                contentDescription = if (showConfirm) "إخفاء الرمز" else "إظهار الرمز",
+                                tint = palette.onSurfaceMuted
+                            )
+                        }
+                    },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -333,17 +396,17 @@ fun VaultSecuritySettingsDialog(
                     TextButton(
                         onClick = {
                             when {
-                                hasPin && currentPin.isBlank() -> {
+                                hasPin && currentPin.isEmpty() -> {
                                     isPinFeedbackError = true
-                                    pinFeedback = "يرجى إدخال رمز PIN الحالي للتحقق"
+                                    pinFeedback = "يرجى إدخال رمز قفل الخزنة الحالي للتحقق"
                                 }
                                 !VaultPinHasher.isValidPinFormat(newPin) -> {
                                     isPinFeedbackError = true
-                                    pinFeedback = "الرمز الجديد يجب أن يكون من 4 إلى 12 رقمًا"
+                                    pinFeedback = "يجب أن يتكون الرمز الجديد من 4 أحرف على الأقل (يدعم الحروف العربية والإنجليزية والأرقام والرموز)"
                                 }
                                 newPin != confirmPin -> {
                                     isPinFeedbackError = true
-                                    pinFeedback = "الرمزان غير متطابقين"
+                                    pinFeedback = "الرمز الجديد وتأكيده غير متطابقين"
                                 }
                                 else -> {
                                     onChangePin(currentPin, newPin) { ok, msg ->
@@ -359,7 +422,7 @@ fun VaultSecuritySettingsDialog(
                             }
                         }
                     ) {
-                        Text(if (hasPin) "تحديث PIN" else "حفظ PIN", color = palette.accent, fontWeight = FontWeight.Bold)
+                        Text(if (hasPin) "تغيير رمز الخزنة" else "حفظ رمز الخزنة", color = palette.accent, fontWeight = FontWeight.Bold)
                     }
                 }
 
@@ -414,16 +477,16 @@ fun ConfirmDeleteVaultDialog(
         containerColor = palette.surface,
         titleContentColor = palette.onSurface,
         textContentColor = palette.onSurface,
-        title = { Text("حذف الفيديو المشفر", fontWeight = FontWeight.Bold) },
+        title = { Text("إزالة من الخزنة الخاصة", fontWeight = FontWeight.Bold) },
         text = {
             Text(
-                "هل أنت متأكد من حذف \"$videoTitle\" نهائيًا من الخزنة المشفرة؟",
+                "هل أنت متأكد من إزالة \"$videoTitle\" نهائيًا من الخزنة المشفرة؟",
                 color = palette.onSurfaceMuted
             )
         },
         confirmButton = {
             TextButton(onClick = onConfirm) {
-                Text("حذف", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
+                Text("إزالة", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
             }
         },
         dismissButton = {
@@ -447,16 +510,16 @@ fun BatchDeleteVaultVideosDialog(
         containerColor = palette.surface,
         titleContentColor = palette.onSurface,
         textContentColor = palette.onSurface,
-        title = { Text("حذف من الخزنة المشفرة", fontWeight = FontWeight.Bold) },
+        title = { Text("إزالة من الخزنة الخاصة", fontWeight = FontWeight.Bold) },
         text = {
             Text(
-                "هل أنت متأكد من حذف $selectedCount من الفيديوهات المحددة نهائيًا من الخزنة المشفرة؟",
+                "هل أنت متأكد من إزالة $selectedCount من الفيديوهات المحددة نهائيًا من الخزنة المشفرة؟",
                 color = palette.onSurfaceMuted
             )
         },
         confirmButton = {
             TextButton(onClick = onConfirm) {
-                Text("حذف المحدد", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
+                Text("إزالة المحدد", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
             }
         },
         dismissButton = {

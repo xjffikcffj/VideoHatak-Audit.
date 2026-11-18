@@ -39,6 +39,8 @@ import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Pin
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.SelectAll
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -68,6 +70,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -245,6 +248,8 @@ fun VaultScreen(
         if (!isUnlocked) {
             var initialPin by remember { mutableStateOf("") }
             var confirmInitialPin by remember { mutableStateOf("") }
+            var showInitialPin by remember { mutableStateOf(false) }
+            var showConfirmInitialPin by remember { mutableStateOf(false) }
             var setupPinError by remember { mutableStateOf<String?>(null) }
 
             Column(
@@ -284,7 +289,7 @@ fun VaultScreen(
 
                 Text(
                     text = if (!hasPinConfigured) {
-                        "أنشئ رمز PIN مستقلًا لحماية الخزنة الخاصة. هذا الرمز خاص بالتطبيق ولا يعتمد على قفل شاشة الهاتف."
+                        "أنشئ رمز قفل مستقلًا لحماية الخزنة الخاصة. يدعم الحروف العربية والإنجليزية والأرقام والرموز، ولا يعتمد على قفل شاشة الهاتف."
                     } else {
                         "مساحة آمنة ومعزولة لحفظ فيديوهاتك الحساسة بتشفير AES-256-GCM وحماية مفاتيح Android Keystore."
                     },
@@ -318,14 +323,24 @@ fun VaultScreen(
                     OutlinedTextField(
                         value = initialPin,
                         onValueChange = { input ->
-                            if (input.length <= 12 && input.all { it.isDigit() }) {
+                            if (input.length <= VaultPinHasher.MAX_PASSCODE_LENGTH && input.none { it == '\n' || it == '\r' }) {
                                 initialPin = input
                                 setupPinError = null
                             }
                         },
-                        label = { Text("إنشاء رمز PIN للخزنة (4 إلى 12 رقمًا)") },
-                        visualTransformation = PasswordVisualTransformation(),
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                        label = { Text("إنشاء رمز قفل الخزنة (4 أحرف فأكثر)") },
+                        supportingText = { Text("يدعم الحروف العربية والإنجليزية والأرقام والرموز") },
+                        visualTransformation = if (showInitialPin) VisualTransformation.None else PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        trailingIcon = {
+                            IconButton(onClick = { showInitialPin = !showInitialPin }) {
+                                Icon(
+                                    imageVector = if (showInitialPin) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                    contentDescription = if (showInitialPin) "إخفاء الرمز" else "إظهار الرمز",
+                                    tint = palette.onSurfaceMuted
+                                )
+                            }
+                        },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(0.9f)
                     )
@@ -333,14 +348,23 @@ fun VaultScreen(
                     OutlinedTextField(
                         value = confirmInitialPin,
                         onValueChange = { input ->
-                            if (input.length <= 12 && input.all { it.isDigit() }) {
+                            if (input.length <= VaultPinHasher.MAX_PASSCODE_LENGTH && input.none { it == '\n' || it == '\r' }) {
                                 confirmInitialPin = input
                                 setupPinError = null
                             }
                         },
-                        label = { Text("تأكيد رمز PIN") },
-                        visualTransformation = PasswordVisualTransformation(),
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                        label = { Text("تأكيد رمز قفل الخزنة") },
+                        visualTransformation = if (showConfirmInitialPin) VisualTransformation.None else PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        trailingIcon = {
+                            IconButton(onClick = { showConfirmInitialPin = !showConfirmInitialPin }) {
+                                Icon(
+                                    imageVector = if (showConfirmInitialPin) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                    contentDescription = if (showConfirmInitialPin) "إخفاء الرمز" else "إظهار الرمز",
+                                    tint = palette.onSurfaceMuted
+                                )
+                            }
+                        },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(0.9f)
                     )
@@ -349,7 +373,7 @@ fun VaultScreen(
                         onClick = {
                             when {
                                 !VaultPinHasher.isValidPinFormat(initialPin) ->
-                                    setupPinError = "يجب أن يتكون الرمز من 4 إلى 12 رقمًا"
+                                    setupPinError = "يجب أن يتكون رمز قفل الخزنة من 4 أحرف على الأقل (يدعم الحروف والأرقام والرموز)"
                                 initialPin != confirmInitialPin ->
                                     setupPinError = "الرمزان غير متطابقين"
                                 else -> {
@@ -384,7 +408,7 @@ fun VaultScreen(
                     ) {
                         Icon(Icons.Default.Pin, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text("فتح الخزنة برمز PIN", fontWeight = FontWeight.Bold)
+                        Text("فتح الخزنة بالرمز", fontWeight = FontWeight.Bold)
                     }
 
                     if (canUseBiometrics) {
@@ -469,60 +493,52 @@ fun VaultScreen(
                                         modifier = Modifier.size(16.dp)
                                     )
                                     Spacer(modifier = Modifier.width(4.dp))
-                                    Text("حذف المحدد", color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
+                                    Text("إزالة المحدد", color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
                                 }
                             }
                         }
                     } else {
-                        Row(
+                        Column(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .padding(horizontal = 16.dp, vertical = 12.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                                ) {
-                                    Text(
-                                        text = "الخزنة الخاصة",
-                                        style = MaterialTheme.typography.titleMedium,
-                                        fontWeight = FontWeight.Bold,
-                                        color = palette.onSurface
-                                    )
-                                    Surface(
-                                        shape = RoundedCornerShape(4.dp),
-                                        color = palette.accent.copy(alpha = 0.18f)
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
                                     ) {
                                         Text(
-                                            text = "AES-256",
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = palette.accent,
+                                            text = "الخزنة الخاصة",
+                                            style = MaterialTheme.typography.titleMedium,
                                             fontWeight = FontWeight.Bold,
-                                            modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp)
+                                            color = palette.onSurface
                                         )
+                                        Surface(
+                                            shape = RoundedCornerShape(4.dp),
+                                            color = palette.accent.copy(alpha = 0.18f)
+                                        ) {
+                                            Text(
+                                                text = "AES-256",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = palette.accent,
+                                                fontWeight = FontWeight.Bold,
+                                                modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp)
+                                            )
+                                        }
                                     }
-                                }
-                                val totalBytes = videos.sumOf { it.encryptedSizeBytes }
-                                val totalMb = totalBytes / (1024.0 * 1024.0)
-                                Text(
-                                    text = String.format(Locale.US, "%d فيديو • %.1f ميجابايت مشفرة", videos.size, totalMb),
-                                    style = MaterialTheme.typography.labelMedium,
-                                    color = palette.onSurfaceMuted
-                                )
-                            }
-
-                            Row(
-                                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                IconButton(onClick = { showSecuritySettingsDialog = true }) {
-                                    Icon(
-                                        imageVector = Icons.Default.Security,
-                                        contentDescription = "إعدادات أمان الخزنة و PIN",
-                                        tint = palette.accent
+                                    val totalBytes = videos.sumOf { it.encryptedSizeBytes }
+                                    val totalMb = totalBytes / (1024.0 * 1024.0)
+                                    Text(
+                                        text = String.format(Locale.US, "%d فيديو • %.1f ميجابايت مشفرة", videos.size, totalMb),
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = palette.onSurfaceMuted
                                     )
                                 }
 
@@ -535,6 +551,28 @@ fun VaultScreen(
                                     Spacer(modifier = Modifier.width(4.dp))
                                     Text("قفل", color = palette.onSurface, fontSize = 12.sp)
                                 }
+                            }
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                OutlinedButton(
+                                    onClick = { showSecuritySettingsDialog = true },
+                                    border = BorderStroke(1.dp, palette.accent.copy(alpha = 0.7f)),
+                                    shape = MaterialTheme.shapes.small,
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Security,
+                                        contentDescription = null,
+                                        tint = palette.accent,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("تغيير رمز الخزنة", color = palette.accent, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                }
 
                                 Button(
                                     onClick = onImportClick,
@@ -542,11 +580,12 @@ fun VaultScreen(
                                         containerColor = palette.accent,
                                         contentColor = MaterialTheme.colorScheme.onPrimary
                                     ),
-                                    shape = MaterialTheme.shapes.small
+                                    shape = MaterialTheme.shapes.small,
+                                    modifier = Modifier.weight(1f)
                                 ) {
                                     Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
                                     Spacer(modifier = Modifier.width(4.dp))
-                                    Text("نقل إلى الخزنة", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                    Text("نقل إلى الخزنة", fontSize = 12.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                 }
                             }
                         }
@@ -633,7 +672,7 @@ fun VaultScreen(
                         )
                         Spacer(modifier = Modifier.height(6.dp))
                         Text(
-                            text = "اضغط على «نقل إلى الخزنة» لتشفير الفيديو والتحقق منه ثم حذف النسخة الأصلية من الجهاز بأمان.",
+                            text = "اضغط على «نقل إلى الخزنة» لتشفير الفيديو والتحقق من سلامته داخل الخزنة ثم إزالة النسخة العامة من المكتبة بأمان.",
                             style = MaterialTheme.typography.bodySmall,
                             color = palette.onSurfaceMuted,
                             textAlign = TextAlign.Center,
@@ -862,7 +901,7 @@ fun VaultVideoCard(
                         DropdownMenuItem(
                             text = {
                                 Text(
-                                    text = "حذف من الخزنة",
+                                    text = "إزالة من الخزنة",
                                     color = MaterialTheme.colorScheme.error
                                 )
                             },

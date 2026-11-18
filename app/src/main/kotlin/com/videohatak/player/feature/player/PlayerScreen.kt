@@ -118,8 +118,11 @@ fun PlayerScreen(
     playlists: List<Playlist> = emptyList(),
     isFavorite: Boolean = false,
     onToggleFavorite: (VideoItem) -> Unit = {},
+    onToggleFavoriteWithResult: ((VideoItem, (Boolean, String) -> Unit) -> Unit)? = null,
     onAddToPlaylists: (VideoItem, List<Long>) -> Unit = { _, _ -> },
+    onAddToPlaylistsWithResult: ((VideoItem, List<Long>, (Boolean, String) -> Unit) -> Unit)? = null,
     onCreatePlaylistAndAdd: (String, VideoItem) -> Unit = { _, _ -> },
+    onCreatePlaylistAndAddWithResult: ((String, VideoItem, (Boolean, String) -> Unit) -> Unit)? = null,
     onAddToVault: (VideoItem) -> Unit = {},
     onRenameVideo: (VideoItem, String) -> Unit = { _, _ -> },
     onMoveToTrash: (VideoItem) -> Unit = {},
@@ -815,18 +818,20 @@ fun PlayerScreen(
                 onToggleFavorite = {
                     if (isVaultVideo) {
                         statusBannerText = "مقاطع الخزنة الخاصة معزولة عن المفضلة العامة"
+                    } else if (onToggleFavoriteWithResult != null) {
+                        onToggleFavoriteWithResult(activeVideoItem) { _, msg ->
+                            statusBannerText = msg
+                        }
                     } else {
-                        val wasFav = isFavorite
                         onToggleFavorite(activeVideoItem)
-                        statusBannerText = if (wasFav) "تمت الإزالة من المفضلة" else "تمت الإضافة إلى المفضلة"
                     }
                 },
                 onAddToVault = {
                     if (isVaultVideo) {
                         statusBannerText = "هذا الفيديو موجود بالفعل داخل الخزنة الخاصة"
                     } else {
+                        statusBannerText = "جارٍ تشفير الفيديو لنقله إلى الخزنة الخاصة..."
                         onAddToVault(activeVideoItem)
-                        statusBannerText = "تم بدء نقل وتشفير \"${activeVideoItem.safeTitle}\" إلى الخزنة الخاصة"
                     }
                 },
                 onRenameVideo = {
@@ -1009,9 +1014,14 @@ fun PlayerScreen(
             AddToPlaylistDialog(
                 playlists = playlists,
                 onSelectPlaylist = { playlist ->
-                    onAddToPlaylists(activeVideoItem, listOf(playlist.id))
                     showAddToPlaylistDialog = false
-                    statusBannerText = "تمت الإضافة إلى \"${playlist.name}\""
+                    if (onAddToPlaylistsWithResult != null) {
+                        onAddToPlaylistsWithResult(activeVideoItem, listOf(playlist.id)) { _, msg ->
+                            statusBannerText = msg
+                        }
+                    } else {
+                        onAddToPlaylists(activeVideoItem, listOf(playlist.id))
+                    }
                 },
                 onCreateNewPlaylist = {
                     showAddToPlaylistDialog = false
@@ -1024,9 +1034,14 @@ fun PlayerScreen(
         if (showCreatePlaylistDialog) {
             CreatePlaylistDialog(
                 onConfirm = { newName ->
-                    onCreatePlaylistAndAdd(newName, activeVideoItem)
                     showCreatePlaylistDialog = false
-                    statusBannerText = "تم إنشاء \"$newName\" وإضافة الفيديو"
+                    if (onCreatePlaylistAndAddWithResult != null) {
+                        onCreatePlaylistAndAddWithResult(newName, activeVideoItem) { _, msg ->
+                            statusBannerText = msg
+                        }
+                    } else {
+                        onCreatePlaylistAndAdd(newName, activeVideoItem)
+                    }
                 },
                 onDismiss = { showCreatePlaylistDialog = false }
             )

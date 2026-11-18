@@ -34,6 +34,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
@@ -65,7 +66,9 @@ import com.videohatak.player.core.playlist.model.toVideoItem
 import com.videohatak.player.core.playlist.repository.PlaylistRepositoryImpl
 import com.videohatak.player.core.trash.repository.TrashRepositoryImpl
 import com.videohatak.player.core.vault.model.toVideoItem
+import com.videohatak.player.core.vault.repository.VaultImportOutcome
 import com.videohatak.player.core.vault.repository.VaultRepositoryImpl
+import com.videohatak.player.feature.library.DataStoreLibraryScrollStore
 import com.videohatak.player.feature.library.LibraryScreen
 import com.videohatak.player.feature.library.LibraryTab
 import com.videohatak.player.feature.library.LibraryUiEvent
@@ -73,7 +76,9 @@ import com.videohatak.player.feature.library.LibraryViewModel
 import com.videohatak.player.feature.player.PlayerScreen
 import com.videohatak.player.feature.player.PlayerViewModel
 import com.videohatak.player.feature.player.components.MiniPlayerBar
+import com.videohatak.player.feature.playlist.PlaylistUiEvent
 import com.videohatak.player.feature.playlist.PlaylistViewModel
+import com.videohatak.player.feature.vault.VaultUiEvent
 import com.videohatak.player.feature.vault.VaultViewModel
 import kotlinx.coroutines.launch
 
@@ -88,7 +93,8 @@ class MainActivity : FragmentActivity() {
     private val libraryViewModel: LibraryViewModel by viewModels {
         LibraryViewModel.provideFactory(
             LocalVideoRepositoryImpl(applicationContext),
-            TrashRepositoryImpl(applicationContext)
+            TrashRepositoryImpl(applicationContext),
+            DataStoreLibraryScrollStore(applicationContext)
         )
     }
 
@@ -227,6 +233,31 @@ class MainActivity : FragmentActivity() {
             var activeVideoForPlayback by remember { mutableStateOf<VideoItem?>(null) }
             var activeContextVideos by remember { mutableStateOf<List<VideoItem>>(emptyList()) }
             activeVideoState = activeVideoForPlayback
+            val currentActiveVideo by rememberUpdatedState(activeVideoForPlayback)
+
+            LaunchedEffect(Unit) {
+                playlistViewModel.events.collect { event ->
+                    when (event) {
+                        is PlaylistUiEvent.ShowMessage -> {
+                            if (currentActiveVideo == null) {
+                                snackbarHostState.showSnackbar(event.message)
+                            }
+                        }
+                    }
+                }
+            }
+
+            LaunchedEffect(Unit) {
+                vaultViewModel.events.collect { event ->
+                    when (event) {
+                        is VaultUiEvent.ShowMessage -> {
+                            if (currentActiveVideo == null) {
+                                snackbarHostState.showSnackbar(event.message)
+                            }
+                        }
+                    }
+                }
+            }
 
             val isInPip by isInPipModeState
 
@@ -235,6 +266,9 @@ class MainActivity : FragmentActivity() {
             val sortOrder by libraryViewModel.sortOrder.collectAsStateWithLifecycle()
             val currentTab by libraryViewModel.currentTab.collectAsStateWithLifecycle()
             val selectedFolder by libraryViewModel.selectedFolder.collectAsStateWithLifecycle()
+            val videosScrollPosition by libraryViewModel.videosScrollPosition.collectAsStateWithLifecycle()
+            val isVideosScrollLoaded by libraryViewModel.isVideosScrollLoaded.collectAsStateWithLifecycle()
+            val foldersScrollPosition by libraryViewModel.foldersScrollPosition.collectAsStateWithLifecycle()
             val playerUiState by playerViewModel.uiState.collectAsStateWithLifecycle()
             val currentPlayerVideo by playerViewModel.currentVideoFlow.collectAsStateWithLifecycle()
             val playbackMode by playerViewModel.playbackMode.collectAsStateWithLifecycle()
@@ -410,6 +444,7 @@ class MainActivity : FragmentActivity() {
                     }
                     val succeededUris = mutableListOf<Uri>()
                     var failedCount = 0
+                    var lastFailureReason: String? = null
                     try {
                         for (target in candidates) {
                             val currentActiveUri = playerViewModel.uiState.value.mediaUri
@@ -419,14 +454,28 @@ class MainActivity : FragmentActivity() {
                                 playerViewModel.stopPlaybackCompletely()
                                 VideoPlaybackService.stopAndCancelNotification(this@MainActivity)
                             }
-                            val imported = repo.importVideo(
-                                sourceUri = target.contentUri,
-                                displayName = target.safeTitle
-                            )
-                            if (imported != null) {
-                                succeededUris.add(target.contentUri)
-                            } else {
-                                failedCount++
+                            when (
+                                val outcome = repo.importVideoDetailed(
+                                    sourceUri = target.contentUri,
+                                    displayName = target.safeTitle
+                                )
+                            ) {
+                                is VaultImportOutcome.Imported -> {
+                                    succeededUris.add(target.contentUri)
+                                }
+                                is VaultImportOutcome.AlreadyInVault -> {
+                                    if (outcome.integrityVerified) {
+                                        succeededUris.add(target.contentUri)
+                                    } else {
+                                        failedCount++
+                                        lastFailureReason = "تعذر التحقق من سلامة النسخة الموجودة في الخزنة — لم يتم المساس بالملف الأصلي"
+                                    }
+                                }
+                                is VaultImportOutcome.Failed -> {
+                                    failedCount++
+                                    lastFailureReason = outcome.reason
+                                }
+                                VaultImportOutcome.Cancelled -> Unit
                             }
                         }
                     } finally {
@@ -440,8 +489,11 @@ class MainActivity : FragmentActivity() {
                             encryptedCount = succeededUris.size,
                             encryptedFailedCount = failedCount
                         )
+                        playlistViewModel.refresh()
                     } else if (failedCount > 0) {
-                        snackbarHostState.showSnackbar("تعذر تشفير ونقل الفيديوهات إلى الخزنة الخاصة")
+                        snackbarHostState.showSnackbar(
+                            lastFailureReason ?: "تعذر تشفير ونقل الفيديو إلى الخزنة — بقيت الملفات الأصلية سليمة"
+                        )
                     }
                 }
             }
@@ -578,10 +630,13 @@ class MainActivity : FragmentActivity() {
                             onToggleFavorite = { targetVideo ->
                                 playlistViewModel.toggleFavorite(targetVideo)
                             },
+                            onToggleFavoriteWithResult = playlistViewModel::toggleFavoriteWithFeedback,
                             onAddToPlaylists = playlistViewModel::addVideoToPlaylists,
+                            onAddToPlaylistsWithResult = playlistViewModel::addVideoToPlaylistsWithResult,
                             onCreatePlaylistAndAdd = { name, targetVideo ->
                                 playlistViewModel.createPlaylistAndAddVideo(name, targetVideo)
                             },
+                            onCreatePlaylistAndAddWithResult = playlistViewModel::createPlaylistAndAddVideoWithResult,
                             onAddToVault = { targetVideo ->
                                 moveVideosToVault(listOf(targetVideo))
                             },
@@ -845,8 +900,10 @@ class MainActivity : FragmentActivity() {
                                     vaultViewModel.changeVaultPin(currentPin, newPin, cb)
                                 },
                                 onVaultSetPin = { newPin ->
-                                    vaultViewModel.setVaultPin(newPin) { _, msg ->
-                                        uiScope.launch { snackbarHostState.showSnackbar(msg) }
+                                    vaultViewModel.setVaultPin(newPin) { ok, msg ->
+                                        if (!ok) {
+                                            uiScope.launch { snackbarHostState.showSnackbar(msg) }
+                                        }
                                     }
                                 },
                                 onVaultRemovePin = {
@@ -877,6 +934,12 @@ class MainActivity : FragmentActivity() {
                                 onVaultUserInteraction = vaultViewModel::recordUserActivity,
                                 seekIntervalSeconds = seekIntervalSeconds,
                                 onSelectSeekIntervalSeconds = playerViewModel::setSeekIntervalSeconds,
+                                videosScrollPosition = videosScrollPosition,
+                                isVideosScrollLoaded = isVideosScrollLoaded,
+                                onSaveVideosScrollPosition = libraryViewModel::saveVideosScrollPosition,
+                                foldersScrollPosition = foldersScrollPosition,
+                                onSaveFoldersScrollPosition = libraryViewModel::saveFoldersScrollPosition,
+                                onOpenFavoritesPlaylist = playlistViewModel::openFavoritesPlaylist,
                                 modifier = Modifier.padding(innerPadding)
                             )
                         }

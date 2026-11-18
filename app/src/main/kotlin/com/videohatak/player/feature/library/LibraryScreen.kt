@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
@@ -69,11 +70,14 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -227,6 +231,16 @@ fun LibraryScreen(
     onVaultUserInteraction: () -> Unit = {},
     seekIntervalSeconds: Int = PlaybackPreferencesRepository.DEFAULT_SEEK_INTERVAL_SECONDS,
     onSelectSeekIntervalSeconds: (Int) -> Unit = {},
+    videosScrollPosition: LibraryScrollPosition = LibraryScrollPosition(),
+    isVideosScrollLoaded: Boolean = true,
+    onSaveVideosScrollPosition: (Int, Int) -> Unit = { _, _ -> },
+    foldersScrollPosition: LibraryScrollPosition = LibraryScrollPosition(),
+    onSaveFoldersScrollPosition: (Int, Int) -> Unit = { _, _ -> },
+    onOpenFavoritesPlaylist: () -> Unit = {
+        favoritesPlaylistId?.let { id ->
+            playlists.firstOrNull { it.id == id }?.let(onSelectPlaylist)
+        }
+    },
     modifier: Modifier = Modifier
 ) {
     val palette = LocalVideoHatakPalette.current
@@ -261,6 +275,16 @@ fun LibraryScreen(
         playlistBulkMenuExpanded = false
     }
 
+    LaunchedEffect(currentTab) {
+        if (currentTab == LibraryTab.FAVORITES) {
+            onTabSelected(LibraryTab.PLAYLISTS)
+            onOpenFavoritesPlaylist()
+        }
+    }
+
+    val latestSaveVideosScroll by rememberUpdatedState(onSaveVideosScrollPosition)
+    val latestSaveFoldersScroll by rememberUpdatedState(onSaveFoldersScrollPosition)
+
     val isVideoSelectionActive = selectedVideoKeys.isNotEmpty()
     val isPlaylistSelectionActive = selectedPlaylistItemIds.isNotEmpty()
 
@@ -272,7 +296,6 @@ fun LibraryScreen(
             selectedPlaylistWithItems != null ||
             currentTab == LibraryTab.VAULT ||
             currentTab == LibraryTab.TRASH ||
-            currentTab == LibraryTab.FAVORITES ||
             currentTab == LibraryTab.SETTINGS ||
             (isSearchExpanded && searchQuery.isNotEmpty())
     ) {
@@ -283,7 +306,6 @@ fun LibraryScreen(
             selectedPlaylistWithItems != null -> onSelectPlaylist(null)
             currentTab == LibraryTab.VAULT -> onTabSelected(LibraryTab.SETTINGS)
             currentTab == LibraryTab.TRASH -> onTabSelected(LibraryTab.VIDEOS)
-            currentTab == LibraryTab.FAVORITES -> onTabSelected(LibraryTab.VIDEOS)
             isSearchExpanded -> {
                 isSearchExpanded = false
                 onSearchQueryChanged("")
@@ -324,17 +346,7 @@ fun LibraryScreen(
                     label = { Text("مجلدات") }
                 )
                 NavigationBarItem(
-                    selected = currentTab == LibraryTab.FAVORITES,
-                    onClick = {
-                        clearFolderSelection()
-                        onTabSelected(LibraryTab.FAVORITES)
-                    },
-                    colors = itemColors,
-                    icon = { Icon(Icons.Default.Star, contentDescription = null) },
-                    label = { Text("المفضلة") }
-                )
-                NavigationBarItem(
-                    selected = currentTab == LibraryTab.PLAYLISTS,
+                    selected = currentTab == LibraryTab.PLAYLISTS || currentTab == LibraryTab.FAVORITES,
                     onClick = {
                         clearFolderSelection()
                         onTabSelected(LibraryTab.PLAYLISTS)
@@ -634,7 +646,38 @@ fun LibraryScreen(
                                 CircularProgressIndicator(color = palette.accent)
                             }
                         } else if (currentTab == LibraryTab.FOLDERS && selectedFolder == null) {
+                            val clampedFolderPos = remember(uiState.folders.size, foldersScrollPosition) {
+                                foldersScrollPosition.clampForItemCount(uiState.folders.size)
+                            }
+                            val foldersListState = rememberLazyListState(
+                                initialFirstVisibleItemIndex = clampedFolderPos.firstVisibleItemIndex,
+                                initialFirstVisibleItemScrollOffset = clampedFolderPos.firstVisibleItemScrollOffset
+                            )
+                            LaunchedEffect(foldersListState, uiState.folders.size) {
+                                snapshotFlow {
+                                    Triple(
+                                        foldersListState.isScrollInProgress,
+                                        foldersListState.firstVisibleItemIndex,
+                                        foldersListState.firstVisibleItemScrollOffset
+                                    )
+                                }.collect { (inProgress, idx, off) ->
+                                    if (!inProgress && uiState.folders.isNotEmpty()) {
+                                        latestSaveFoldersScroll(idx, off)
+                                    }
+                                }
+                            }
+                            DisposableEffect(Unit) {
+                                onDispose {
+                                    if (uiState.folders.isNotEmpty()) {
+                                        latestSaveFoldersScroll(
+                                            foldersListState.firstVisibleItemIndex,
+                                            foldersListState.firstVisibleItemScrollOffset
+                                        )
+                                    }
+                                }
+                            }
                             LazyColumn(
+                                state = foldersListState,
                                 modifier = Modifier.fillMaxSize(),
                                 contentPadding = PaddingValues(14.dp),
                                 verticalArrangement = Arrangement.spacedBy(8.dp)
@@ -654,6 +697,108 @@ fun LibraryScreen(
                                         style = MaterialTheme.typography.bodyLarge,
                                         color = palette.onSurfaceMuted
                                     )
+                                }
+                            } else if (currentTab == LibraryTab.VIDEOS && selectedFolder == null) {
+                                val initialClamped = remember(isVideosScrollLoaded) {
+                                    if (isVideosScrollLoaded) {
+                                        videosScrollPosition.clampForItemCount(videos.size)
+                                    } else {
+                                        LibraryScrollPosition()
+                                    }
+                                }
+                                val videosListState = rememberLazyListState(
+                                    initialFirstVisibleItemIndex = initialClamped.firstVisibleItemIndex,
+                                    initialFirstVisibleItemScrollOffset = initialClamped.firstVisibleItemScrollOffset
+                                )
+                                var hasRestoredVideosScroll by remember { mutableStateOf(false) }
+
+                                LaunchedEffect(isVideosScrollLoaded, videos.size) {
+                                    if (!hasRestoredVideosScroll && isVideosScrollLoaded && videos.isNotEmpty()) {
+                                        val target = videosScrollPosition.clampForItemCount(videos.size)
+                                        if (!target.isAtOrigin &&
+                                            (videosListState.firstVisibleItemIndex != target.firstVisibleItemIndex ||
+                                                videosListState.firstVisibleItemScrollOffset != target.firstVisibleItemScrollOffset)
+                                        ) {
+                                            videosListState.scrollToItem(
+                                                target.firstVisibleItemIndex,
+                                                target.firstVisibleItemScrollOffset
+                                            )
+                                        }
+                                        hasRestoredVideosScroll = true
+                                    }
+                                }
+
+                                LaunchedEffect(videosListState, videos.size, hasRestoredVideosScroll) {
+                                    if (!hasRestoredVideosScroll) return@LaunchedEffect
+                                    snapshotFlow {
+                                        Triple(
+                                            videosListState.isScrollInProgress,
+                                            videosListState.firstVisibleItemIndex,
+                                            videosListState.firstVisibleItemScrollOffset
+                                        )
+                                    }.collect { (inProgress, idx, off) ->
+                                        if (!inProgress && videos.isNotEmpty()) {
+                                            latestSaveVideosScroll(idx, off)
+                                        }
+                                    }
+                                }
+
+                                DisposableEffect(Unit) {
+                                    onDispose {
+                                        if (hasRestoredVideosScroll && videos.isNotEmpty()) {
+                                            latestSaveVideosScroll(
+                                                videosListState.firstVisibleItemIndex,
+                                                videosListState.firstVisibleItemScrollOffset
+                                            )
+                                        }
+                                    }
+                                }
+
+                                LazyColumn(
+                                    state = videosListState,
+                                    modifier = Modifier.fillMaxSize(),
+                                    contentPadding = PaddingValues(14.dp),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    items(videos, key = { it.id }) { video ->
+                                        val key = videoSelectionKey(video)
+                                        val selected = key in selectedVideoKeys
+                                        VideoCard(
+                                            video = video,
+                                            onClick = {
+                                                if (isVideoSelectionActive) {
+                                                    selectedVideoKeys = if (selected) {
+                                                        selectedVideoKeys - key
+                                                    } else {
+                                                        selectedVideoKeys + key
+                                                    }
+                                                } else {
+                                                    latestSaveVideosScroll(
+                                                        videosListState.firstVisibleItemIndex,
+                                                        videosListState.firstVisibleItemScrollOffset
+                                                    )
+                                                    onVideoClick(video, videos)
+                                                }
+                                            },
+                                            onLongClick = {
+                                                selectedVideoKeys = if (selected) {
+                                                    selectedVideoKeys - key
+                                                } else {
+                                                    selectedVideoKeys + key
+                                                }
+                                            },
+                                            isSelectionMode = isVideoSelectionActive,
+                                            isSelected = selected,
+                                            isFavorite = isVideoFavorite(video),
+                                            onToggleFavoriteClick = { onToggleFavorite(video) },
+                                            onAddToPlaylist = { videosForPlaylistAddition = listOf(video) },
+                                            onRenameClick = { videoToRename = video },
+                                            onMoveToFolderClick = { videosToMove = listOf(video) },
+                                            onAddToVaultClick = { onAddVideoToVault(video) },
+                                            onMoveToTrashClick = { onMoveVideoToTrash(video) },
+                                            onInfoClick = { videoForInfo = video }
+                                        )
+                                    }
                                 }
                             } else {
                                 LazyColumn(
@@ -702,243 +847,7 @@ fun LibraryScreen(
                     }
                 }
 
-                LibraryTab.FAVORITES -> {
-                    val selectedFavorites = remember(favoriteVideos, selectedVideoKeys) {
-                        favoriteVideos.filter { videoSelectionKey(it) in selectedVideoKeys }
-                    }
-                    Column(modifier = Modifier.fillMaxSize()) {
-                        if (isVideoSelectionActive) {
-                            Surface(
-                                color = palette.surfaceElevated,
-                                border = BorderStroke(0.75.dp, palette.accent.copy(alpha = 0.45f)),
-                                shape = RoundedCornerShape(14.dp),
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(horizontal = 12.dp, vertical = 6.dp)
-                            ) {
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(horizontal = 6.dp, vertical = 2.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    IconButton(onClick = { selectedVideoKeys = emptySet() }) {
-                                        Icon(Icons.Default.Close, contentDescription = "إلغاء التحديد", tint = palette.onSurface)
-                                    }
-                                    Text(
-                                        text = "تم تحديد ${selectedFavorites.size}",
-                                        style = MaterialTheme.typography.titleSmall,
-                                        fontWeight = FontWeight.Bold,
-                                        color = palette.accent,
-                                        modifier = Modifier.weight(1f)
-                                    )
-                                    IconButton(
-                                        onClick = {
-                                            selectedVideoKeys = if (selectedFavorites.size == favoriteVideos.size && favoriteVideos.isNotEmpty()) {
-                                                emptySet()
-                                            } else {
-                                                favoriteVideos.map(::videoSelectionKey).toSet()
-                                            }
-                                        }
-                                    ) {
-                                        Icon(
-                                            imageVector = if (selectedFavorites.size == favoriteVideos.size && favoriteVideos.isNotEmpty()) {
-                                                Icons.Default.Deselect
-                                            } else {
-                                                Icons.Default.SelectAll
-                                            },
-                                            contentDescription = "تحديد الكل",
-                                            tint = palette.accent
-                                        )
-                                    }
-                                    Box {
-                                        IconButton(onClick = { bulkMenuExpanded = true }) {
-                                            Icon(Icons.Default.MoreVert, contentDescription = "إجراءات المفضلة", tint = palette.accent)
-                                        }
-                                        MaterialTheme(
-                                            colorScheme = MaterialTheme.colorScheme.copy(surface = palette.surface)
-                                        ) {
-                                            DropdownMenu(
-                                                expanded = bulkMenuExpanded,
-                                                onDismissRequest = { bulkMenuExpanded = false }
-                                            ) {
-                                                DropdownMenuItem(
-                                                    text = { Text("إزالة من المفضلة (دون حذف الملف)", color = palette.onSurface) },
-                                                    leadingIcon = { Icon(Icons.Default.StarBorder, contentDescription = null, tint = palette.accent) },
-                                                    onClick = {
-                                                        bulkMenuExpanded = false
-                                                        val targets = selectedFavorites
-                                                        selectedVideoKeys = emptySet()
-                                                        onRemoveVideosFromFavorites(targets)
-                                                    }
-                                                )
-                                                DropdownMenuItem(
-                                                    text = { Text("إضافة إلى القائمة", color = palette.onSurface) },
-                                                    leadingIcon = { Icon(Icons.Default.PlaylistAdd, contentDescription = null, tint = palette.accent) },
-                                                    onClick = {
-                                                        bulkMenuExpanded = false
-                                                        videosForPlaylistAddition = selectedFavorites
-                                                        selectedVideoKeys = emptySet()
-                                                    }
-                                                )
-                                                DropdownMenuItem(
-                                                    text = { Text("نقل إلى مجلد", color = palette.onSurface) },
-                                                    leadingIcon = { Icon(Icons.Default.DriveFileMove, contentDescription = null, tint = palette.accent) },
-                                                    onClick = {
-                                                        bulkMenuExpanded = false
-                                                        videosToMove = selectedFavorites
-                                                        selectedVideoKeys = emptySet()
-                                                    }
-                                                )
-                                                DropdownMenuItem(
-                                                    text = { Text("نقل إلى الخزنة", color = palette.onSurface) },
-                                                    leadingIcon = { Icon(Icons.Default.Lock, contentDescription = null, tint = palette.accent) },
-                                                    onClick = {
-                                                        bulkMenuExpanded = false
-                                                        val targets = selectedFavorites
-                                                        selectedVideoKeys = emptySet()
-                                                        onAddVideosToVault(targets)
-                                                    }
-                                                )
-                                                DropdownMenuItem(
-                                                    text = { Text("نقل إلى سلة المهملات", color = MaterialTheme.colorScheme.error) },
-                                                    leadingIcon = {
-                                                        Icon(
-                                                            Icons.Default.DeleteOutline,
-                                                            contentDescription = null,
-                                                            tint = MaterialTheme.colorScheme.error
-                                                        )
-                                                    },
-                                                    onClick = {
-                                                        bulkMenuExpanded = false
-                                                        val targets = selectedFavorites
-                                                        selectedVideoKeys = emptySet()
-                                                        onTrashVideos(targets)
-                                                    }
-                                                )
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(horizontal = 16.dp, vertical = 8.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(Icons.Default.Star, contentDescription = null, tint = palette.accent)
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    text = "المفضلة (${favoriteVideos.size})",
-                                    style = MaterialTheme.typography.titleMedium,
-                                    fontWeight = FontWeight.Bold,
-                                    color = palette.onSurface,
-                                    modifier = Modifier.weight(1f)
-                                )
-                                if (favoriteVideos.isNotEmpty()) {
-                                    Button(
-                                        onClick = {
-                                            val favId = favoritesPlaylistId
-                                            if (favId != null) {
-                                                onPlayPlaylist(favId, null, playbackMode.shuffleEnabled)
-                                            } else {
-                                                onVideoClick(favoriteVideos.first(), favoriteVideos)
-                                            }
-                                        },
-                                        colors = ButtonDefaults.buttonColors(
-                                            containerColor = palette.accent,
-                                            contentColor = MaterialTheme.colorScheme.onPrimary
-                                        ),
-                                        shape = RoundedCornerShape(10.dp)
-                                    ) {
-                                        Icon(Icons.Default.PlayArrow, contentDescription = null)
-                                        Spacer(modifier = Modifier.width(4.dp))
-                                        Text("تشغيل الكل", fontWeight = FontWeight.Bold)
-                                    }
-                                }
-                            }
-                        }
-
-                        if (favoriteVideos.isEmpty()) {
-                            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                                Column(
-                                    horizontalAlignment = Alignment.CenterHorizontally,
-                                    modifier = Modifier.padding(horizontal = 24.dp)
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.StarBorder,
-                                        contentDescription = null,
-                                        tint = palette.accent.copy(alpha = 0.7f),
-                                        modifier = Modifier.size(48.dp)
-                                    )
-                                    Spacer(modifier = Modifier.height(10.dp))
-                                    Text(
-                                        text = "لا توجد مقاطع في المفضلة بعد",
-                                        style = MaterialTheme.typography.titleSmall,
-                                        fontWeight = FontWeight.Bold,
-                                        color = palette.onSurface
-                                    )
-                                    Spacer(modifier = Modifier.height(4.dp))
-                                    Text(
-                                        text = "أضف فيديوهاتك المفضلة من المكتبة أو أثناء التشغيل بالضغط على النجمة.",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = palette.onSurfaceMuted
-                                    )
-                                }
-                            }
-                        } else {
-                            LazyColumn(
-                                modifier = Modifier.fillMaxSize(),
-                                contentPadding = PaddingValues(14.dp),
-                                verticalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                items(favoriteVideos, key = { "${it.id}_${it.contentUri}" }) { video ->
-                                    val key = videoSelectionKey(video)
-                                    val selected = key in selectedVideoKeys
-                                    VideoCard(
-                                        video = video,
-                                        onClick = {
-                                            if (isVideoSelectionActive) {
-                                                selectedVideoKeys = if (selected) {
-                                                    selectedVideoKeys - key
-                                                } else {
-                                                    selectedVideoKeys + key
-                                                }
-                                            } else {
-                                                val favId = favoritesPlaylistId
-                                                if (favId != null) {
-                                                    onPlayPlaylist(favId, video.id, playbackMode.shuffleEnabled)
-                                                } else {
-                                                    onVideoClick(video, favoriteVideos)
-                                                }
-                                            }
-                                        },
-                                        onLongClick = {
-                                            selectedVideoKeys = if (selected) {
-                                                selectedVideoKeys - key
-                                            } else {
-                                                selectedVideoKeys + key
-                                            }
-                                        },
-                                        isSelectionMode = isVideoSelectionActive,
-                                        isSelected = selected,
-                                        isFavorite = true,
-                                        favoriteMenuLabel = "إزالة من المفضلة",
-                                        onToggleFavoriteClick = { onToggleFavorite(video) },
-                                        onAddToPlaylist = { videosForPlaylistAddition = listOf(video) },
-                                        onRenameClick = { videoToRename = video },
-                                        onMoveToFolderClick = { videosToMove = listOf(video) },
-                                        onAddToVaultClick = { onAddVideoToVault(video) },
-                                        onMoveToTrashClick = { onMoveVideoToTrash(video) },
-                                        onInfoClick = { videoForInfo = video }
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
+                LibraryTab.FAVORITES -> Unit
 
                 LibraryTab.PLAYLISTS -> {
                     val currentPlaylistPair = selectedPlaylistWithItems
@@ -1175,32 +1084,25 @@ fun LibraryScreen(
                         }
                     } else {
                         Box(modifier = Modifier.fillMaxSize()) {
-                            if (playlists.isEmpty()) {
-                                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                                    Text(
-                                        text = "لا توجد قوائم تشغيل حتى الآن",
-                                        style = MaterialTheme.typography.bodyLarge,
-                                        color = palette.onSurfaceMuted
-                                    )
-                                }
-                            } else {
-                                LazyColumn(
-                                    modifier = Modifier.fillMaxSize(),
-                                    contentPadding = PaddingValues(14.dp),
-                                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                                ) {
-                                    items(playlists, key = { it.id }) { playlist ->
-                                        val isProtectedFavorites =
-                                            PlaylistRepository.isProtectedFavoritesTitle(playlist.title)
+                            val hasFavoritesPlaylist = playlists.any {
+                                PlaylistRepository.isProtectedFavoritesTitle(it.title)
+                            }
+                            LazyColumn(
+                                modifier = Modifier.fillMaxSize(),
+                                contentPadding = PaddingValues(14.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                if (!hasFavoritesPlaylist) {
+                                    item(key = "virtual_favorites_playlist") {
                                         Card(
                                             modifier = Modifier
                                                 .fillMaxWidth()
-                                                .clickable { onSelectPlaylist(playlist) },
+                                                .clickable { onOpenFavoritesPlaylist() },
                                             shape = RoundedCornerShape(14.dp),
                                             colors = CardDefaults.cardColors(containerColor = palette.surface),
                                             border = BorderStroke(
-                                                width = if (isProtectedFavorites) 1.25.dp else 0.75.dp,
-                                                color = if (isProtectedFavorites) palette.accent.copy(alpha = 0.75f) else palette.border.copy(alpha = 0.65f)
+                                                width = 1.25.dp,
+                                                color = palette.accent.copy(alpha = 0.75f)
                                             )
                                         ) {
                                             Row(
@@ -1210,7 +1112,7 @@ fun LibraryScreen(
                                                 verticalAlignment = Alignment.CenterVertically
                                             ) {
                                                 Icon(
-                                                    imageVector = if (isProtectedFavorites) Icons.Default.Star else Icons.Default.PlaylistPlay,
+                                                    imageVector = Icons.Default.Star,
                                                     contentDescription = null,
                                                     tint = palette.accent
                                                 )
@@ -1218,40 +1120,97 @@ fun LibraryScreen(
                                                 Column(modifier = Modifier.weight(1f)) {
                                                     Row(verticalAlignment = Alignment.CenterVertically) {
                                                         Text(
-                                                            text = playlist.title,
+                                                            text = PlaylistRepository.FAVORITES_PLAYLIST_TITLE,
                                                             style = MaterialTheme.typography.titleMedium,
                                                             fontWeight = FontWeight.Bold,
                                                             color = palette.onSurface
                                                         )
-                                                        if (isProtectedFavorites) {
-                                                            Spacer(modifier = Modifier.width(8.dp))
-                                                            Surface(
-                                                                shape = RoundedCornerShape(6.dp),
-                                                                color = palette.accent.copy(alpha = 0.16f)
-                                                            ) {
-                                                                Text(
-                                                                    text = "أساسية",
-                                                                    style = MaterialTheme.typography.labelSmall,
-                                                                    color = palette.accent,
-                                                                    fontWeight = FontWeight.Bold,
-                                                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                                                                )
-                                                            }
+                                                        Spacer(modifier = Modifier.width(8.dp))
+                                                        Surface(
+                                                            shape = RoundedCornerShape(6.dp),
+                                                            color = palette.accent.copy(alpha = 0.16f)
+                                                        ) {
+                                                            Text(
+                                                                text = "أساسية",
+                                                                style = MaterialTheme.typography.labelSmall,
+                                                                color = palette.accent,
+                                                                fontWeight = FontWeight.Bold,
+                                                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                                            )
                                                         }
                                                     }
                                                     Text(
-                                                        text = "${playlist.itemCount} فيديو",
+                                                        text = "${favoriteVideos.size} فيديو",
                                                         style = MaterialTheme.typography.bodySmall,
                                                         color = palette.onSurfaceMuted
                                                     )
                                                 }
-                                                if (!isProtectedFavorites) {
-                                                    IconButton(onClick = { playlistToRename = playlist }) {
-                                                        Icon(Icons.Default.Edit, contentDescription = "إعادة تسمية", tint = palette.onSurfaceMuted)
+                                            }
+                                        }
+                                    }
+                                }
+                                items(playlists, key = { it.id }) { playlist ->
+                                    val isProtectedFavorites =
+                                        PlaylistRepository.isProtectedFavoritesTitle(playlist.title)
+                                    Card(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clickable { onSelectPlaylist(playlist) },
+                                        shape = RoundedCornerShape(14.dp),
+                                        colors = CardDefaults.cardColors(containerColor = palette.surface),
+                                        border = BorderStroke(
+                                            width = if (isProtectedFavorites) 1.25.dp else 0.75.dp,
+                                            color = if (isProtectedFavorites) palette.accent.copy(alpha = 0.75f) else palette.border.copy(alpha = 0.65f)
+                                        )
+                                    ) {
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(14.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Icon(
+                                                imageVector = if (isProtectedFavorites) Icons.Default.Star else Icons.Default.PlaylistPlay,
+                                                contentDescription = null,
+                                                tint = palette.accent
+                                            )
+                                            Spacer(modifier = Modifier.width(14.dp))
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                                    Text(
+                                                        text = playlist.title,
+                                                        style = MaterialTheme.typography.titleMedium,
+                                                        fontWeight = FontWeight.Bold,
+                                                        color = palette.onSurface
+                                                    )
+                                                    if (isProtectedFavorites) {
+                                                        Spacer(modifier = Modifier.width(8.dp))
+                                                        Surface(
+                                                            shape = RoundedCornerShape(6.dp),
+                                                            color = palette.accent.copy(alpha = 0.16f)
+                                                        ) {
+                                                            Text(
+                                                                text = "أساسية",
+                                                                style = MaterialTheme.typography.labelSmall,
+                                                                color = palette.accent,
+                                                                fontWeight = FontWeight.Bold,
+                                                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                                            )
+                                                        }
                                                     }
-                                                    IconButton(onClick = { onDeletePlaylist(playlist.id) }) {
-                                                        Icon(Icons.Default.Delete, contentDescription = "حذف", tint = MaterialTheme.colorScheme.error)
-                                                    }
+                                                }
+                                                Text(
+                                                    text = "${playlist.itemCount} فيديو",
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = palette.onSurfaceMuted
+                                                )
+                                            }
+                                            if (!isProtectedFavorites) {
+                                                IconButton(onClick = { playlistToRename = playlist }) {
+                                                    Icon(Icons.Default.Edit, contentDescription = "إعادة تسمية", tint = palette.onSurfaceMuted)
+                                                }
+                                                IconButton(onClick = { onDeletePlaylist(playlist.id) }) {
+                                                    Icon(Icons.Default.Delete, contentDescription = "حذف", tint = MaterialTheme.colorScheme.error)
                                                 }
                                             }
                                         }

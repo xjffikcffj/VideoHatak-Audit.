@@ -8,15 +8,23 @@ import com.videohatak.player.core.playlist.model.Playlist
 import com.videohatak.player.core.playlist.model.PlaylistItem
 import com.videohatak.player.core.playlist.model.PlaylistPlaybackState
 import com.videohatak.player.core.playlist.model.PlaylistRepeatMode
+import com.videohatak.player.core.playlist.repository.PlaylistAddOutcome
 import com.videohatak.player.core.playlist.repository.PlaylistRepository
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+
+sealed interface PlaylistUiEvent {
+    data class ShowMessage(val message: String) : PlaylistUiEvent
+}
 
 class PlaylistViewModel(
     private val repository: PlaylistRepository
@@ -53,6 +61,9 @@ class PlaylistViewModel(
         .map { it?.first?.id }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
+    private val _events = MutableSharedFlow<PlaylistUiEvent>(extraBufferCapacity = 16)
+    val events: SharedFlow<PlaylistUiEvent> = _events.asSharedFlow()
+
     init {
         refresh()
     }
@@ -75,10 +86,26 @@ class PlaylistViewModel(
     }
 
     fun isFavorite(video: VideoItem): Boolean {
-        return video.id in _favoriteVideoIds.value || video.contentUri.toString() in _favoriteVideoUris.value
+        val uriKey = video.contentUri.toString().trim()
+        return (video.id > 0L && video.id in _favoriteVideoIds.value) ||
+            (uriKey.isNotEmpty() && uriKey in _favoriteVideoUris.value)
+    }
+
+    fun openFavoritesPlaylist() {
+        viewModelScope.launch {
+            val fav = repository.ensureFavoritesPlaylist() ?: return@launch
+            refreshFavoritesState()
+            _selectedPlaylistWithItems.value = repository.getPlaylistWithItems(fav.id)
+        }
     }
 
     fun toggleFavorite(video: VideoItem, onResult: ((Boolean) -> Unit)? = null) {
+        toggleFavoriteWithFeedback(video) { isNowFavorite, _ ->
+            onResult?.invoke(isNowFavorite)
+        }
+    }
+
+    fun toggleFavoriteWithFeedback(video: VideoItem, onResult: (Boolean, String) -> Unit) {
         viewModelScope.launch {
             val isNowFavorite = repository.toggleFavorite(video)
             refreshFavoritesState()
@@ -87,7 +114,13 @@ class PlaylistViewModel(
                     loadPlaylistWithItems(selected.id)
                 }
             }
-            onResult?.invoke(isNowFavorite)
+            val msg = if (isNowFavorite) {
+                "تمت إضافة الفيديو إلى المفضلة بنجاح"
+            } else {
+                "تمت إزالة الفيديو من المفضلة بنجاح"
+            }
+            _events.tryEmit(PlaylistUiEvent.ShowMessage(msg))
+            onResult(isNowFavorite, msg)
         }
     }
 
@@ -108,26 +141,54 @@ class PlaylistViewModel(
 
     fun createPlaylist(name: String) {
         viewModelScope.launch {
-            val newId = repository.createPlaylist(name)
-            loadPlaylistWithItems(newId)
+            val cleanName = name.trim().ifBlank { "قائمة جديدة" }
+            val newId = repository.createPlaylist(cleanName)
+            if (newId > 0L) {
+                loadPlaylistWithItems(newId)
+                _events.tryEmit(PlaylistUiEvent.ShowMessage("تم إنشاء قائمة \"$cleanName\" بنجاح"))
+            } else {
+                _events.tryEmit(PlaylistUiEvent.ShowMessage("تعذر إنشاء قائمة التشغيل"))
+            }
         }
     }
 
     fun createPlaylistAndAddVideo(name: String, video: VideoItem, onComplete: (() -> Unit)? = null) {
-        viewModelScope.launch {
-            val newId = repository.createPlaylist(name)
-            if (newId > 0L) {
-                repository.addVideoToPlaylists(video, listOf(newId))
-                refreshFavoritesState()
-                loadPlaylistWithItems(newId)
-            }
+        createPlaylistAndAddVideoWithResult(name, video) { _, _ ->
             onComplete?.invoke()
+        }
+    }
+
+    fun createPlaylistAndAddVideoWithResult(
+        name: String,
+        video: VideoItem,
+        onResult: (Boolean, String) -> Unit
+    ) {
+        viewModelScope.launch {
+            val cleanName = name.trim().ifBlank { "قائمة جديدة" }
+            val newId = repository.createPlaylist(cleanName)
+            if (newId <= 0L) {
+                val errMsg = "تعذر إنشاء قائمة التشغيل"
+                _events.tryEmit(PlaylistUiEvent.ShowMessage(errMsg))
+                onResult(false, errMsg)
+                return@launch
+            }
+            val outcome = repository.addVideosToPlaylistsDetailed(listOf(video), listOf(newId))
+            refreshFavoritesState()
+            loadPlaylistWithItems(newId)
+            val msg = when {
+                outcome.addedCount > 0 -> "تم إنشاء \"$cleanName\" وإضافة الفيديو بنجاح"
+                outcome.duplicateCount > 0 -> "الفيديو موجود بالفعل في \"$cleanName\""
+                else -> "تم إنشاء \"$cleanName\" لكن تعذر إضافة الفيديو"
+            }
+            _events.tryEmit(PlaylistUiEvent.ShowMessage(msg))
+            onResult(outcome.addedCount > 0, msg)
         }
     }
 
     fun renamePlaylist(id: Long, newName: String) {
         val current = playlists.value.firstOrNull { it.id == id }
         if (current != null && PlaylistRepository.isProtectedFavoritesTitle(current.title)) {
+            _events.tryEmit(PlaylistUiEvent.ShowMessage("لا يمكن تعديل اسم قائمة المفضلة الأساسية"))
             return
         }
         viewModelScope.launch {
@@ -135,12 +196,19 @@ class PlaylistViewModel(
             if (updated && _selectedPlaylistWithItems.value?.first?.id == id) {
                 loadPlaylistWithItems(id)
             }
+            val msg = if (updated) {
+                "تم تغيير اسم القائمة بنجاح"
+            } else {
+                "تعذر تغيير اسم القائمة"
+            }
+            _events.tryEmit(PlaylistUiEvent.ShowMessage(msg))
         }
     }
 
     fun deletePlaylist(id: Long) {
         val current = playlists.value.firstOrNull { it.id == id }
         if (current != null && PlaylistRepository.isProtectedFavoritesTitle(current.title)) {
+            _events.tryEmit(PlaylistUiEvent.ShowMessage("لا يمكن حذف قائمة المفضلة الأساسية"))
             return
         }
         viewModelScope.launch {
@@ -149,16 +217,39 @@ class PlaylistViewModel(
             if (deleted && _selectedPlaylistWithItems.value?.first?.id == id) {
                 _selectedPlaylistWithItems.value = null
             }
+            val msg = if (deleted) {
+                "تم حذف القائمة بنجاح"
+            } else {
+                "تعذر حذف القائمة"
+            }
+            _events.tryEmit(PlaylistUiEvent.ShowMessage(msg))
         }
     }
 
     fun addVideoToPlaylists(video: VideoItem, playlistIds: List<Long>) {
+        addVideoToPlaylistsWithResult(video, playlistIds) { _, _ -> }
+    }
+
+    fun addVideoToPlaylistsWithResult(
+        video: VideoItem,
+        playlistIds: List<Long>,
+        onResult: (Boolean, String) -> Unit
+    ) {
+        if (playlistIds.isEmpty()) {
+            val msg = "لم يتم اختيار قائمة تشغيل"
+            _events.tryEmit(PlaylistUiEvent.ShowMessage(msg))
+            onResult(false, msg)
+            return
+        }
         viewModelScope.launch {
-            repository.addVideoToPlaylists(video, playlistIds)
+            val outcome = repository.addVideosToPlaylistsDetailed(listOf(video), playlistIds)
             refreshFavoritesState()
             _selectedPlaylistWithItems.value?.first?.id?.let {
                 if (it in playlistIds) loadPlaylistWithItems(it)
             }
+            val msg = formatPlaylistAddMessage(outcome, totalVideos = 1, isFavoritesTarget = false)
+            _events.tryEmit(PlaylistUiEvent.ShowMessage(msg))
+            onResult(outcome.addedCount > 0, msg)
         }
     }
 
@@ -172,12 +263,14 @@ class PlaylistViewModel(
             return
         }
         viewModelScope.launch {
-            val added = repository.addVideosToPlaylists(videos, playlistIds)
+            val outcome = repository.addVideosToPlaylistsDetailed(videos, playlistIds)
             refreshFavoritesState()
             _selectedPlaylistWithItems.value?.first?.id?.let {
                 if (it in playlistIds) loadPlaylistWithItems(it)
             }
-            onComplete(added)
+            val msg = formatPlaylistAddMessage(outcome, totalVideos = videos.size, isFavoritesTarget = false)
+            _events.tryEmit(PlaylistUiEvent.ShowMessage(msg))
+            onComplete(outcome.addedCount)
         }
     }
 
@@ -190,14 +283,16 @@ class PlaylistViewModel(
             return
         }
         viewModelScope.launch {
-            val added = repository.addVideosToFavorites(videos)
+            val outcome = repository.addVideosToFavoritesDetailed(videos)
             refreshFavoritesState()
             _selectedPlaylistWithItems.value?.first?.let { selected ->
                 if (PlaylistRepository.isProtectedFavoritesTitle(selected.title)) {
                     loadPlaylistWithItems(selected.id)
                 }
             }
-            onComplete(added)
+            val msg = formatPlaylistAddMessage(outcome, totalVideos = videos.size, isFavoritesTarget = true)
+            _events.tryEmit(PlaylistUiEvent.ShowMessage(msg))
+            onComplete(outcome.addedCount)
         }
     }
 
@@ -217,15 +312,30 @@ class PlaylistViewModel(
                     loadPlaylistWithItems(selected.id)
                 }
             }
+            val msg = when {
+                removed == 1 -> "تمت إزالة الفيديو من المفضلة بنجاح"
+                removed > 1 -> "تمت إزالة $removed فيديو من المفضلة بنجاح"
+                else -> "الفيديو غير موجود في المفضلة"
+            }
+            _events.tryEmit(PlaylistUiEvent.ShowMessage(msg))
             onComplete(removed)
         }
     }
 
     fun removeItemFromPlaylist(itemId: Long, playlistId: Long) {
         viewModelScope.launch {
-            repository.removeVideoFromPlaylist(itemId, playlistId)
+            val isFavPlaylist = isFavoritesPlaylistId(playlistId)
+            val removed = repository.removeVideoFromPlaylistDetailed(itemId, playlistId)
             refreshFavoritesState()
-            loadPlaylistWithItems(playlistId)
+            if (_selectedPlaylistWithItems.value?.first?.id == playlistId) {
+                loadPlaylistWithItems(playlistId)
+            }
+            val msg = when {
+                removed && isFavPlaylist -> "تمت إزالة الفيديو من المفضلة بنجاح"
+                removed -> "تمت إزالة الفيديو من القائمة بنجاح"
+                else -> "تعذر إزالة الفيديو من القائمة"
+            }
+            _events.tryEmit(PlaylistUiEvent.ShowMessage(msg))
         }
     }
 
@@ -239,11 +349,20 @@ class PlaylistViewModel(
             return
         }
         viewModelScope.launch {
+            val isFavPlaylist = isFavoritesPlaylistId(playlistId)
             val removed = repository.removeVideosFromPlaylist(itemIds.toList(), playlistId)
             refreshFavoritesState()
             if (_selectedPlaylistWithItems.value?.first?.id == playlistId) {
                 loadPlaylistWithItems(playlistId)
             }
+            val msg = when {
+                removed == 1 && isFavPlaylist -> "تمت إزالة الفيديو من المفضلة بنجاح"
+                removed > 1 && isFavPlaylist -> "تمت إزالة $removed فيديو من المفضلة بنجاح"
+                removed == 1 -> "تمت إزالة الفيديو من القائمة بنجاح"
+                removed > 1 -> "تمت إزالة $removed فيديو من القائمة بنجاح"
+                else -> "تعذر إزالة الفيديو من القائمة"
+            }
+            _events.tryEmit(PlaylistUiEvent.ShowMessage(msg))
             onComplete(removed)
         }
     }
@@ -275,6 +394,56 @@ class PlaylistViewModel(
                 PlaylistRepeatMode.ONE -> PlaylistRepeatMode.OFF
             }
             it.copy(repeatMode = next)
+        }
+    }
+
+    private fun isFavoritesPlaylistId(playlistId: Long): Boolean {
+        val currentTitle = _selectedPlaylistWithItems.value?.first
+            ?.takeIf { it.id == playlistId }?.title
+            ?: playlists.value.firstOrNull { it.id == playlistId }?.title
+            ?: _favoritesPlaylistWithItems.value?.first?.takeIf { it.id == playlistId }?.title
+        return PlaylistRepository.isProtectedFavoritesTitle(currentTitle)
+    }
+
+    private fun formatPlaylistAddMessage(
+        outcome: PlaylistAddOutcome,
+        totalVideos: Int,
+        isFavoritesTarget: Boolean
+    ): String {
+        val targetName = outcome.playlistTitles.singleOrNull()
+        val isSingleFav = isFavoritesTarget || PlaylistRepository.isProtectedFavoritesTitle(targetName)
+        return when {
+            outcome.addedCount > 0 && outcome.duplicateCount == 0 && outcome.failedCount == 0 -> {
+                when {
+                    isSingleFav && totalVideos == 1 -> "تمت إضافة الفيديو إلى المفضلة بنجاح"
+                    isSingleFav -> "تمت إضافة ${outcome.addedCount} فيديو إلى المفضلة بنجاح"
+                    targetName != null && totalVideos == 1 -> "تمت إضافة الفيديو إلى \"$targetName\" بنجاح"
+                    targetName != null -> "تمت إضافة ${outcome.addedCount} فيديو إلى \"$targetName\" بنجاح"
+                    totalVideos == 1 -> "تمت إضافة الفيديو إلى القائمة بنجاح"
+                    else -> "تمت إضافة ${outcome.addedCount} فيديو إلى القائمة بنجاح"
+                }
+            }
+            outcome.addedCount == 0 && outcome.duplicateCount > 0 && outcome.failedCount == 0 -> {
+                when {
+                    isSingleFav && totalVideos == 1 -> "الفيديو موجود بالفعل في المفضلة"
+                    isSingleFav -> "الفيديوهات المحددة موجودة بالفعل في المفضلة"
+                    totalVideos == 1 -> "الفيديو موجود بالفعل في القائمة"
+                    else -> "الفيديوهات المحددة موجودة بالفعل في القائمة"
+                }
+            }
+            outcome.addedCount > 0 && outcome.duplicateCount > 0 -> {
+                if (isSingleFav) {
+                    "تمت إضافة ${outcome.addedCount} إلى المفضلة، و${outcome.duplicateCount} موجود بالفعل"
+                } else {
+                    "تمت إضافة ${outcome.addedCount} فيديو، و${outcome.duplicateCount} موجود بالفعل في القائمة"
+                }
+            }
+            outcome.addedCount > 0 -> {
+                "تمت إضافة ${outcome.addedCount} فيديو بنجاح"
+            }
+            else -> {
+                if (isSingleFav) "تعذر إضافة الفيديو إلى المفضلة" else "تعذر إضافة الفيديو إلى القائمة"
+            }
         }
     }
 

@@ -16,6 +16,8 @@ import com.videohatak.player.core.permission.PermissionHelper
 import com.videohatak.player.core.permission.VideoPermissionStatus
 import com.videohatak.player.core.trash.model.TrashItem
 import com.videohatak.player.core.trash.repository.TrashRepository
+import com.videohatak.player.core.vault.model.VaultHiddenMatcher
+import com.videohatak.player.core.vault.model.VaultHiddenOriginal
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -39,7 +41,8 @@ sealed interface LibraryUiEvent {
 class LibraryViewModel(
     private val videoRepository: VideoRepository,
     private val trashRepository: TrashRepository? = null,
-    private val scrollStore: LibraryScrollStore? = null
+    private val scrollStore: LibraryScrollStore? = null,
+    private val vaultHiddenEntries: StateFlow<List<VaultHiddenOriginal>> = MutableStateFlow(emptyList())
 ) : ViewModel() {
 
     private val _permissionStatus = MutableStateFlow<VideoPermissionStatus>(VideoPermissionStatus.NotRequested)
@@ -107,16 +110,18 @@ class LibraryViewModel(
         val query: String,
         val sort: SortOrder,
         val folder: VideoFolder?,
-        val trashedUris: Set<String>
+        val trashedUris: Set<String>,
+        val vaultHidden: List<VaultHiddenOriginal>
     )
 
     private val filterCriteria = combine(
         searchQuery,
         sortOrder,
         selectedFolder,
-        trashedUrisFlow
-    ) { query, sort, folder, trashed ->
-        FilterCriteria(query, sort, folder, trashed)
+        trashedUrisFlow,
+        vaultHiddenEntries
+    ) { query, sort, folder, trashed, hidden ->
+        FilterCriteria(query, sort, folder, trashed, hidden)
     }
 
     val uiState: StateFlow<LibraryUiState> = combine(
@@ -125,11 +130,12 @@ class LibraryViewModel(
         _rawVideos,
         filterCriteria
     ) { status, loading, videos, criteria ->
-        val visibleVideos = if (criteria.trashedUris.isEmpty()) {
+        val visibleNotTrashed = if (criteria.trashedUris.isEmpty()) {
             videos
         } else {
             videos.filterNot { it.contentUri.toString() in criteria.trashedUris }
         }
+        val visibleVideos = VaultHiddenMatcher.filterVisibleVideos(visibleNotTrashed, criteria.vaultHidden)
         val filtered = videoRepository.filterAndSort(
             videos = visibleVideos,
             query = criteria.query,
@@ -827,7 +833,8 @@ class LibraryViewModel(
                 trashRepository?.refresh()
                 val videos = videoRepository.getVideos()
                 _rawVideos.value = videos
-                val visible = videos.filterNot { it.contentUri.toString() in trashedUrisFlow.value }
+                val visibleNotTrashed = videos.filterNot { it.contentUri.toString() in trashedUrisFlow.value }
+                val visible = VaultHiddenMatcher.filterVisibleVideos(visibleNotTrashed, vaultHiddenEntries.value)
                 val activeFolder = selectedFolder.value
                 if (activeFolder != null) {
                     selectedFolder.value = videoRepository.groupIntoFolders(visible)
@@ -846,12 +853,18 @@ class LibraryViewModel(
         fun provideFactory(
             videoRepository: VideoRepository,
             trashRepository: TrashRepository? = null,
-            scrollStore: LibraryScrollStore? = null
+            scrollStore: LibraryScrollStore? = null,
+            vaultHiddenEntries: StateFlow<List<VaultHiddenOriginal>> = MutableStateFlow(emptyList())
         ): ViewModelProvider.Factory =
             object : ViewModelProvider.Factory {
                 @Suppress("UNCHECKED_CAST")
                 override fun <T : ViewModel> create(modelClass: Class<T>): T {
-                    return LibraryViewModel(videoRepository, trashRepository, scrollStore) as T
+                    return LibraryViewModel(
+                        videoRepository = videoRepository,
+                        trashRepository = trashRepository,
+                        scrollStore = scrollStore,
+                        vaultHiddenEntries = vaultHiddenEntries
+                    ) as T
                 }
             }
     }

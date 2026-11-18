@@ -65,6 +65,7 @@ import com.videohatak.player.core.playback.service.VideoPlaybackService
 import com.videohatak.player.core.playlist.model.toVideoItem
 import com.videohatak.player.core.playlist.repository.PlaylistRepositoryImpl
 import com.videohatak.player.core.trash.repository.TrashRepositoryImpl
+import com.videohatak.player.core.vault.model.VaultHiddenMatcher
 import com.videohatak.player.core.vault.model.toVideoItem
 import com.videohatak.player.core.vault.repository.VaultImportOutcome
 import com.videohatak.player.core.vault.repository.VaultRepositoryImpl
@@ -92,9 +93,10 @@ class MainActivity : FragmentActivity() {
 
     private val libraryViewModel: LibraryViewModel by viewModels {
         LibraryViewModel.provideFactory(
-            LocalVideoRepositoryImpl(applicationContext),
-            TrashRepositoryImpl(applicationContext),
-            DataStoreLibraryScrollStore(applicationContext)
+            videoRepository = LocalVideoRepositoryImpl(applicationContext),
+            trashRepository = TrashRepositoryImpl(applicationContext),
+            scrollStore = DataStoreLibraryScrollStore(applicationContext),
+            vaultHiddenEntries = VaultRepositoryImpl.getInstance(applicationContext).hiddenOriginalEntries
         )
     }
 
@@ -106,8 +108,13 @@ class MainActivity : FragmentActivity() {
     }
 
     private val playlistViewModel: PlaylistViewModel by viewModels {
+        val hiddenFlow = VaultRepositoryImpl.getInstance(applicationContext).hiddenOriginalEntries
         PlaylistViewModel.provideFactory(
-            PlaylistRepositoryImpl(applicationContext)
+            repository = PlaylistRepositoryImpl(
+                context = applicationContext,
+                hiddenOriginalsProvider = { hiddenFlow.value }
+            ),
+            vaultHiddenEntries = hiddenFlow
         )
     }
 
@@ -266,6 +273,7 @@ class MainActivity : FragmentActivity() {
                         }
                         is VaultUiEvent.LibraryMediaUpdated -> {
                             libraryViewModel.refresh()
+                            playlistViewModel.refresh()
                         }
                         is VaultUiEvent.RequestLegacyWritePermission -> {
                             pendingVaultRestoreIds = event.pendingRestoreIds
@@ -349,10 +357,14 @@ class MainActivity : FragmentActivity() {
             val trashExistenceMap by libraryViewModel.trashExistenceMap.collectAsStateWithLifecycle()
             val missingTrashItemPendingRemoval by libraryViewModel.missingTrashItemPendingRemoval.collectAsStateWithLifecycle()
 
-            val favoriteVideos = remember(favoriteItems, uiState.allVideos, trashItems) {
+            val hiddenOriginalEntries by vaultViewModel.hiddenOriginalEntries.collectAsStateWithLifecycle()
+
+            val favoriteVideos = remember(favoriteItems, uiState.allVideos, trashItems, hiddenOriginalEntries) {
                 val trashedUriSet = trashItems.mapTo(HashSet()) { it.contentUri }
                 favoriteItems.filter { item ->
-                    item.isAvailable && item.contentUri !in trashedUriSet
+                    item.isAvailable &&
+                        item.contentUri !in trashedUriSet &&
+                        !VaultHiddenMatcher.isPlaylistItemHidden(item, hiddenOriginalEntries)
                 }.map { item ->
                     uiState.allVideos.firstOrNull {
                         it.id == item.videoId || it.contentUri.toString() == item.contentUri
@@ -399,20 +411,24 @@ class MainActivity : FragmentActivity() {
             }
 
             val vaultImportLauncher = rememberLauncherForActivityResult(
-                contract = ActivityResultContracts.GetContent()
+                contract = ActivityResultContracts.OpenDocument()
             ) { uri: Uri? ->
                 if (uri != null) {
+                    runCatching {
+                        contentResolver.takePersistableUriPermission(
+                            uri,
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION
+                        )
+                    }
                     vaultViewModel.importVideoFromUri(
                         sourceUri = uri,
                         displayName = null,
-                        deleteOriginal = true
+                        deleteOriginal = false
                     ) { ok ->
                         if (ok) {
-                            libraryViewModel.deleteMovedVaultOriginals(
-                                sourceUris = listOf(uri),
-                                encryptedCount = 1,
-                                encryptedFailedCount = 0
-                            )
+                            vaultViewModel.refresh()
+                            libraryViewModel.refresh()
+                            playlistViewModel.refresh()
                         }
                     }
                 }
@@ -465,7 +481,7 @@ class MainActivity : FragmentActivity() {
                             }
                         )
                     }
-                    val succeededUris = mutableListOf<Uri>()
+                    var encryptedCount = 0
                     var failedCount = 0
                     var lastFailureReason: String? = null
                     try {
@@ -482,15 +498,19 @@ class MainActivity : FragmentActivity() {
                                     sourceUri = target.contentUri,
                                     displayName = target.safeTitle,
                                     originalFileName = target.displayName.takeIf { it.isNotBlank() } ?: target.safeTitle,
-                                    originalRelativePath = target.relativePath.takeIf { it.isNotBlank() }
+                                    originalRelativePath = target.relativePath.takeIf { it.isNotBlank() },
+                                    originalSizeBytes = target.sizeBytes.takeIf { it > 0L },
+                                    originalDateModifiedSec = target.dateModifiedSec.takeIf { it > 0L },
+                                    originalMediaStoreId = target.id.takeIf { it > 0L },
+                                    originalFilePath = target.path.takeIf { it.isNotBlank() }
                                 )
                             ) {
                                 is VaultImportOutcome.Imported -> {
-                                    succeededUris.add(target.contentUri)
+                                    encryptedCount++
                                 }
                                 is VaultImportOutcome.AlreadyInVault -> {
                                     if (outcome.integrityVerified) {
-                                        succeededUris.add(target.contentUri)
+                                        encryptedCount++
                                     } else {
                                         failedCount++
                                         lastFailureReason = "تعذر التحقق من سلامة النسخة الموجودة في الخزنة — لم يتم المساس بالملف الأصلي"
@@ -508,16 +528,21 @@ class MainActivity : FragmentActivity() {
                         snackbarHostState.currentSnackbarData?.dismiss()
                     }
                     vaultViewModel.refresh()
-                    if (succeededUris.isNotEmpty()) {
-                        libraryViewModel.deleteMovedVaultOriginals(
-                            sourceUris = succeededUris,
-                            encryptedCount = succeededUris.size,
-                            encryptedFailedCount = failedCount
-                        )
-                        playlistViewModel.refresh()
+                    libraryViewModel.refresh()
+                    playlistViewModel.refresh()
+                    if (encryptedCount > 0) {
+                        val msg = when {
+                            failedCount > 0 ->
+                                "تم تشفير $encryptedCount فيديو وإخفاؤه من المكتبة، وتعذر نقل $failedCount"
+                            encryptedCount == 1 ->
+                                "تمت إضافة الفيديو إلى الخزنة وإخفاؤه من المكتبة مع بقاء الأصل سليمًا"
+                            else ->
+                                "تمت إضافة $encryptedCount فيديو إلى الخزنة وإخفاؤها من المكتبة مع بقاء الأصول سليمة"
+                        }
+                        snackbarHostState.showSnackbar(msg)
                     } else if (failedCount > 0) {
                         snackbarHostState.showSnackbar(
-                            lastFailureReason ?: "تعذر تشفير ونقل الفيديو إلى الخزنة — بقيت الملفات الأصلية سليمة"
+                            lastFailureReason ?: "تعذر تشفير ونقل الفيديو إلى الخزنة — بقيت الملفات الأصلية ظاهرة وسليمة"
                         )
                     }
                 }
@@ -940,7 +965,7 @@ class MainActivity : FragmentActivity() {
                                     vaultViewModel.lockVault()
                                 },
                                 onVaultImportRequest = {
-                                    vaultImportLauncher.launch("video/*")
+                                    vaultImportLauncher.launch(arrayOf("video/*"))
                                 },
                                 onVaultCancelImport = vaultViewModel::cancelImport,
                                 onVaultDismissImportState = vaultViewModel::dismissImportState,

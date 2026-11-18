@@ -7,7 +7,9 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.videohatak.player.core.vault.biometric.VaultBiometricHelper
+import com.videohatak.player.core.vault.model.VaultHiddenOriginal
 import com.videohatak.player.core.vault.model.VaultVideo
+import com.videohatak.player.core.vault.repository.VaultDeleteOutcome
 import com.videohatak.player.core.vault.repository.VaultImportOutcome
 import com.videohatak.player.core.vault.repository.VaultRepository
 import com.videohatak.player.core.vault.repository.VaultRestoreOutcome
@@ -66,6 +68,8 @@ class VaultViewModel(
     val videos: StateFlow<List<VaultVideo>> = vaultVideos
 
     val vaultCount: StateFlow<Int> = repository.vaultCount
+
+    val hiddenOriginalEntries: StateFlow<List<VaultHiddenOriginal>> = repository.hiddenOriginalEntries
 
     private val _isUnlocked = MutableStateFlow(false)
     val isUnlocked: StateFlow<Boolean> = _isUnlocked.asStateFlow()
@@ -422,7 +426,7 @@ class VaultViewModel(
                     _importState.value = VaultImportState.Success
                     refresh()
                     if (!deleteOriginal) {
-                        _events.tryEmit(VaultUiEvent.ShowMessage("تمت إضافة الفيديو إلى الخزنة بنجاح"))
+                        _events.tryEmit(VaultUiEvent.ShowMessage("تمت إضافة الفيديو إلى الخزنة وإخفاؤه من المكتبة بنجاح"))
                     }
                     onComplete(true)
                 }
@@ -499,6 +503,10 @@ class VaultViewModel(
         videoId: Long,
         onComplete: (VaultRestoreOutcome) -> Unit = {}
     ) {
+        if (_restoreState.value is VaultRestoreState.Restoring) {
+            onComplete(VaultRestoreOutcome.Failed("توجد عملية إزالة من الخزنة قيد التنفيذ حاليًا"))
+            return
+        }
         viewModelScope.launch {
             _actionError.value = null
             val targetTitle = vaultVideos.value.firstOrNull { it.id == videoId }?.displayName.orEmpty()
@@ -516,6 +524,18 @@ class VaultViewModel(
                 is VaultRestoreOutcome.Restored -> {
                     _events.tryEmit(VaultUiEvent.LibraryMediaUpdated)
                     _events.tryEmit(VaultUiEvent.ShowMessage("تمت إزالة الفيديو من الخزنة واستعادته إلى المكتبة بنجاح"))
+                }
+                is VaultRestoreOutcome.OriginalMissing -> {
+                    _actionError.value = outcome.reason
+                    _events.tryEmit(VaultUiEvent.ShowMessage(outcome.reason))
+                }
+                is VaultRestoreOutcome.OriginalChanged -> {
+                    _actionError.value = outcome.reason
+                    _events.tryEmit(VaultUiEvent.ShowMessage(outcome.reason))
+                }
+                is VaultRestoreOutcome.RequiresUriPermission -> {
+                    _actionError.value = outcome.reason
+                    _events.tryEmit(VaultUiEvent.ShowMessage(outcome.reason))
                 }
                 is VaultRestoreOutcome.RequiresLegacyWritePermission -> {
                     _events.tryEmit(
@@ -544,6 +564,10 @@ class VaultViewModel(
             onComplete(0, 0)
             return
         }
+        if (_restoreState.value is VaultRestoreState.Restoring) {
+            onComplete(0, videoIds.size)
+            return
+        }
         viewModelScope.launch {
             _actionError.value = null
             val orderedIds = videoIds.toList()
@@ -564,6 +588,18 @@ class VaultViewModel(
                     when (val outcome = repository.restoreVaultVideo(videoId)) {
                         is VaultRestoreOutcome.Restored -> {
                             succeeded++
+                        }
+                        is VaultRestoreOutcome.OriginalMissing -> {
+                            failed++
+                            lastFailureReason = outcome.reason
+                        }
+                        is VaultRestoreOutcome.OriginalChanged -> {
+                            failed++
+                            lastFailureReason = outcome.reason
+                        }
+                        is VaultRestoreOutcome.RequiresUriPermission -> {
+                            failed++
+                            lastFailureReason = outcome.reason
                         }
                         is VaultRestoreOutcome.RequiresLegacyWritePermission -> {
                             permissionRequested = true
@@ -590,21 +626,22 @@ class VaultViewModel(
                 _events.tryEmit(VaultUiEvent.LibraryMediaUpdated)
             }
             if (!permissionRequested) {
-                if (failed > 0 && repository.vaultError.value.isNullOrBlank()) {
+                if (failed > 0) {
                     _actionError.value = lastFailureReason
-                        ?: "تمت استعادة $succeeded وتعذر استعادة $failed — بقيت الفيديوهات غير المستعادة محفوظة في الخزنة"
+                        ?: repository.vaultError.value
+                        ?: "تمت إزالة $succeeded وتعذر إزالة $failed — بقيت الفيديوهات غير المستعادة محمية في الخزنة"
                 }
                 if (succeeded > 0) {
                     val msg = when {
                         failed == 0 && succeeded == 1 -> "تمت إزالة الفيديو من الخزنة واستعادته إلى المكتبة بنجاح"
-                        failed == 0 -> "تمت استعادة $succeeded فيديو إلى المكتبة وإزالتها من الخزنة بنجاح"
-                        else -> "تمت استعادة $succeeded فيديو إلى المكتبة، وتعذر استعادة $failed وبقيت محفوظة في الخزنة"
+                        failed == 0 -> "تمت إزالة $succeeded فيديو من الخزنة واستعادتها للظهور في المكتبة بنجاح"
+                        else -> "تمت إزالة $succeeded فيديو من الخزنة، وتعذر إزالة $failed وبقيت محفوظة في الخزنة"
                     }
                     _events.tryEmit(VaultUiEvent.ShowMessage(msg))
                 } else if (failed > 0) {
                     _events.tryEmit(
                         VaultUiEvent.ShowMessage(
-                            lastFailureReason ?: "تعذر استعادة الفيديوهات إلى المكتبة — بقيت محفوظة داخل الخزنة"
+                            lastFailureReason ?: "تعذر إعادة إظهار الفيديوهات في المكتبة — بقيت محفوظة داخل الخزنة"
                         )
                     )
                 }
@@ -615,7 +652,7 @@ class VaultViewModel(
 
     fun onLegacyRestoreWritePermissionResult(granted: Boolean, pendingRestoreIds: List<Long>) {
         if (!granted) {
-            val msg = "تم رفض إذن التخزين المطلوب لاستعادة الفيديو إلى المكتبة — بقي الفيديو محفوظًا داخل الخزنة"
+            val msg = "تم رفض إذن التخزين المطلوب لإعادة إظهار الفيديو في المكتبة — بقي الفيديو محفوظًا داخل الخزنة"
             _actionError.value = msg
             _events.tryEmit(VaultUiEvent.ShowMessage(msg))
             return
@@ -634,11 +671,20 @@ class VaultViewModel(
                 throw ce
             } catch (_: Throwable) {
             }
-            val deleted = repository.deleteVaultVideo(videoId)
-            if (deleted) {
-                _events.tryEmit(VaultUiEvent.ShowMessage("تمت إزالة الفيديو من الخزنة بنجاح"))
-            } else if (repository.vaultError.value.isNullOrBlank()) {
-                _actionError.value = "تعذر إزالة الفيديو من الخزنة"
+            when (val outcome = repository.deleteVaultVideoDetailed(videoId)) {
+                VaultDeleteOutcome.Deleted -> {
+                    _events.tryEmit(VaultUiEvent.ShowMessage("تمت إزالة الفيديو من الخزنة بنجاح"))
+                }
+                is VaultDeleteOutcome.BlockedSoleRemainingCopy -> {
+                    _actionError.value = outcome.reason
+                    _events.tryEmit(VaultUiEvent.ShowMessage(outcome.reason))
+                }
+                is VaultDeleteOutcome.Failed -> {
+                    if (repository.vaultError.value.isNullOrBlank()) {
+                        _actionError.value = outcome.reason
+                    }
+                    _events.tryEmit(VaultUiEvent.ShowMessage(outcome.reason))
+                }
             }
         }
     }
@@ -655,6 +701,7 @@ class VaultViewModel(
             _actionError.value = null
             var succeeded = 0
             var failed = 0
+            var lastReason: String? = null
             for (videoId in videoIds) {
                 try {
                     beforeDeleteVideoHook?.invoke(videoId)
@@ -662,22 +709,32 @@ class VaultViewModel(
                     throw ce
                 } catch (_: Throwable) {
                 }
-                if (repository.deleteVaultVideo(videoId)) {
-                    succeeded++
-                } else {
-                    failed++
+                when (val outcome = repository.deleteVaultVideoDetailed(videoId)) {
+                    VaultDeleteOutcome.Deleted -> succeeded++
+                    is VaultDeleteOutcome.BlockedSoleRemainingCopy -> {
+                        failed++
+                        lastReason = outcome.reason
+                    }
+                    is VaultDeleteOutcome.Failed -> {
+                        failed++
+                        lastReason = outcome.reason
+                    }
                 }
             }
-            if (failed > 0 && repository.vaultError.value.isNullOrBlank()) {
-                _actionError.value = "تمت إزالة $succeeded وتعذر إزالة $failed من الخزنة"
+            if (failed > 0) {
+                _actionError.value = lastReason
+                    ?: repository.vaultError.value
+                    ?: "تم حذف $succeeded وتعذر حذف $failed من الخزنة"
             }
             if (succeeded > 0) {
                 val msg = when {
                     failed == 0 && succeeded == 1 -> "تمت إزالة الفيديو من الخزنة بنجاح"
                     failed == 0 -> "تمت إزالة $succeeded فيديو من الخزنة بنجاح"
-                    else -> "تمت إزالة $succeeded فيديو من الخزنة، وتعذر إزالة $failed"
+                    else -> "تمت إزالة $succeeded فيديو من الخزنة، وتعذر حذف $failed"
                 }
                 _events.tryEmit(VaultUiEvent.ShowMessage(msg))
+            } else if (failed > 0 && lastReason != null) {
+                _events.tryEmit(VaultUiEvent.ShowMessage(lastReason))
             }
             onComplete(succeeded, failed)
         }

@@ -105,13 +105,13 @@ fun RestoreVaultVideoConfirmationDialog(
         title = { Text("إزالة من الخزنة الخاصة", fontWeight = FontWeight.Bold) },
         text = {
             Text(
-                "سيتم فك تشفير \"${video.title}\" والتحقق من سلامته واستعادته إلى مكتبة الفيديوهات العامة، وبعد التأكد من نجاح الاستعادة فقط ستُزال نسخته من الخزنة.",
+                "سيتم التحقق من وجود الملف الأصلي لـ \"${video.title}\" وسلامة بصمته SHA-256 ثم إعادة إظهاره في مكتبة VideoHatak كما كان دون إنشاء نسخة مكررة، وبعد التأكد فقط تُزال النسخة المشفرة من الخزنة.",
                 color = palette.onSurfaceMuted
             )
         },
         confirmButton = {
             TextButton(onClick = onConfirm) {
-                Text("إزالة واستعادة", color = palette.accent, fontWeight = FontWeight.Bold)
+                Text("إزالة وإعادة إظهار", color = palette.accent, fontWeight = FontWeight.Bold)
             }
         },
         dismissButton = {
@@ -138,7 +138,7 @@ fun DeleteVaultVideoConfirmationDialog(
         title = { Text("حذف نهائي من الخزنة", fontWeight = FontWeight.Bold) },
         text = {
             Text(
-                "تحذير: سيؤدي هذا الإجراء إلى حذف النسخة المشفرة من \"${video.title}\" نهائيًا دون استعادتها إلى مكتبة الهاتف. هل تريد المتابعة؟",
+                "تحذير: سيؤدي هذا الإجراء إلى حذف النسخة المشفرة من \"${video.title}\" من الخزنة نهائيًا (سيُرفض الحذف إذا كانت هذه النسخة هي النسخة السليمة الوحيدة المتبقية). هل تريد المتابعة؟",
                 color = palette.onSurfaceMuted
             )
         },
@@ -178,7 +178,7 @@ fun VaultSecurityInfoDialog(
                             "• المفاتيح: يُحفظ مفتاح التشفير الرئيسي داخل Android Keystore على الجهاز لحماية مفاتيح الملفات.\n" +
                             "• بوابة الوصول المستقلة: الخزنة محمية برمز قفل مستقل مرن يدعم الحروف العربية والإنجليزية والأرقام والرموز (بتجزئة PBKDF2 وتقييد المحاولات الخاطئة) دون الاعتماد على قفل شاشة الهاتف، مع خيار إضافي لاستخدام البصمة.\n" +
                             "• الخصوصية التامة: يفعّل التطبيق FLAG_SECURE لمنع لقطات وتسجيل الشاشة، ويعطّل PiP والإشعارات والتشغيل المصغّر وفي الخلفية، ويُوقف التشغيل فور الخروج أو القفل.\n" +
-                            "• النقل والاستعادة: عند نقل فيديو إلى الخزنة يتم تشفيره والتحقق من سلامته أولًا قبل إزالة النسخة العامة، وعند اختيار «إزالة من الخزنة» يُفك تشفيره ويُعاد إلى المكتبة العامة مع التحقق من سلامته قبل مسح النسخة المشفرة، بينما يتطلب «حذف نهائي» تأكيدًا مستقلًا.",
+                            "• الإخفاء والاستعادة العكوسة: عند نقل فيديو إلى الخزنة يُنشأ له نسخ مشفر وتُحفظ بصمته SHA-256 ويُخفى داخل مكتبة VideoHatak دون المساس بالملف الأصلي على الجهاز. وعند اختيار «إزالة من الخزنة» يتحقق التطبيق من وجود الأصل وسلامته ثم يعيد إظهاره في مكانه دون نسخ مكررة، ولا يسمح بحذف النسخة المشفرة نهائيًا إذا كانت هي النسخة السليمة الوحيدة المتبقية.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = palette.onSurfaceMuted
                 )
@@ -247,7 +247,7 @@ fun RestoreVideoProgressDialog(
         containerColor = palette.surface,
         titleContentColor = palette.onSurface,
         textContentColor = palette.onSurface,
-        title = { Text("جارٍ استعادة الفيديو إلى المكتبة...", fontWeight = FontWeight.Bold) },
+                title = { Text("جارٍ التحقق وإعادة إظهار الفيديو...", fontWeight = FontWeight.Bold) },
         text = {
             Column(modifier = Modifier.fillMaxWidth()) {
                 if (currentTitle.isNotBlank()) {
@@ -260,7 +260,7 @@ fun RestoreVideoProgressDialog(
                     Spacer(modifier = Modifier.height(6.dp))
                 }
                 Text(
-                    text = "يتم فك التشفير والتحقق من سلامة المحتوى وإدراجه في مكتبة الهاتف قبل إزالة النسخة المشفرة.",
+                    text = "يتم التحقق من وجود الملف الأصلي وسلامة بصمته SHA-256 وإعادة إظهاره في المكتبة قبل إزالة النسخة المشفرة.",
                     color = palette.onSurfaceMuted
                 )
                 Spacer(modifier = Modifier.height(14.dp))
@@ -570,7 +570,7 @@ fun ConfirmDeleteVaultDialog(
         title = { Text("حذف نهائي من الخزنة", fontWeight = FontWeight.Bold) },
         text = {
             Text(
-                "تحذير: هل أنت متأكد من الحذف النهائي لـ \"$videoTitle\" من الخزنة المشفرة دون استعادته إلى المكتبة؟",
+                "تحذير: هل أنت متأكد من الحذف النهائي للنسخة المشفرة لـ \"$videoTitle\"؟ لن يتم تنفيذ الحذف إذا كانت هذه النسخة هي النسخة السليمة الوحيدة المتبقية.",
                 color = palette.onSurfaceMuted
             )
         },
@@ -600,16 +600,16 @@ fun BatchRestoreVaultVideosDialog(
         containerColor = palette.surface,
         titleContentColor = palette.onSurface,
         textContentColor = palette.onSurface,
-        title = { Text("إزالة واستعادة من الخزنة", fontWeight = FontWeight.Bold) },
+        title = { Text("إزالة وإعادة إظهار في المكتبة", fontWeight = FontWeight.Bold) },
         text = {
             Text(
-                "سيتم فك تشفير $selectedCount من الفيديوهات المحددة والتحقق من سلامتها واستعادتها إلى مكتبة الفيديوهات العامة، ثم إزالتها من الخزنة.",
+                "سيتم التحقق من وجود الأصول وسلامتها (SHA-256) وإعادة إظهار $selectedCount من الفيديوهات في المكتبة كما كانت، ثم إزالة نسخها المشفرة من الخزنة.",
                 color = palette.onSurfaceMuted
             )
         },
         confirmButton = {
             TextButton(onClick = onConfirm) {
-                Text("إزالة واستعادة ($selectedCount)", color = palette.accent, fontWeight = FontWeight.Bold)
+                Text("إزالة وإعادة إظهار ($selectedCount)", color = palette.accent, fontWeight = FontWeight.Bold)
             }
         },
         dismissButton = {
@@ -636,7 +636,7 @@ fun BatchDeleteVaultVideosDialog(
         title = { Text("حذف نهائي من الخزنة", fontWeight = FontWeight.Bold) },
         text = {
             Text(
-                "تحذير: هل أنت متأكد من الحذف النهائي لـ $selectedCount من الفيديوهات المحددة من الخزنة المشفرة دون استعادتها إلى مكتبة الهاتف؟",
+                "تحذير: هل أنت متأكد من الحذف النهائي لـ $selectedCount من النسخ المشفرة في الخزنة؟ سيُحظر حذف أي مقطع إذا كانت النسخة المشفرة هي النسخة السليمة الوحيدة المتبقية.",
                 color = palette.onSurfaceMuted
             )
         },

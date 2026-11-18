@@ -731,7 +731,7 @@ fun VaultScreen(
                         )
                         Spacer(modifier = Modifier.height(6.dp))
                         Text(
-                            text = "اضغط على «نقل إلى الخزنة» لتشفير الفيديو والتحقق من سلامته داخل الخزنة ثم إزالة النسخة العامة من المكتبة بأمان.",
+                            text = "اضغط على «نقل إلى الخزنة» لتشفير نسخة من الفيديو داخل الخزنة وإخفائه داخل VideoHatak فقط مع إبقاء الملف الأصلي سليمًا في موقعه.",
                             style = MaterialTheme.typography.bodySmall,
                             color = palette.onSurfaceMuted,
                             textAlign = TextAlign.Center,

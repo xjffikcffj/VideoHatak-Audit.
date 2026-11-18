@@ -9,6 +9,8 @@ import com.videohatak.player.core.playlist.db.PlaylistDatabaseStore
 import com.videohatak.player.core.playlist.db.VideoHatakDatabaseHelper
 import com.videohatak.player.core.playlist.model.Playlist
 import com.videohatak.player.core.playlist.model.PlaylistItem
+import com.videohatak.player.core.vault.model.VaultHiddenMatcher
+import com.videohatak.player.core.vault.model.VaultHiddenOriginal
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
@@ -23,7 +25,8 @@ class PlaylistRepositoryImpl(
     private val context: Context,
     private val dbHelper: PlaylistDatabaseStore = VideoHatakDatabaseHelper(context),
     private val videoRepository: VideoRepository = LocalVideoRepositoryImpl(context),
-    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val hiddenOriginalsProvider: () -> List<VaultHiddenOriginal> = { emptyList() }
 ) : PlaylistRepository {
 
     private val _playlists = MutableStateFlow<List<Playlist>>(emptyList())
@@ -44,7 +47,16 @@ class PlaylistRepositoryImpl(
     override suspend fun refresh() = withContext(ioDispatcher) {
         runCatching {
             findAndMigrateFavoritesLocked()
-            val list = dbHelper.getPlaylists()
+            val hidden = hiddenOriginalsProvider()
+            val list = dbHelper.getPlaylists().map { playlist ->
+                if (hidden.isEmpty()) {
+                    playlist
+                } else {
+                    val visibleCount = dbHelper.getItemsForPlaylist(playlist.id)
+                        .count { !VaultHiddenMatcher.isPlaylistItemHidden(it, hidden) }
+                    playlist.copy(itemCount = visibleCount)
+                }
+            }
             val sorted = list.sortedByDescending { PlaylistRepository.isProtectedFavoritesTitle(it.title) }
             _playlists.update { sorted }
         }
@@ -113,19 +125,22 @@ class PlaylistRepositoryImpl(
 
     override suspend fun getPlaylistItems(playlistId: Long): List<PlaylistItem> = withContext(ioDispatcher) {
         val rawItems = dbHelper.getItemsForPlaylist(playlistId)
-        rawItems.map { item ->
-            val exists = isMediaAvailable(Uri.parse(item.contentUri))
-            if (item.isAvailable != exists) {
-                dbHelper.updateItemAvailability(item.id, exists)
+        val hidden = hiddenOriginalsProvider()
+        rawItems
+            .filterNot { VaultHiddenMatcher.isPlaylistItemHidden(it, hidden) }
+            .map { item ->
+                val exists = isMediaAvailable(Uri.parse(item.contentUri))
+                if (item.isAvailable != exists) {
+                    dbHelper.updateItemAvailability(item.id, exists)
+                }
+                item.copy(isAvailable = exists)
             }
-            item.copy(isAvailable = exists)
-        }
     }
 
     override suspend fun getPlaylistWithItems(playlistId: Long): Pair<Playlist, List<PlaylistItem>>? = withContext(ioDispatcher) {
         val playlist = dbHelper.getPlaylists().find { it.id == playlistId } ?: return@withContext null
         val items = getPlaylistItems(playlistId)
-        Pair(playlist, items)
+        Pair(playlist.copy(itemCount = items.size), items)
     }
 
     internal fun normalizeVideoUriKey(rawUri: String?): String =
@@ -208,10 +223,12 @@ class PlaylistRepositoryImpl(
      */
     override suspend fun relinkMissingItems(playlistId: Long): Int = withContext(ioDispatcher) {
         val items = dbHelper.getItemsForPlaylist(playlistId)
-        val allVideos = videoRepository.getVideos()
+        val hidden = hiddenOriginalsProvider()
+        val allVideos = VaultHiddenMatcher.filterVisibleVideos(videoRepository.getVideos(), hidden)
         var relinkedCount = 0
 
         for (item in items) {
+            if (VaultHiddenMatcher.isPlaylistItemHidden(item, hidden)) continue
             val uri = Uri.parse(item.contentUri)
             if (uri.scheme == "vault") continue
             if (!isMediaAvailable(uri)) {
@@ -410,7 +427,9 @@ class PlaylistRepositoryImpl(
 
     override suspend fun getFavoriteVideoKeys(): Pair<Set<Long>, Set<String>> = withContext(ioDispatcher) {
         val favoritesPlaylist = findAndMigrateFavoritesLocked() ?: return@withContext (emptySet<Long>() to emptySet())
+        val hidden = hiddenOriginalsProvider()
         val items = dbHelper.getItemsForPlaylist(favoritesPlaylist.id)
+            .filterNot { VaultHiddenMatcher.isPlaylistItemHidden(it, hidden) }
         val ids = items.mapNotNull { it.videoId.takeIf { id -> id > 0L } }.toSet()
         val uris = items.mapNotNull { normalizeVideoUriKey(it.contentUri).takeIf { u -> u.isNotEmpty() } }.toSet()
         ids to uris

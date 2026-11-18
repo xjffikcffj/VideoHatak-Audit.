@@ -22,6 +22,9 @@ import com.videohatak.player.core.playback.service.MediaNotificationPrivacy
 import com.videohatak.player.core.playlist.model.PlaylistRepeatMode
 import com.videohatak.player.core.playlist.model.toVideoItem
 import com.videohatak.player.core.playlist.repository.PlaylistRepositoryImpl
+import com.videohatak.player.core.vault.model.VaultHiddenMatcher
+import com.videohatak.player.core.vault.model.VaultHiddenOriginal
+import com.videohatak.player.core.vault.repository.VaultRepositoryImpl
 import com.videohatak.player.core.subtitle.model.SubtitleCue
 import com.videohatak.player.core.subtitle.model.SubtitleFormat
 import com.videohatak.player.core.subtitle.model.SubtitleStyleConfig
@@ -98,7 +101,16 @@ class PlayerViewModel(
             _currentVideo.value = value
         }
 
-    private val playlistRepository by lazy { PlaylistRepositoryImpl(getApplication()) }
+    private fun currentVaultHiddenOriginals(): List<VaultHiddenOriginal> =
+        runCatching { VaultRepositoryImpl.getInstance(getApplication()).hiddenOriginalEntries.value }
+            .getOrDefault(emptyList())
+
+    private val playlistRepository by lazy {
+        PlaylistRepositoryImpl(
+            context = getApplication(),
+            hiddenOriginalsProvider = { currentVaultHiddenOriginals() }
+        )
+    }
     private var playlistVideos: List<VideoItem> = emptyList()
     private var translationJob: Job? = null
 
@@ -362,6 +374,10 @@ class PlayerViewModel(
     }
 
     fun playVideoInContext(video: VideoItem, contextVideos: List<VideoItem>) {
+        val hidden = currentVaultHiddenOriginals()
+        if (!MediaNotificationPrivacy.isVaultVideo(video) && VaultHiddenMatcher.isVideoHidden(video, hidden)) {
+            return
+        }
         currentVideo = video
         _pendingResumePrompt.value = null
         safeThumbnailManager?.setVideoUri(video.contentUri)
@@ -372,7 +388,10 @@ class PlayerViewModel(
             contextVideos.any { it.id == video.id }
 
         if (canQueueContext) {
-            val validContext = contextVideos.filter { it.bucketId != "secure_vault" }
+            val validContext = VaultHiddenMatcher.filterVisibleVideos(
+                contextVideos.filter { it.bucketId != "secure_vault" },
+                hidden
+            )
             val startIndex = validContext.indexOfFirst { it.id == video.id }.coerceAtLeast(0)
             playlistVideos = validContext
             val activeMode = currentAuthoritativePlaybackMode()
@@ -410,7 +429,9 @@ class PlayerViewModel(
         viewModelScope.launch {
             _isPlaylistLoadPending.value = true
             try {
-                val rawItems = playlistRepository.getPlaylistItems(playlistId).filter { it.isAvailable }
+                val hidden = currentVaultHiddenOriginals()
+                val rawItems = playlistRepository.getPlaylistItems(playlistId)
+                    .filter { it.isAvailable && !VaultHiddenMatcher.isPlaylistItemHidden(it, hidden) }
                 if (rawItems.isEmpty()) return@launch
                 val videoItems = rawItems.map { it.toVideoItem() }
                 playlistVideos = videoItems

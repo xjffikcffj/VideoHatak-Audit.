@@ -11,6 +11,8 @@ import com.videohatak.player.core.playlist.model.PlaylistRepeatMode
 import com.videohatak.player.core.playlist.repository.PlaylistAddOutcome
 import com.videohatak.player.core.playlist.repository.PlaylistRepository
 import com.videohatak.player.core.playlist.repository.ToggleFavoriteResult
+import com.videohatak.player.core.vault.model.VaultHiddenMatcher
+import com.videohatak.player.core.vault.model.VaultHiddenOriginal
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -18,6 +20,8 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
@@ -28,16 +32,27 @@ sealed interface PlaylistUiEvent {
 }
 
 class PlaylistViewModel(
-    private val repository: PlaylistRepository
+    private val repository: PlaylistRepository,
+    private val vaultHiddenEntries: StateFlow<List<VaultHiddenOriginal>> = MutableStateFlow(emptyList())
 ) : ViewModel() {
 
     val playlists: StateFlow<List<Playlist>> = repository.playlists
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     private val _selectedPlaylistWithItems = MutableStateFlow<Pair<Playlist, List<PlaylistItem>>?>(null)
-    val selectedPlaylistWithItems: StateFlow<Pair<Playlist, List<PlaylistItem>>?> = _selectedPlaylistWithItems.asStateFlow()
+    val selectedPlaylistWithItems: StateFlow<Pair<Playlist, List<PlaylistItem>>?> = combine(
+        _selectedPlaylistWithItems,
+        vaultHiddenEntries
+    ) { pair, hidden ->
+        pair?.let { (pl, items) ->
+            val visible = if (hidden.isEmpty()) items else items.filterNot {
+                VaultHiddenMatcher.isPlaylistItemHidden(it, hidden)
+            }
+            pl.copy(itemCount = visible.size) to visible
+        }
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
-    val currentPlaylistItems: StateFlow<List<PlaylistItem>> = _selectedPlaylistWithItems
+    val currentPlaylistItems: StateFlow<List<PlaylistItem>> = selectedPlaylistWithItems
         .map { it?.second ?: emptyList() }
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
@@ -51,10 +66,19 @@ class PlaylistViewModel(
     val favoriteVideoUris: StateFlow<Set<String>> = _favoriteVideoUris.asStateFlow()
 
     private val _favoritesPlaylistWithItems = MutableStateFlow<Pair<Playlist, List<PlaylistItem>>?>(null)
-    val favoritesPlaylistWithItems: StateFlow<Pair<Playlist, List<PlaylistItem>>?> =
-        _favoritesPlaylistWithItems.asStateFlow()
+    val favoritesPlaylistWithItems: StateFlow<Pair<Playlist, List<PlaylistItem>>?> = combine(
+        _favoritesPlaylistWithItems,
+        vaultHiddenEntries
+    ) { pair, hidden ->
+        pair?.let { (pl, items) ->
+            val visible = if (hidden.isEmpty()) items else items.filterNot {
+                VaultHiddenMatcher.isPlaylistItemHidden(it, hidden)
+            }
+            pl.copy(itemCount = visible.size) to visible
+        }
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
-    val favoriteItems: StateFlow<List<PlaylistItem>> = _favoritesPlaylistWithItems
+    val favoriteItems: StateFlow<List<PlaylistItem>> = favoritesPlaylistWithItems
         .map { it?.second ?: emptyList() }
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
@@ -67,6 +91,11 @@ class PlaylistViewModel(
 
     init {
         refresh()
+        viewModelScope.launch {
+            vaultHiddenEntries.drop(1).collect {
+                refresh()
+            }
+        }
     }
 
     fun refresh() {
@@ -469,11 +498,14 @@ class PlaylistViewModel(
     }
 
     companion object {
-        fun provideFactory(repository: PlaylistRepository): ViewModelProvider.Factory =
+        fun provideFactory(
+            repository: PlaylistRepository,
+            vaultHiddenEntries: StateFlow<List<VaultHiddenOriginal>> = MutableStateFlow(emptyList())
+        ): ViewModelProvider.Factory =
             object : ViewModelProvider.Factory {
                 @Suppress("UNCHECKED_CAST")
                 override fun <T : ViewModel> create(modelClass: Class<T>): T {
-                    return PlaylistViewModel(repository) as T
+                    return PlaylistViewModel(repository, vaultHiddenEntries) as T
                 }
             }
     }

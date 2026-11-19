@@ -3,6 +3,7 @@ package com.videohatak.player
 import android.app.Application
 import android.app.PendingIntent
 import android.content.Intent
+import android.content.pm.ActivityInfo
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteException
 import android.database.sqlite.SQLiteOpenHelper
@@ -20,6 +21,7 @@ import com.videohatak.player.core.model.VideoFolder
 import com.videohatak.player.core.model.VideoItem
 import com.videohatak.player.core.model.VideoSortOrder
 import com.videohatak.player.core.playback.PlaybackMode
+import com.videohatak.player.core.playback.PlayerOrientationMode
 import com.videohatak.player.core.playback.VideoPlayerManager
 import com.videohatak.player.core.playback.service.MediaNotificationArtworkLoader
 import com.videohatak.player.core.playback.service.VideoPlaybackService
@@ -844,5 +846,139 @@ class TrueVaultAndStabilityVerificationTest {
         assertFalse(repo.isFavorite(sampleVideo))
         assertEquals(Pair(emptySet<Long>(), emptySet<String>()), repo.getFavoriteVideoKeys())
         repo.moveItem(1L, 0, 1)
+    }
+
+    // -------------------------------------------------------------------------
+    // 4. Main App Auto-Rotation & Silent Original Delete With Full Restore
+    // -------------------------------------------------------------------------
+
+    @Test
+    fun mainAppOrientation_allowsFullSensorAutoRotateAndPreservesPlayerModes() {
+        assertEquals(
+            ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR,
+            MainActivity.MAIN_APP_ORIENTATION
+        )
+        assertEquals(
+            ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT,
+            PlayerOrientationMode.PORTRAIT.activityOrientation
+        )
+        assertEquals(
+            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE,
+            PlayerOrientationMode.LANDSCAPE.activityOrientation
+        )
+        assertEquals(
+            ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR,
+            PlayerOrientationMode.AUTO.activityOrientation
+        )
+        assertEquals(PlayerOrientationMode.LANDSCAPE, PlayerOrientationMode.PORTRAIT.next())
+        assertEquals(PlayerOrientationMode.AUTO, PlayerOrientationMode.LANDSCAPE.next())
+        assertEquals(PlayerOrientationMode.PORTRAIT, PlayerOrientationMode.AUTO.next())
+    }
+
+    @Test
+    fun trueVault_autoDeleteOriginal_emitsNoAppNotification_andStillRestoresFromEncryptedCopy() = runTest(testDispatcher) {
+        val publicDir = tempFolder.newFolder("SilentDeletePublic")
+        val source1 = File(publicDir, "clip1.mp4")
+        val source2 = File(publicDir, "clip2.mp4")
+        val payload1 = ByteArray(64 * 1024) { ((it * 17) + 3).toByte() }
+        val payload2 = ByteArray(32 * 1024) { ((it * 11) + 9).toByte() }
+        source1.writeBytes(payload1)
+        source2.writeBytes(payload2)
+        val expectedSha1 = sha256Hex(payload1)
+
+        val restoredOutFile = File(publicDir, "restored_clip1.mp4")
+        val exporter = object : PublicMediaExporter {
+            override suspend fun exportVideo(request: PublicExportRequest): PublicExportOutcome {
+                val bytes = request.decryptedTempFile.readBytes()
+                restoredOutFile.writeBytes(bytes)
+                return PublicExportOutcome.Exported(
+                    mediaUri = Uri.fromFile(restoredOutFile),
+                    displayName = request.displayName,
+                    relativePath = request.relativePath ?: "Movies/",
+                    mimeType = request.mimeType,
+                    verifiedSizeBytes = bytes.size.toLong(),
+                    verifiedSha256 = sha256Hex(bytes)
+                )
+            }
+        }
+
+        val crypto = VaultCryptoManager(keyStoreProvider = "TEST_PROVIDER")
+        val db = VaultDatabaseHelper(testApp())
+        val repo = VaultRepositoryImpl(
+            context = testApp(),
+            cryptoManager = crypto,
+            dbHelper = db,
+            ioDispatcher = testDispatcher,
+            publicMediaExporter = exporter
+        )
+        repo.setUnlocked(true)
+        repo.refresh()
+
+        val vm = VaultViewModel(
+            repository = repo,
+            biometricHelper = VaultBiometricHelper(testApp()),
+            securityPreferences = null
+        )
+        val events = mutableListOf<VaultUiEvent>()
+        val collectJob = launch { vm.events.collect { events.add(it) } }
+        advanceUntilIdle()
+
+        val imp1 = (repo.importMediaVideoDetailed(
+            sourceUri = Uri.fromFile(source1),
+            displayName = "Clip 1",
+            originalFileName = "clip1.mp4",
+            originalRelativePath = "Movies/",
+            originalSizeBytes = payload1.size.toLong(),
+            originalFilePath = source1.absolutePath
+        ) as VaultImportOutcome.Imported).video
+
+        // Auto-delete after verified encryption must NOT emit any app ShowMessage snackbar
+        events.clear()
+        vm.deleteOriginalsForVaultEntries(listOf(imp1.id))
+        advanceUntilIdle()
+
+        assertFalse("Original file 1 must be deleted automatically", source1.exists())
+        assertTrue(events.any { it is VaultUiEvent.LibraryMediaUpdated })
+        assertTrue(
+            "App must NOT emit ShowMessage notification when auto-deleting original",
+            events.filterIsInstance<VaultUiEvent.ShowMessage>().isEmpty()
+        )
+        val entry1 = repo.vaultVideos.first().first { it.id == imp1.id }
+        assertEquals(VaultEntryState.ORIGINAL_DELETED_VERIFIED, entry1.vaultState)
+        assertTrue(entry1.isOriginalDeletedProtected)
+
+        // Retry delete path must also delete quietly without emitting ShowMessage on success
+        val imp2 = (repo.importMediaVideoDetailed(
+            sourceUri = Uri.fromFile(source2),
+            displayName = "Clip 2",
+            originalFileName = "clip2.mp4",
+            originalRelativePath = "Movies/",
+            originalSizeBytes = payload2.size.toLong(),
+            originalFilePath = source2.absolutePath
+        ) as VaultImportOutcome.Imported).video
+
+        events.clear()
+        vm.retryDeleteOriginal(imp2.id)
+        advanceUntilIdle()
+
+        assertFalse("Original file 2 must be deleted via retryDeleteOriginal", source2.exists())
+        assertTrue(events.any { it is VaultUiEvent.LibraryMediaUpdated })
+        assertTrue(
+            "App must NOT emit ShowMessage notification on retryDeleteOriginal success",
+            events.filterIsInstance<VaultUiEvent.ShowMessage>().isEmpty()
+        )
+
+        // Removing from Vault MUST still decrypt .enc -> export valid public file -> verify SHA-256 -> clean up
+        val restoreOutcome = repo.restoreVaultVideo(imp1.id)
+        assertTrue("Expected Restored, got $restoreOutcome", restoreOutcome is VaultRestoreOutcome.Restored)
+        val restored = restoreOutcome as VaultRestoreOutcome.Restored
+        assertEquals(expectedSha1, restored.verifiedSha256)
+        assertTrue(restoredOutFile.exists())
+        assertArrayEquals(payload1, restoredOutFile.readBytes())
+        assertFalse(repo.resolveEncryptedFile(imp1).exists())
+        assertNull(db.getVideoById(imp1.id))
+
+        collectJob.cancel()
+        db.close()
     }
 }

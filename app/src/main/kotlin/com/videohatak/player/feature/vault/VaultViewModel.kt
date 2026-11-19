@@ -631,7 +631,6 @@ class VaultViewModel(
             when (val outcome = repository.deleteOriginalForVaultEntry(vaultId)) {
                 is VaultOriginalDeleteOutcome.DeletedVerified -> {
                     _events.tryEmit(VaultUiEvent.LibraryMediaUpdated)
-                    _events.tryEmit(VaultUiEvent.ShowMessage("تم حذف النسخة الأصلية غير المشفرة والتحقق من إزالتها بنجاح"))
                 }
                 is VaultOriginalDeleteOutcome.RequiresUserConsent -> {
                     _events.tryEmit(
@@ -689,12 +688,7 @@ class VaultViewModel(
         val failedDeleteCount = outcome.failedReasons.size
         val firstFailure = outcome.failedReasons.values.firstOrNull()
         val msg = when {
-            deletedCount > 0 && failedDeleteCount == 0 && encryptedFailedCount == 0 ->
-                if (deletedCount == 1) {
-                    "تم تشفير الفيديو وحذف النسخة الأصلية من الجهاز بنجاح"
-                } else {
-                    "تم تشفير $deletedCount فيديو وحذف نسخها الأصلية من الجهاز بنجاح"
-                }
+            deletedCount > 0 && failedDeleteCount == 0 && encryptedFailedCount == 0 -> null
             deletedCount > 0 && failedDeleteCount > 0 ->
                 "تم نقل $deletedCount فيديو بنجاح، وتعذر حذف أصل $failedDeleteCount وبقيت نسختها المشفرة محمية"
             failedDeleteCount > 0 -> {

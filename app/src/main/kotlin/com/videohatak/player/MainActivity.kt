@@ -1,6 +1,7 @@
 package com.videohatak.player
 
 import android.content.Intent
+import android.content.pm.ActivityInfo
 import android.content.res.Configuration
 import android.net.Uri
 import android.os.Build
@@ -142,6 +143,7 @@ class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         val splashScreen = installSplashScreen()
         super.onCreate(savedInstanceState)
+        requestedOrientation = MAIN_APP_ORIENTATION
         canUseBiometricsState.value = vaultViewModel.canUseBiometrics()
 
         val startTimestamp = System.currentTimeMillis()
@@ -717,6 +719,13 @@ class MainActivity : FragmentActivity() {
                 ) {
                     val palette = LocalVideoHatakPalette.current
                     val activeVideo = activeVideoForPlayback
+                    val isInPlayerScreen = activeVideo != null
+
+                    LaunchedEffect(isInPlayerScreen) {
+                        if (!isInPlayerScreen) {
+                            requestedOrientation = MAIN_APP_ORIENTATION
+                        }
+                    }
 
                     if (activeVideo != null) {
                         val isActiveFavorite = (activeVideo.id in favoriteVideoIds) ||
@@ -1162,5 +1171,9 @@ class MainActivity : FragmentActivity() {
     override fun onDestroy() {
         volumeComboDetector.reset()
         super.onDestroy()
+    }
+
+    companion object {
+        internal const val MAIN_APP_ORIENTATION: Int = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
     }
 }

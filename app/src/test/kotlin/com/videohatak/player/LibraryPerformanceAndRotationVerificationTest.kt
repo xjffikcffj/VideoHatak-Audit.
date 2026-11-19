@@ -377,7 +377,7 @@ class LibraryPerformanceAndRotationVerificationTest {
                 originalMediaStoreId = 30L,
                 originalFilePath = "/storage/emulated/0/Movies/video_30.mp4",
                 storageType = VaultOriginalStorageType.MEDIA_STORE,
-                vaultState = VaultEntryState.RESTORED_PUBLIC
+                vaultState = VaultEntryState.ORIGINAL_RESTORED_VERIFIED
             )
         )
 
@@ -387,7 +387,7 @@ class LibraryPerformanceAndRotationVerificationTest {
         assertEquals(298, visible.size)
         assertFalse(10L in visibleIds)
         assertFalse(25L in visibleIds)
-        assertTrue("RESTORED_PUBLIC entry must remain visible", 30L in visibleIds)
+        assertTrue("ORIGINAL_RESTORED_VERIFIED entry must remain visible", 30L in visibleIds)
     }
 
     @Test

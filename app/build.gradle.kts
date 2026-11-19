@@ -88,6 +88,8 @@ android {
         unitTests.isReturnDefaultValues = true
         unitTests.isIncludeAndroidResources = true
         unitTests.all {
+            it.systemProperty("robolectric.dependency.repo.id", "mavenCentral")
+            it.systemProperty("robolectric.dependency.repo.url", "https://repo.maven.apache.org/maven2")
             it.timeout.set(Duration.ofMinutes(15))
             it.testLogging {
                 events(

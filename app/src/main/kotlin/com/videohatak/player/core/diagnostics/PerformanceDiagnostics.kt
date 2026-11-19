@@ -26,7 +26,7 @@ object PerformanceDiagnostics {
         operation: String,
         mainThresholdMs: Long = DEFAULT_SLOW_MAIN_MS,
         bgThresholdMs: Long = DEFAULT_SLOW_BG_MS,
-        details: () -> String = { "" },
+        noinline details: () -> String = { "" },
         block: () -> T
     ): T {
         val startNs = System.nanoTime()
@@ -44,7 +44,7 @@ object PerformanceDiagnostics {
         }
     }
 
-    inline fun recordIfSlow(
+    fun recordIfSlow(
         operation: String,
         elapsedMs: Long,
         mainThresholdMs: Long = DEFAULT_SLOW_MAIN_MS,

@@ -82,6 +82,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+import java.util.zip.CRC32
 
 @OptIn(ExperimentalCoroutinesApi::class)
 @RunWith(RobolectricTestRunner::class)
@@ -768,6 +769,27 @@ class TrueVaultAndStabilityVerificationTest {
         val corruptIdx = (corruptedPng.size / 2).coerceIn(33, corruptedPng.size - 13)
         corruptedPng[corruptIdx] = (corruptedPng[corruptIdx].toInt() xor 0xFF).toByte()
         assertNull(MediaNotificationArtworkLoader.decodeSampledBitmap(corruptedPng))
+
+        // Oversized dimensions (> 16,384 px) and excessive total pixels (> 64M px) with valid CRC32 must be rejected
+        fun pngWithIhdrDimensions(basePng: ByteArray, w: Int, h: Int): ByteArray {
+            return basePng.copyOf().apply {
+                this[16] = ((w ushr 24) and 0xFF).toByte()
+                this[17] = ((w ushr 16) and 0xFF).toByte()
+                this[18] = ((w ushr 8) and 0xFF).toByte()
+                this[19] = (w and 0xFF).toByte()
+                this[20] = ((h ushr 24) and 0xFF).toByte()
+                this[21] = ((h ushr 16) and 0xFF).toByte()
+                this[22] = ((h ushr 8) and 0xFF).toByte()
+                this[23] = (h and 0xFF).toByte()
+                val crc = CRC32().apply { update(this@apply, 12, 17) }.value
+                this[29] = ((crc ushr 24) and 0xFF).toByte()
+                this[30] = ((crc ushr 16) and 0xFF).toByte()
+                this[31] = ((crc ushr 8) and 0xFF).toByte()
+                this[32] = (crc and 0xFF).toByte()
+            }
+        }
+        assertNull(MediaNotificationArtworkLoader.decodeSampledBitmap(pngWithIhdrDimensions(largePngBytes, 20_000, 20_000)))
+        assertNull(MediaNotificationArtworkLoader.decodeSampledBitmap(pngWithIhdrDimensions(largePngBytes, 9_000, 9_000)))
     }
 
     // -------------------------------------------------------------------------

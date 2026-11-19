@@ -102,36 +102,49 @@ object MediaNotificationArtworkLoader {
         return bitmap
     }
 
+    private data class EncodedImageDimensions(
+        val width: Int,
+        val height: Int
+    )
+
+    private val PLATFORM_ONLY_IMAGE_MIMES = setOf(
+        "image/heic",
+        "image/heif",
+        "image/avif"
+    )
+
+    private fun isValidDimensions(width: Long, height: Long): Boolean {
+        return width in 1L..MAX_SOURCE_DIMENSION_PX.toLong() &&
+            height in 1L..MAX_SOURCE_DIMENSION_PX.toLong() &&
+            width * height <= MAX_SOURCE_PIXELS
+    }
+
     internal fun decodeSampledBitmap(bytes: ByteArray, maxSizePx: Int = ARTWORK_SIZE_PX): Bitmap? {
         if (bytes.size < 12) return null
         val target = maxSizePx.coerceAtLeast(32)
         return try {
-            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
-
-            val width = bounds.outWidth
-            val height = bounds.outHeight
-            if (width <= 0 || height <= 0 ||
-                width > MAX_SOURCE_DIMENSION_PX ||
-                height > MAX_SOURCE_DIMENSION_PX ||
-                width.toLong() * height.toLong() > MAX_SOURCE_PIXELS
-            ) {
-                return null
+            val parsed = parseAndValidateImageDimensions(bytes) ?: run {
+                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+                val mimeType = bounds.outMimeType?.trim()?.lowercase(Locale.US).orEmpty()
+                if (mimeType in PLATFORM_ONLY_IMAGE_MIMES &&
+                    bytes.size >= 16 &&
+                    isValidDimensions(bounds.outWidth.toLong(), bounds.outHeight.toLong())
+                ) {
+                    EncodedImageDimensions(bounds.outWidth, bounds.outHeight)
+                } else {
+                    return null
+                }
             }
 
-            val mimeType = bounds.outMimeType?.trim()?.lowercase(Locale.US).orEmpty()
-            if (!mimeType.startsWith("image/")) {
-                return null
-            }
-
-            if (!isStructurallyValidEncodedImage(bytes, mimeType, width, height)) {
+            if (!isValidDimensions(parsed.width.toLong(), parsed.height.toLong())) {
                 return null
             }
 
             var sampleSize = 1
-            if (width > target || height > target) {
-                var halfW = width / 2
-                var halfH = height / 2
+            if (parsed.width > target || parsed.height > target) {
+                var halfW = parsed.width / 2
+                var halfH = parsed.height / 2
                 while (halfW / sampleSize >= target && halfH / sampleSize >= target) {
                     sampleSize *= 2
                 }
@@ -152,61 +165,83 @@ object MediaNotificationArtworkLoader {
         }
     }
 
-    private fun isStructurallyValidEncodedImage(
-        bytes: ByteArray,
-        mimeType: String,
-        expectedWidth: Int,
-        expectedHeight: Int
-    ): Boolean {
-        return when (mimeType) {
-            "image/png" -> isValidPngStructure(bytes, expectedWidth, expectedHeight)
-            "image/jpeg", "image/jpg" -> isValidJpegStructure(bytes, expectedWidth, expectedHeight)
-            "image/webp" -> isValidWebpStructure(bytes)
-            "image/gif" -> isValidGifStructure(bytes, expectedWidth, expectedHeight)
-            "image/bmp", "image/x-ms-bmp" -> isValidBmpStructure(bytes, expectedWidth, expectedHeight)
-            else -> bytes.size >= 16 && expectedWidth > 0 && expectedHeight > 0
+    private fun parseAndValidateImageDimensions(bytes: ByteArray): EncodedImageDimensions? {
+        return when {
+            hasPngSignature(bytes) -> parseValidPngDimensions(bytes)
+            hasJpegSoi(bytes) -> parseValidJpegDimensions(bytes)
+            hasWebpHeader(bytes) -> parseValidWebpDimensions(bytes)
+            hasGifHeader(bytes) -> parseValidGifDimensions(bytes)
+            hasBmpHeader(bytes) -> parseValidBmpDimensions(bytes)
+            else -> null
         }
     }
 
-    private fun isValidPngStructure(
-        bytes: ByteArray,
-        expectedWidth: Int,
-        expectedHeight: Int
-    ): Boolean {
-        if (bytes.size < 45) return false
+    private fun hasPngSignature(bytes: ByteArray): Boolean {
+        if (bytes.size < PNG_SIGNATURE.size) return false
         for (i in PNG_SIGNATURE.indices) {
             if (bytes[i] != PNG_SIGNATURE[i]) return false
         }
+        return true
+    }
+
+    private fun hasJpegSoi(bytes: ByteArray): Boolean {
+        return bytes.size >= 2 &&
+            (bytes[0].toInt() and 0xFF) == 0xFF &&
+            (bytes[1].toInt() and 0xFF) == 0xD8
+    }
+
+    private fun hasWebpHeader(bytes: ByteArray): Boolean {
+        if (bytes.size < 12) return false
+        return String(bytes, 0, 4, Charsets.US_ASCII) == "RIFF" &&
+            String(bytes, 8, 4, Charsets.US_ASCII) == "WEBP"
+    }
+
+    private fun hasGifHeader(bytes: ByteArray): Boolean {
+        if (bytes.size < 6) return false
+        val header = String(bytes, 0, 6, Charsets.US_ASCII)
+        return header == "GIF87a" || header == "GIF89a"
+    }
+
+    private fun hasBmpHeader(bytes: ByteArray): Boolean {
+        return bytes.size >= 2 &&
+            bytes[0] == 'B'.code.toByte() &&
+            bytes[1] == 'M'.code.toByte()
+    }
+
+    private fun parseValidPngDimensions(bytes: ByteArray): EncodedImageDimensions? {
+        if (bytes.size < 45 || !hasPngSignature(bytes)) return null
         var offset = PNG_SIGNATURE.size
         var chunkIndex = 0
+        var parsedWidth = 0L
+        var parsedHeight = 0L
         var sawIhdr = false
         var sawIdat = false
         var sawIend = false
 
         while (offset + 12 <= bytes.size) {
             val lengthLong = readUInt32BE(bytes, offset)
-            if (lengthLong < 0L || lengthLong > Int.MAX_VALUE.toLong()) return false
+            if (lengthLong < 0L || lengthLong > Int.MAX_VALUE.toLong()) return null
             val totalChunkBytes = 12L + lengthLong
-            if (offset.toLong() + totalChunkBytes > bytes.size.toLong()) return false
+            if (offset.toLong() + totalChunkBytes > bytes.size.toLong()) return null
             val length = lengthLong.toInt()
 
             val crc32 = CRC32().apply { update(bytes, offset + 4, 4 + length) }.value
             val storedCrc = readUInt32BE(bytes, offset + 8 + length)
-            if (crc32 != storedCrc) return false
+            if (crc32 != storedCrc) return null
 
             val type = String(bytes, offset + 4, 4, Charsets.US_ASCII)
             if (chunkIndex == 0) {
-                if (type != "IHDR" || length != 13) return false
-                val ihdrW = readUInt32BE(bytes, offset + 8).toInt()
-                val ihdrH = readUInt32BE(bytes, offset + 12).toInt()
-                if (ihdrW <= 0 || ihdrH <= 0 || ihdrW != expectedWidth || ihdrH != expectedHeight) {
-                    return false
-                }
+                if (type != "IHDR" || length != 13) return null
+                parsedWidth = readUInt32BE(bytes, offset + 8)
+                parsedHeight = readUInt32BE(bytes, offset + 12)
+                if (!isValidDimensions(parsedWidth, parsedHeight)) return null
                 sawIhdr = true
             } else if (type == "IDAT") {
-                sawIdat = true
+                if (length > 0) {
+                    sawIdat = true
+                }
             } else if (type == "IEND") {
-                if (length != 0) return false
+                if (length != 0) return null
                 sawIend = true
                 break
             }
@@ -214,28 +249,29 @@ object MediaNotificationArtworkLoader {
             offset += 12 + length
             chunkIndex++
         }
-        return sawIhdr && sawIdat && sawIend
+        return if (sawIhdr && sawIdat && sawIend) {
+            EncodedImageDimensions(parsedWidth.toInt(), parsedHeight.toInt())
+        } else {
+            null
+        }
     }
 
-    private fun isValidJpegStructure(
-        bytes: ByteArray,
-        expectedWidth: Int,
-        expectedHeight: Int
-    ): Boolean {
-        if (bytes.size < 16) return false
-        if ((bytes[0].toInt() and 0xFF) != 0xFF || (bytes[1].toInt() and 0xFF) != 0xD8) return false
+    private fun parseValidJpegDimensions(bytes: ByteArray): EncodedImageDimensions? {
+        if (bytes.size < 16 || !hasJpegSoi(bytes)) return null
 
         var pos = 2
+        var parsedWidth = 0L
+        var parsedHeight = 0L
         var sawSof = false
         var sawSos = false
         var sawEoi = false
 
         while (pos < bytes.size) {
-            if ((bytes[pos].toInt() and 0xFF) != 0xFF) return false
+            if ((bytes[pos].toInt() and 0xFF) != 0xFF) return null
             while (pos < bytes.size && (bytes[pos].toInt() and 0xFF) == 0xFF) {
                 pos++
             }
-            if (pos >= bytes.size) return false
+            if (pos >= bytes.size) return null
             val marker = bytes[pos].toInt() and 0xFF
             pos++
 
@@ -246,17 +282,17 @@ object MediaNotificationArtworkLoader {
                 sawEoi = sawSos
                 break
             }
-            if (pos + 2 > bytes.size) return false
+            if (pos + 2 > bytes.size) return null
             val segLen = ((bytes[pos].toInt() and 0xFF) shl 8) or (bytes[pos + 1].toInt() and 0xFF)
-            if (segLen < 2 || pos + segLen > bytes.size) return false
+            if (segLen < 2 || pos + segLen > bytes.size) return null
 
             if (marker in 0xC0..0xCF && marker != 0xC4 && marker != 0xC8 && marker != 0xCC) {
-                if (segLen < 8) return false
-                val frameH = ((bytes[pos + 3].toInt() and 0xFF) shl 8) or (bytes[pos + 4].toInt() and 0xFF)
-                val frameW = ((bytes[pos + 5].toInt() and 0xFF) shl 8) or (bytes[pos + 6].toInt() and 0xFF)
-                if (frameW <= 0 || frameH <= 0 || frameW != expectedWidth || frameH != expectedHeight) {
-                    return false
-                }
+                if (segLen < 8) return null
+                val frameH = (((bytes[pos + 3].toInt() and 0xFF) shl 8) or (bytes[pos + 4].toInt() and 0xFF)).toLong()
+                val frameW = (((bytes[pos + 5].toInt() and 0xFF) shl 8) or (bytes[pos + 6].toInt() and 0xFF)).toLong()
+                if (!isValidDimensions(frameW, frameH)) return null
+                parsedWidth = frameW
+                parsedHeight = frameH
                 sawSof = true
             }
 
@@ -296,51 +332,97 @@ object MediaNotificationArtworkLoader {
                 if (!foundEndOrNextMarker || sawEoi) break
             }
         }
-        return sawSof && sawSos && sawEoi
+        return if (sawSof && sawSos && sawEoi) {
+            EncodedImageDimensions(parsedWidth.toInt(), parsedHeight.toInt())
+        } else {
+            null
+        }
     }
 
-    private fun isValidWebpStructure(bytes: ByteArray): Boolean {
-        if (bytes.size < 20) return false
-        val riff = String(bytes, 0, 4, Charsets.US_ASCII)
-        val webp = String(bytes, 8, 4, Charsets.US_ASCII)
-        if (riff != "RIFF" || webp != "WEBP") return false
+    private fun parseValidWebpDimensions(bytes: ByteArray): EncodedImageDimensions? {
+        if (bytes.size < 20 || !hasWebpHeader(bytes)) return null
         val riffSize = readUInt32LE(bytes, 4)
-        if (riffSize < 12L || 8L + riffSize > bytes.size.toLong()) return false
+        if (riffSize < 12L || 8L + riffSize > bytes.size.toLong()) return null
         val chunkTag = String(bytes, 12, 4, Charsets.US_ASCII)
-        if (chunkTag != "VP8 " && chunkTag != "VP8L" && chunkTag != "VP8X") return false
         val chunkSize = readUInt32LE(bytes, 16)
-        return chunkSize > 0L && 20L + chunkSize <= 8L + riffSize
+        if (chunkSize <= 0L || 20L + chunkSize > 8L + riffSize) return null
+
+        val (w, h) = when (chunkTag) {
+            "VP8 " -> {
+                if (chunkSize < 10L || bytes.size < 30) return null
+                if ((bytes[23].toInt() and 0xFF) != 0x9D ||
+                    (bytes[24].toInt() and 0xFF) != 0x01 ||
+                    (bytes[25].toInt() and 0xFF) != 0x2A
+                ) {
+                    return null
+                }
+                val rawW = (bytes[26].toInt() and 0xFF) or ((bytes[27].toInt() and 0x3F) shl 8)
+                val rawH = (bytes[28].toInt() and 0xFF) or ((bytes[29].toInt() and 0x3F) shl 8)
+                rawW.toLong() to rawH.toLong()
+            }
+            "VP8L" -> {
+                if (chunkSize < 5L || bytes.size < 25 || (bytes[20].toInt() and 0xFF) != 0x2F) {
+                    return null
+                }
+                val bits = readUInt32LE(bytes, 21)
+                val rawW = (bits and 0x3FFFL) + 1L
+                val rawH = ((bits ushr 14) and 0x3FFFL) + 1L
+                rawW to rawH
+            }
+            "VP8X" -> {
+                if (chunkSize < 10L || bytes.size < 30) return null
+                val rawW = (readUInt24LE(bytes, 24) + 1L)
+                val rawH = (readUInt24LE(bytes, 27) + 1L)
+                rawW to rawH
+            }
+            else -> return null
+        }
+        return if (isValidDimensions(w, h)) {
+            EncodedImageDimensions(w.toInt(), h.toInt())
+        } else {
+            null
+        }
     }
 
-    private fun isValidGifStructure(
-        bytes: ByteArray,
-        expectedWidth: Int,
-        expectedHeight: Int
-    ): Boolean {
-        if (bytes.size < 14) return false
-        val header = String(bytes, 0, 6, Charsets.US_ASCII)
-        if (header != "GIF87a" && header != "GIF89a") return false
-        val w = (bytes[6].toInt() and 0xFF) or ((bytes[7].toInt() and 0xFF) shl 8)
-        val h = (bytes[8].toInt() and 0xFF) or ((bytes[9].toInt() and 0xFF) shl 8)
-        if (w <= 0 || h <= 0 || w != expectedWidth || h != expectedHeight) return false
+    private fun parseValidGifDimensions(bytes: ByteArray): EncodedImageDimensions? {
+        if (bytes.size < 14 || !hasGifHeader(bytes)) return null
+        val w = ((bytes[6].toInt() and 0xFF) or ((bytes[7].toInt() and 0xFF) shl 8)).toLong()
+        val h = ((bytes[8].toInt() and 0xFF) or ((bytes[9].toInt() and 0xFF) shl 8)).toLong()
+        if (!isValidDimensions(w, h)) return null
         var lastNonZero = bytes.size - 1
         while (lastNonZero > 13 && bytes[lastNonZero] == 0.toByte()) {
             lastNonZero--
         }
-        return bytes[lastNonZero] == 0x3B.toByte()
+        return if (bytes[lastNonZero] == 0x3B.toByte()) {
+            EncodedImageDimensions(w.toInt(), h.toInt())
+        } else {
+            null
+        }
     }
 
-    private fun isValidBmpStructure(
-        bytes: ByteArray,
-        expectedWidth: Int,
-        expectedHeight: Int
-    ): Boolean {
-        if (bytes.size < 26) return false
-        if (bytes[0] != 'B'.code.toByte() || bytes[1] != 'M'.code.toByte()) return false
+    private fun parseValidBmpDimensions(bytes: ByteArray): EncodedImageDimensions? {
+        if (bytes.size < 26 || !hasBmpHeader(bytes)) return null
         val declaredSize = readUInt32LE(bytes, 2)
-        if (declaredSize < 26L || declaredSize > bytes.size.toLong()) return false
+        if (declaredSize < 26L || declaredSize > bytes.size.toLong()) return null
         val dibSize = readUInt32LE(bytes, 14)
-        return dibSize >= 12L && expectedWidth > 0 && expectedHeight > 0
+        val (w, h) = when {
+            dibSize == 12L -> {
+                val rawW = ((bytes[18].toInt() and 0xFF) or ((bytes[19].toInt() and 0xFF) shl 8)).toLong()
+                val rawH = ((bytes[20].toInt() and 0xFF) or ((bytes[21].toInt() and 0xFF) shl 8)).toLong()
+                rawW to rawH
+            }
+            dibSize >= 40L -> {
+                val rawW = readInt32LE(bytes, 18).toLong()
+                val rawH = kotlin.math.abs(readInt32LE(bytes, 22).toLong())
+                rawW to rawH
+            }
+            else -> return null
+        }
+        return if (isValidDimensions(w, h)) {
+            EncodedImageDimensions(w.toInt(), h.toInt())
+        } else {
+            null
+        }
     }
 
     private fun readUInt32BE(bytes: ByteArray, offset: Int): Long {
@@ -355,6 +437,19 @@ object MediaNotificationArtworkLoader {
             ((bytes[offset + 1].toLong() and 0xFF) shl 8) or
             ((bytes[offset + 2].toLong() and 0xFF) shl 16) or
             ((bytes[offset + 3].toLong() and 0xFF) shl 24)
+    }
+
+    private fun readUInt24LE(bytes: ByteArray, offset: Int): Long {
+        return (bytes[offset].toLong() and 0xFF) or
+            ((bytes[offset + 1].toLong() and 0xFF) shl 8) or
+            ((bytes[offset + 2].toLong() and 0xFF) shl 16)
+    }
+
+    private fun readInt32LE(bytes: ByteArray, offset: Int): Int {
+        return (bytes[offset].toInt() and 0xFF) or
+            ((bytes[offset + 1].toInt() and 0xFF) shl 8) or
+            ((bytes[offset + 2].toInt() and 0xFF) shl 16) or
+            ((bytes[offset + 3].toInt() and 0xFF) shl 24)
     }
 
     private fun extractArtworkBitmap(context: Context, uri: Uri): Bitmap? {

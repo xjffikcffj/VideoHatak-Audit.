@@ -188,12 +188,14 @@ class LibraryPerformanceAndRotationVerificationTest {
     @Test
     fun libraryViewModel_filterSortAndFolderGrouping_runOffMainThreadAndCacheFoldersAcrossSearchAndSort() =
         runBlocking {
+            val mainThreadRef = AtomicReference<Thread>()
+            val workerThreadRef = AtomicReference<Thread>()
             val mainExecutor = Executors.newSingleThreadExecutor { runnable ->
-                Thread(runnable, "vh-main-thread")
+                Thread(runnable, "vh-main-thread").also { mainThreadRef.set(it) }
             }
             val mainDispatcher = mainExecutor.asCoroutineDispatcher()
             val workerExecutor = Executors.newSingleThreadExecutor { runnable ->
-                Thread(runnable, "vh-compute-worker")
+                Thread(runnable, "vh-compute-worker").also { workerThreadRef.set(it) }
             }
             val workerDispatcher = workerExecutor.asCoroutineDispatcher()
             Dispatchers.setMain(mainDispatcher)
@@ -236,12 +238,20 @@ class LibraryPerformanceAndRotationVerificationTest {
                     1,
                     repo.groupIntoFoldersCalls.get()
                 )
-                assertTrue(repo.filterThreads.isNotEmpty())
-                assertTrue(repo.groupThreads.isNotEmpty())
-                assertTrue(repo.filterThreads.all { it == "vh-compute-worker" })
-                assertTrue(repo.groupThreads.all { it == "vh-compute-worker" })
-                assertTrue(repo.filterThreads.none { it == "vh-main-thread" })
-                assertTrue(repo.groupThreads.none { it == "vh-main-thread" })
+                assertExecutedStrictlyOnWorkerThread(
+                    operationName = "filterAndSort",
+                    recordedRefs = repo.filterThreadRefs,
+                    recordedNames = repo.filterThreads,
+                    expectedWorkerThread = workerThreadRef.get(),
+                    forbiddenMainThread = mainThreadRef.get()
+                )
+                assertExecutedStrictlyOnWorkerThread(
+                    operationName = "groupIntoFolders",
+                    recordedRefs = repo.groupThreadRefs,
+                    recordedNames = repo.groupThreads,
+                    expectedWorkerThread = workerThreadRef.get(),
+                    forbiddenMainThread = mainThreadRef.get()
+                )
 
                 collectJob.cancel()
             } finally {
@@ -256,12 +266,14 @@ class LibraryPerformanceAndRotationVerificationTest {
     @Test
     fun libraryViewModel_emptyVideoListSkipsGroupIntoFoldersAndLoadsActualVideosOnce() =
         runBlocking {
+            val mainThreadRef = AtomicReference<Thread>()
+            val workerThreadRef = AtomicReference<Thread>()
             val mainExecutor = Executors.newSingleThreadExecutor { runnable ->
-                Thread(runnable, "vh-main-thread")
+                Thread(runnable, "vh-main-thread").also { mainThreadRef.set(it) }
             }
             val mainDispatcher = mainExecutor.asCoroutineDispatcher()
             val workerExecutor = Executors.newSingleThreadExecutor { runnable ->
-                Thread(runnable, "vh-compute-worker")
+                Thread(runnable, "vh-compute-worker").also { workerThreadRef.set(it) }
             }
             val workerDispatcher = workerExecutor.asCoroutineDispatcher()
             Dispatchers.setMain(mainDispatcher)
@@ -306,8 +318,13 @@ class LibraryPerformanceAndRotationVerificationTest {
                 }
                 assertEquals(2, populatedState.folders.size)
                 assertEquals(1, repo.groupIntoFoldersCalls.get())
-                assertTrue(repo.groupThreads.all { it == "vh-compute-worker" })
-                assertTrue(repo.groupThreads.none { it == "vh-main-thread" })
+                assertExecutedStrictlyOnWorkerThread(
+                    operationName = "groupIntoFolders",
+                    recordedRefs = repo.groupThreadRefs,
+                    recordedNames = repo.groupThreads,
+                    expectedWorkerThread = workerThreadRef.get(),
+                    forbiddenMainThread = mainThreadRef.get()
+                )
 
                 // 3. Search & sort must NOT re-invoke groupIntoFolders()
                 vm.onSearchQueryChanged("video_2")
@@ -323,6 +340,13 @@ class LibraryPerformanceAndRotationVerificationTest {
                     }
                 }
                 assertEquals(1, repo.groupIntoFoldersCalls.get())
+                assertExecutedStrictlyOnWorkerThread(
+                    operationName = "filterAndSort",
+                    recordedRefs = repo.filterThreadRefs,
+                    recordedNames = repo.filterThreads,
+                    expectedWorkerThread = workerThreadRef.get(),
+                    forbiddenMainThread = mainThreadRef.get()
+                )
 
                 // 4. Hiding all videos resets folders to empty without calling groupIntoFolders()
                 vaultHiddenFlow.value = realVideos.map { v ->
@@ -339,6 +363,101 @@ class LibraryPerformanceAndRotationVerificationTest {
                 }
                 assertTrue(allHiddenState.folders.isEmpty())
                 assertEquals(1, repo.groupIntoFoldersCalls.get())
+
+                collectJob.cancel()
+            } finally {
+                Dispatchers.setMain(testDispatcher)
+                workerDispatcher.close()
+                workerExecutor.shutdownNow()
+                mainDispatcher.close()
+                mainExecutor.shutdownNow()
+            }
+        }
+
+    @Test
+    fun libraryViewModel_selectedFolderSync_updatesWithoutSideEffectLoopOrDuplicateGrouping() =
+        runBlocking {
+            val mainThreadRef = AtomicReference<Thread>()
+            val workerThreadRef = AtomicReference<Thread>()
+            val mainExecutor = Executors.newSingleThreadExecutor { runnable ->
+                Thread(runnable, "vh-main-thread").also { mainThreadRef.set(it) }
+            }
+            val mainDispatcher = mainExecutor.asCoroutineDispatcher()
+            val workerExecutor = Executors.newSingleThreadExecutor { runnable ->
+                Thread(runnable, "vh-compute-worker").also { workerThreadRef.set(it) }
+            }
+            val workerDispatcher = workerExecutor.asCoroutineDispatcher()
+            Dispatchers.setMain(mainDispatcher)
+            try {
+                val videosRef = AtomicReference(sampleVideos(6))
+                val repo = object : CountingVideoRepository(emptyList()) {
+                    override suspend fun getVideos(): List<VideoItem> {
+                        getVideosCalls.incrementAndGet()
+                        return videosRef.get()
+                    }
+                }
+                val vm = LibraryViewModel(
+                    videoRepository = repo,
+                    computeDispatcher = workerDispatcher
+                )
+                val collectJob = launch(mainDispatcher) {
+                    vm.uiState.collect {}
+                }
+
+                vm.onPermissionStatusChanged(VideoPermissionStatus.FullAccess)
+                val initialState = withTimeout(5_000L) {
+                    vm.uiState.first { !it.isLoading && it.allVideos.size == 6 }
+                }
+                assertEquals(1, repo.groupIntoFoldersCalls.get())
+
+                val evenFolder = initialState.folders.first { it.bucketId == "folder_even" }
+                assertEquals(3, evenFolder.videoCount)
+                vm.onFolderSelected(evenFolder)
+                withTimeout(5_000L) {
+                    vm.uiState.first { it.filteredVideos.size == 3 }
+                }
+                assertEquals(1, repo.groupIntoFoldersCalls.get())
+
+                // Refresh with 8 videos (4 per folder): selectedFolder syncs to videoCount=4 with strictly +1 group call
+                videosRef.set(sampleVideos(8))
+                vm.refresh()
+                withTimeout(5_000L) {
+                    vm.uiState.first { !it.isLoading && it.allVideos.size == 8 && it.filteredVideos.size == 4 }
+                }
+                val updatedSelected = withTimeout(5_000L) {
+                    vm.selectedFolder.first { it?.videoCount == 4 }
+                }
+                assertEquals("folder_even", updatedSelected?.bucketId)
+                assertEquals(
+                    "Refreshing while a folder is selected must NOT trigger duplicate groupIntoFolders",
+                    2,
+                    repo.groupIntoFoldersCalls.get()
+                )
+
+                // Refresh with empty list: clears selectedFolder to null without calling groupIntoFolders again
+                videosRef.set(emptyList())
+                vm.refresh()
+                withTimeout(5_000L) {
+                    vm.uiState.first { !it.isLoading && it.allVideos.isEmpty() }
+                }
+                withTimeout(5_000L) {
+                    vm.selectedFolder.first { it == null }
+                }
+                assertEquals(2, repo.groupIntoFoldersCalls.get())
+                assertExecutedStrictlyOnWorkerThread(
+                    operationName = "filterAndSort",
+                    recordedRefs = repo.filterThreadRefs,
+                    recordedNames = repo.filterThreads,
+                    expectedWorkerThread = workerThreadRef.get(),
+                    forbiddenMainThread = mainThreadRef.get()
+                )
+                assertExecutedStrictlyOnWorkerThread(
+                    operationName = "groupIntoFolders",
+                    recordedRefs = repo.groupThreadRefs,
+                    recordedNames = repo.groupThreads,
+                    expectedWorkerThread = workerThreadRef.get(),
+                    forbiddenMainThread = mainThreadRef.get()
+                )
 
                 collectJob.cancel()
             } finally {
@@ -581,6 +700,35 @@ class LibraryPerformanceAndRotationVerificationTest {
         }
     }
 
+    private fun assertExecutedStrictlyOnWorkerThread(
+        operationName: String,
+        recordedRefs: List<Thread>,
+        recordedNames: List<String>,
+        expectedWorkerThread: Thread?,
+        forbiddenMainThread: Thread?
+    ) {
+        assertTrue("$operationName must execute at least once", recordedRefs.isNotEmpty())
+        assertNotNull("Worker thread must have been initialized", expectedWorkerThread)
+        assertTrue(
+            "$operationName must run only on worker Thread ($expectedWorkerThread), actual refs=$recordedRefs, names=$recordedNames",
+            recordedRefs.all { it === expectedWorkerThread }
+        )
+        if (forbiddenMainThread != null) {
+            assertTrue(
+                "$operationName must NEVER run on Main Thread ($forbiddenMainThread), actual refs=$recordedRefs, names=$recordedNames",
+                recordedRefs.none { it === forbiddenMainThread }
+            )
+        }
+        assertTrue(
+            "$operationName thread names must start with 'vh-compute-worker', actual=$recordedNames",
+            recordedNames.all { it == "vh-compute-worker" || it.startsWith("vh-compute-worker ") }
+        )
+        assertTrue(
+            "$operationName thread names must NOT start with 'vh-main-thread', actual=$recordedNames",
+            recordedNames.none { it == "vh-main-thread" || it.startsWith("vh-main-thread ") }
+        )
+    }
+
     private open class CountingVideoRepository(
         private val items: List<VideoItem>
     ) : VideoRepository {
@@ -588,6 +736,8 @@ class LibraryPerformanceAndRotationVerificationTest {
         val groupIntoFoldersCalls = AtomicInteger(0)
         val filterThreads = CopyOnWriteArrayList<String>()
         val groupThreads = CopyOnWriteArrayList<String>()
+        val filterThreadRefs = CopyOnWriteArrayList<Thread>()
+        val groupThreadRefs = CopyOnWriteArrayList<Thread>()
 
         override fun observeVideos(): Flow<List<VideoItem>> = flowOf(items)
 
@@ -602,7 +752,9 @@ class LibraryPerformanceAndRotationVerificationTest {
             sortOrder: VideoSortOrder,
             folderId: String?
         ): List<VideoItem> {
-            filterThreads.add(Thread.currentThread().name)
+            val current = Thread.currentThread()
+            filterThreadRefs.add(current)
+            filterThreads.add(current.name)
             val filtered = videos.filter { v ->
                 (folderId == null || v.bucketId == folderId) &&
                     (query.isBlank() || v.safeTitle.contains(query, ignoreCase = true))
@@ -618,7 +770,9 @@ class LibraryPerformanceAndRotationVerificationTest {
         }
 
         override fun groupIntoFolders(videos: List<VideoItem>): List<VideoFolder> {
-            groupThreads.add(Thread.currentThread().name)
+            val current = Thread.currentThread()
+            groupThreadRefs.add(current)
+            groupThreads.add(current.name)
             groupIntoFoldersCalls.incrementAndGet()
             return videos.groupBy { it.bucketId }.map { (bucketId, list) ->
                 VideoFolder(

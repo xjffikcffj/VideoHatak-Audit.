@@ -22,6 +22,7 @@ import com.videohatak.player.core.vault.model.VaultHiddenOriginal
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -32,12 +33,13 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.shareIn
 import kotlinx.coroutines.flow.stateIn
-import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -146,9 +148,6 @@ class LibraryViewModel(
             details = { "raw=${videos.size}" }
         ) {
             if (videos.isEmpty()) {
-                if (selectedFolder.value != null) {
-                    selectedFolder.value = null
-                }
                 VisibleLibrarySnapshot()
             } else {
                 val visibleNotTrashed = if (trashedUris.isEmpty()) {
@@ -161,11 +160,6 @@ class LibraryViewModel(
                     emptyList()
                 } else {
                     videoRepository.groupIntoFolders(visibleVideos)
-                }
-                if (selectedFolder.value != null) {
-                    selectedFolder.update { active ->
-                        active?.let { current -> folders.firstOrNull { it.bucketId == current.bucketId } }
-                    }
                 }
                 VisibleLibrarySnapshot(
                     visibleVideos = visibleVideos,
@@ -229,6 +223,33 @@ class LibraryViewModel(
         started = SharingStarted.WhileSubscribed(5000),
         initialValue = LibraryUiState(isLoading = true)
     )
+
+    init {
+        startSelectedFolderSync()
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private fun startSelectedFolderSync() {
+        viewModelScope.launch {
+            selectedFolder
+                .map { it?.bucketId }
+                .distinctUntilChanged()
+                .flatMapLatest { bucketId ->
+                    if (bucketId == null) {
+                        emptyFlow()
+                    } else {
+                        visibleSnapshotFlow.map { snapshot ->
+                            snapshot.folders.firstOrNull { it.bucketId == bucketId }
+                        }
+                    }
+                }
+                .collect { refreshedFolder ->
+                    if (selectedFolder.value != refreshedFolder) {
+                        selectedFolder.value = refreshedFolder
+                    }
+                }
+        }
+    }
 
     fun onPermissionStatusChanged(status: VideoPermissionStatus) =
         onPermissionStatusChanged(status = status, forceRefresh = false)

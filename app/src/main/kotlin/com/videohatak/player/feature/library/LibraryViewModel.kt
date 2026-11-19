@@ -143,17 +143,25 @@ class LibraryViewModel(
             operation = "library_visible_and_folders",
             details = { "raw=${videos.size}" }
         ) {
-            val visibleNotTrashed = if (trashedUris.isEmpty()) {
-                videos
+            if (videos.isEmpty()) {
+                VisibleLibrarySnapshot()
             } else {
-                videos.filterNot { it.contentUri.toString() in trashedUris }
+                val visibleNotTrashed = if (trashedUris.isEmpty()) {
+                    videos
+                } else {
+                    videos.filterNot { it.contentUri.toString() in trashedUris }
+                }
+                val visibleVideos = VaultHiddenMatcher.filterVisibleVideos(visibleNotTrashed, vaultHidden)
+                val folders = if (visibleVideos.isEmpty()) {
+                    emptyList()
+                } else {
+                    videoRepository.groupIntoFolders(visibleVideos)
+                }
+                VisibleLibrarySnapshot(
+                    visibleVideos = visibleVideos,
+                    folders = folders
+                )
             }
-            val visibleVideos = VaultHiddenMatcher.filterVisibleVideos(visibleNotTrashed, vaultHidden)
-            val folders = videoRepository.groupIntoFolders(visibleVideos)
-            VisibleLibrarySnapshot(
-                visibleVideos = visibleVideos,
-                folders = folders
-            )
         }
     }
         .flowOn(computeDispatcher)
@@ -922,16 +930,24 @@ class LibraryViewModel(
                 val activeFolder = selectedFolder.value
                 if (activeFolder != null) {
                     val refreshedFolder = kotlinx.coroutines.withContext(computeDispatcher) {
-                        val visibleNotTrashed = videos.filterNot {
-                            it.contentUri.toString() in trashedUrisFlow.value
+                        if (videos.isEmpty()) {
+                            null
+                        } else {
+                            val visibleNotTrashed = videos.filterNot {
+                                it.contentUri.toString() in trashedUrisFlow.value
+                            }
+                            val visible = VaultHiddenMatcher.filterVisibleVideos(
+                                visibleNotTrashed,
+                                vaultHiddenEntries.value
+                            )
+                            val folderVideos = visible.filter { it.bucketId == activeFolder.bucketId }
+                            if (folderVideos.isEmpty()) {
+                                null
+                            } else {
+                                videoRepository.groupIntoFolders(folderVideos)
+                                    .firstOrNull { it.bucketId == activeFolder.bucketId }
+                            }
                         }
-                        val visible = VaultHiddenMatcher.filterVisibleVideos(
-                            visibleNotTrashed,
-                            vaultHiddenEntries.value
-                        )
-                        val folderVideos = visible.filter { it.bucketId == activeFolder.bucketId }
-                        videoRepository.groupIntoFolders(folderVideos)
-                            .firstOrNull { it.bucketId == activeFolder.bucketId }
                     }
                     if (requestGeneration == loadGeneration.get()) {
                         selectedFolder.value = refreshedFolder

@@ -64,6 +64,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 @OptIn(ExperimentalCoroutinesApi::class)
 @RunWith(RobolectricTestRunner::class)
@@ -241,6 +242,103 @@ class LibraryPerformanceAndRotationVerificationTest {
                 assertTrue(repo.groupThreads.all { it == "vh-compute-worker" })
                 assertTrue(repo.filterThreads.none { it == "vh-main-thread" })
                 assertTrue(repo.groupThreads.none { it == "vh-main-thread" })
+
+                collectJob.cancel()
+            } finally {
+                Dispatchers.setMain(testDispatcher)
+                workerDispatcher.close()
+                workerExecutor.shutdownNow()
+                mainDispatcher.close()
+                mainExecutor.shutdownNow()
+            }
+        }
+
+    @Test
+    fun libraryViewModel_emptyVideoListSkipsGroupIntoFoldersAndLoadsActualVideosOnce() =
+        runBlocking {
+            val mainExecutor = Executors.newSingleThreadExecutor { runnable ->
+                Thread(runnable, "vh-main-thread")
+            }
+            val mainDispatcher = mainExecutor.asCoroutineDispatcher()
+            val workerExecutor = Executors.newSingleThreadExecutor { runnable ->
+                Thread(runnable, "vh-compute-worker")
+            }
+            val workerDispatcher = workerExecutor.asCoroutineDispatcher()
+            Dispatchers.setMain(mainDispatcher)
+            try {
+                val videosRef = AtomicReference<List<VideoItem>>(emptyList())
+                val repo = object : CountingVideoRepository(emptyList()) {
+                    override suspend fun getVideos(): List<VideoItem> {
+                        getVideosCalls.incrementAndGet()
+                        return videosRef.get()
+                    }
+                }
+                val vaultHiddenFlow = MutableStateFlow<List<VaultHiddenOriginal>>(emptyList())
+                val vm = LibraryViewModel(
+                    videoRepository = repo,
+                    vaultHiddenEntries = vaultHiddenFlow,
+                    computeDispatcher = workerDispatcher
+                )
+
+                val collectJob = launch(mainDispatcher) {
+                    vm.uiState.collect {}
+                }
+
+                // 1. Initial empty state & empty MediaStore result must NEVER call groupIntoFolders()
+                vm.onPermissionStatusChanged(VideoPermissionStatus.FullAccess)
+                val emptyLoadedState = withTimeout(5_000L) {
+                    vm.uiState.first { !it.isLoading }
+                }
+                assertTrue(emptyLoadedState.allVideos.isEmpty())
+                assertTrue(emptyLoadedState.folders.isEmpty())
+                assertEquals(
+                    "groupIntoFolders must NOT be called when video list is empty",
+                    0,
+                    repo.groupIntoFoldersCalls.get()
+                )
+
+                // 2. Loading actual videos invokes groupIntoFolders() once on computeDispatcher
+                val realVideos = sampleVideos(6)
+                videosRef.set(realVideos)
+                vm.refresh()
+                val populatedState = withTimeout(5_000L) {
+                    vm.uiState.first { !it.isLoading && it.allVideos.size == 6 }
+                }
+                assertEquals(2, populatedState.folders.size)
+                assertEquals(1, repo.groupIntoFoldersCalls.get())
+                assertTrue(repo.groupThreads.all { it == "vh-compute-worker" })
+                assertTrue(repo.groupThreads.none { it == "vh-main-thread" })
+
+                // 3. Search & sort must NOT re-invoke groupIntoFolders()
+                vm.onSearchQueryChanged("video_2")
+                val searchedState = withTimeout(5_000L) {
+                    vm.uiState.first { it.filteredVideos.size == 1 }
+                }
+                assertEquals(1, searchedState.filteredVideos.size)
+                vm.onSortOrderChanged(SortOrder.NAME_DESC)
+                vm.onSearchQueryChanged("")
+                withTimeout(5_000L) {
+                    vm.uiState.first {
+                        it.filteredVideos.size == 6 && it.filteredVideos.first().title == "video_6"
+                    }
+                }
+                assertEquals(1, repo.groupIntoFoldersCalls.get())
+
+                // 4. Hiding all videos resets folders to empty without calling groupIntoFolders()
+                vaultHiddenFlow.value = realVideos.map { v ->
+                    VaultHiddenOriginal(
+                        vaultId = v.id,
+                        originalUri = v.contentUri.toString(),
+                        originalMediaStoreId = v.id,
+                        storageType = VaultOriginalStorageType.MEDIA_STORE,
+                        vaultState = VaultEntryState.ORIGINAL_HIDDEN
+                    )
+                }
+                val allHiddenState = withTimeout(5_000L) {
+                    vm.uiState.first { it.allVideos.isEmpty() }
+                }
+                assertTrue(allHiddenState.folders.isEmpty())
+                assertEquals(1, repo.groupIntoFoldersCalls.get())
 
                 collectJob.cancel()
             } finally {

@@ -5,11 +5,19 @@ import android.graphics.Bitmap
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
+import android.os.CancellationSignal
+import android.os.OperationCanceledException
 import android.util.LruCache
 import android.util.Size
+import com.videohatak.player.core.diagnostics.PerformanceDiagnostics
 import com.videohatak.player.core.playback.service.MediaNotificationPrivacy
 import com.videohatak.player.core.thumbnail.retriever.ThumbnailRetriever
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
@@ -37,24 +45,83 @@ object VideoThumbnailLoader {
         if (MediaNotificationPrivacy.isVaultUri(contentUri)) {
             return null
         }
+        currentCoroutineContext().ensureActive()
         getCached(videoId)?.let { return it }
 
-        return loaderSemaphore.withPermit {
-            withContext(Dispatchers.IO) {
-                getCached(videoId)?.let { return@withContext it }
+        val loaded = loadThumbnailInternal(
+            videoId = videoId,
+            contentUri = contentUri,
+            semaphore = loaderSemaphore,
+            ioDispatcher = Dispatchers.IO,
+            cacheLookup = ::getCached,
+            cacheStore = { id, bmp -> memoryCache.put(id, bmp) },
+            primaryFetcher = { uri, signal ->
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    context.contentResolver.loadThumbnail(uri, Size(320, 180), signal)
+                } else {
+                    extractFrameFallback(context, uri)
+                }
+            },
+            fallbackFetcher = { uri ->
+                extractFrameFallback(context, uri)
+            }
+        )
+        return loaded
+    }
 
-                val bitmap = try {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                        context.contentResolver.loadThumbnail(contentUri, Size(320, 180), null)
-                    } else {
-                        extractFrameFallback(context, contentUri)
+    internal suspend fun loadThumbnailInternal(
+        videoId: Long,
+        contentUri: Uri,
+        semaphore: Semaphore = loaderSemaphore,
+        ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+        cacheLookup: (Long) -> Bitmap? = ::getCached,
+        cacheStore: (Long, Bitmap) -> Unit = { id, bmp -> memoryCache.put(id, bmp) },
+        primaryFetcher: (Uri, CancellationSignal) -> Bitmap?,
+        fallbackFetcher: (Uri) -> Bitmap?
+    ): Bitmap? {
+        if (MediaNotificationPrivacy.isVaultUri(contentUri)) {
+            return null
+        }
+        currentCoroutineContext().ensureActive()
+        cacheLookup(videoId)?.let { return it }
+
+        return semaphore.withPermit {
+            currentCoroutineContext().ensureActive()
+            withContext(ioDispatcher) {
+                currentCoroutineContext().ensureActive()
+                cacheLookup(videoId)?.let { return@withContext it }
+
+                val signal = CancellationSignal()
+                val jobHandle = currentCoroutineContext()[Job]?.invokeOnCompletion { cause ->
+                    if (cause != null) {
+                        runCatching { signal.cancel() }
                     }
-                } catch (_: Throwable) {
-                    extractFrameFallback(context, contentUri)
-                }?.takeIf { !it.isRecycled }
+                }
+                val bitmap = try {
+                    PerformanceDiagnostics.measure(
+                        operation = "thumbnail_load",
+                        details = { "videoId=$videoId" }
+                    ) {
+                        val primary = try {
+                            primaryFetcher(contentUri, signal)
+                        } catch (ce: CancellationException) {
+                            throw ce
+                        } catch (oce: OperationCanceledException) {
+                            currentCoroutineContext().ensureActive()
+                            throw CancellationException("Thumbnail request cancelled", oce)
+                        } catch (_: Throwable) {
+                            currentCoroutineContext().ensureActive()
+                            fallbackFetcher(contentUri)
+                        }
+                        primary?.takeIf { !it.isRecycled }
+                    }
+                } finally {
+                    jobHandle?.dispose()
+                }
 
+                currentCoroutineContext().ensureActive()
                 if (bitmap != null) {
-                    memoryCache.put(videoId, bitmap)
+                    cacheStore(videoId, bitmap)
                 }
                 bitmap
             }
@@ -63,6 +130,7 @@ object VideoThumbnailLoader {
 
     private fun extractFrameFallback(context: Context, uri: Uri): Bitmap? {
         if (MediaNotificationPrivacy.isVaultUri(uri)) return null
+        if (Thread.currentThread().isInterrupted) return null
         val retriever = MediaMetadataRetriever()
         return try {
             retriever.setDataSource(context, uri)
@@ -72,6 +140,8 @@ object VideoThumbnailLoader {
                 retriever.getFrameAtTime(1_000_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                     ?.let { raw -> ThumbnailRetriever.downscaleIfNeeded(raw, 320, 180) }
             }
+        } catch (ce: CancellationException) {
+            throw ce
         } catch (_: Throwable) {
             null
         } finally {
@@ -82,4 +152,3 @@ object VideoThumbnailLoader {
         }
     }
 }
-

@@ -108,6 +108,17 @@ import kotlin.math.roundToInt
 
 private enum class ActiveDragAxis { NONE, SEEK, VOLUME, BRIGHTNESS }
 
+internal fun resolveOrientationRestoreOnExitPlayer(
+    isMainActivity: Boolean,
+    orientationBeforePlayer: Int
+): Int {
+    return if (isMainActivity) {
+        com.videohatak.player.MainActivity.MAIN_APP_ORIENTATION
+    } else {
+        orientationBeforePlayer
+    }
+}
+
 @OptIn(UnstableApi::class)
 @Composable
 fun PlayerScreen(
@@ -299,25 +310,30 @@ fun PlayerScreen(
         }
     }
 
-    val orientationMode = uiState.playerOrientationMode
-    DisposableEffect(orientationMode) {
-        activity?.requestedOrientation = orientationMode.activityOrientation
-        onDispose { }
+    val orientationBeforePlayer = remember(activity) {
+        resolveOrientationRestoreOnExitPlayer(
+            isMainActivity = activity is com.videohatak.player.MainActivity,
+            orientationBeforePlayer = activity?.requestedOrientation ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        )
     }
-
+    val orientationMode = uiState.playerOrientationMode
     DisposableEffect(Unit) {
-        val originalOrientation = activity?.requestedOrientation ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         val originalBrightness = activity?.window?.attributes?.screenBrightness ?: -1f
         onDispose {
             viewModel.setPipActive(false)
             viewModel.clearTemporaryPlaybackSpeed()
-            activity?.requestedOrientation = originalOrientation
+            activity?.requestedOrientation = orientationBeforePlayer
             activity?.window?.let { win ->
                 val attrs = win.attributes
                 attrs.screenBrightness = originalBrightness
                 win.attributes = attrs
             }
         }
+    }
+
+    DisposableEffect(orientationMode) {
+        activity?.requestedOrientation = orientationMode.activityOrientation
+        onDispose { }
     }
 
     // Minimize/Back keeps video playing smoothly in background + MiniPlayerBar + notification

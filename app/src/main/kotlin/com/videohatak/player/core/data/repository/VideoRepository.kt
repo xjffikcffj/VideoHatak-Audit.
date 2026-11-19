@@ -186,7 +186,19 @@ class LocalVideoRepositoryImpl(
     }.flowOn(ioDispatcher)
 
     override suspend fun getVideos(): List<VideoItem> = withContext(ioDispatcher) {
-        queryVideosInternal()
+        com.videohatak.player.core.diagnostics.PerformanceDiagnostics.measure(
+            operation = "mediastore_get_videos"
+        ) {
+            queryVideosInternal()
+        }
+    }
+
+    private fun extractParentFolderName(path: String): String? {
+        val trimmed = path.trimEnd('/')
+        val lastSlash = trimmed.lastIndexOf('/')
+        if (lastSlash <= 0) return null
+        val prevSlash = trimmed.lastIndexOf('/', lastSlash - 1)
+        return if (prevSlash >= 0) trimmed.substring(prevSlash + 1, lastSlash) else trimmed.substring(0, lastSlash)
     }
 
     private fun queryVideosInternal(): List<VideoItem> {
@@ -262,13 +274,14 @@ class LocalVideoRepositoryImpl(
                         } else ""
 
                         val resolvedBucketId = rawBucketId ?: if (path.isNotBlank()) {
-                            File(path).parentFile?.name.hashCode().toString()
+                            extractParentFolderName(path).hashCode().toString()
                         } else "default_bucket"
 
                         val resolvedBucketName = when {
                             !rawBucketName.isNullOrBlank() -> rawBucketName
                             relativePath.isNotBlank() -> relativePath.trim('/').substringAfterLast('/')
-                            path.isNotBlank() -> File(path).parentFile?.name ?: "مجلد الفيديوهات"
+                            path.isNotBlank() -> extractParentFolderName(path)?.takeIf { it.isNotBlank() }
+                                ?: "مجلد الفيديوهات"
                             else -> "مجلد الفيديوهات"
                         }
 
@@ -951,16 +964,19 @@ class LocalVideoRepositoryImpl(
         sortOrder: VideoSortOrder,
         folderId: String?
     ): List<VideoItem> {
-        val normalizedQuery = query.trim().lowercase()
+        val normalizedQuery = query.trim()
 
-        val filtered = videos.filter { video ->
-            val matchesFolder = folderId == null || video.bucketId == folderId
-            val matchesQuery = normalizedQuery.isEmpty() ||
-                video.safeTitle.lowercase().contains(normalizedQuery) ||
-                video.displayName.lowercase().contains(normalizedQuery) ||
-                video.bucketDisplayName.lowercase().contains(normalizedQuery)
-
-            matchesFolder && matchesQuery
+        val filtered = if (folderId == null && normalizedQuery.isEmpty()) {
+            videos
+        } else {
+            videos.filter { video ->
+                val matchesFolder = folderId == null || video.bucketId == folderId
+                if (!matchesFolder) return@filter false
+                normalizedQuery.isEmpty() ||
+                    video.safeTitle.contains(normalizedQuery, ignoreCase = true) ||
+                    video.displayName.contains(normalizedQuery, ignoreCase = true) ||
+                    video.bucketDisplayName.contains(normalizedQuery, ignoreCase = true)
+            }
         }
 
         return when (sortOrder.field) {
@@ -973,9 +989,9 @@ class LocalVideoRepositoryImpl(
             }
             VideoSortField.NAME -> {
                 if (sortOrder.direction == SortDirection.DESCENDING) {
-                    filtered.sortedByDescending { it.safeTitle.lowercase() }
+                    filtered.sortedWith { a, b -> b.safeTitle.compareTo(a.safeTitle, ignoreCase = true) }
                 } else {
-                    filtered.sortedBy { it.safeTitle.lowercase() }
+                    filtered.sortedWith { a, b -> a.safeTitle.compareTo(b.safeTitle, ignoreCase = true) }
                 }
             }
             VideoSortField.DURATION -> {

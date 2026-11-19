@@ -16,8 +16,13 @@ import com.videohatak.player.core.permission.PermissionHelper
 import com.videohatak.player.core.permission.VideoPermissionStatus
 import com.videohatak.player.core.trash.model.TrashItem
 import com.videohatak.player.core.trash.repository.TrashRepository
+import com.videohatak.player.core.diagnostics.PerformanceDiagnostics
 import com.videohatak.player.core.vault.model.VaultHiddenMatcher
 import com.videohatak.player.core.vault.model.VaultHiddenOriginal
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -26,11 +31,15 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import java.util.concurrent.atomic.AtomicLong
 
 sealed interface LibraryUiEvent {
     data class ShowMessage(val message: String) : LibraryUiEvent
@@ -42,7 +51,8 @@ class LibraryViewModel(
     private val videoRepository: VideoRepository,
     private val trashRepository: TrashRepository? = null,
     private val scrollStore: LibraryScrollStore? = null,
-    private val vaultHiddenEntries: StateFlow<List<VaultHiddenOriginal>> = MutableStateFlow(emptyList())
+    private val vaultHiddenEntries: StateFlow<List<VaultHiddenOriginal>> = MutableStateFlow(emptyList()),
+    private val computeDispatcher: CoroutineDispatcher = Dispatchers.Default
 ) : ViewModel() {
 
     private val _permissionStatus = MutableStateFlow<VideoPermissionStatus>(VideoPermissionStatus.NotRequested)
@@ -76,6 +86,13 @@ class LibraryViewModel(
     private var hasLocalVideosScrollSave = false
     private val videosScrollSaveMutex = Mutex()
 
+    @Volatile
+    private var lastHandledPermissionStatus: VideoPermissionStatus = VideoPermissionStatus.NotRequested
+    @Volatile
+    private var hasCompletedInitialLoad: Boolean = false
+    private var loadVideosJob: Job? = null
+    private val loadGeneration = AtomicLong(0L)
+
     init {
         if (scrollStore != null) {
             viewModelScope.launch {
@@ -106,51 +123,83 @@ class LibraryViewModel(
     private val trashedUrisFlow: StateFlow<Set<String>> =
         trashRepository?.trashedUris ?: MutableStateFlow(emptySet())
 
-    private data class FilterCriteria(
-        val query: String,
-        val sort: SortOrder,
-        val folder: VideoFolder?,
-        val trashedUris: Set<String>,
-        val vaultHidden: List<VaultHiddenOriginal>
+    private data class VisibleLibrarySnapshot(
+        val visibleVideos: List<VideoItem> = emptyList(),
+        val folders: List<VideoFolder> = emptyList()
     )
 
-    private val filterCriteria = combine(
-        searchQuery,
-        sortOrder,
-        selectedFolder,
+    private data class FilterInputs(
+        val query: String,
+        val sort: SortOrder,
+        val folderId: String?
+    )
+
+    private val visibleSnapshotFlow = combine(
+        _rawVideos,
         trashedUrisFlow,
         vaultHiddenEntries
-    ) { query, sort, folder, trashed, hidden ->
-        FilterCriteria(query, sort, folder, trashed, hidden)
+    ) { videos, trashedUris, vaultHidden ->
+        PerformanceDiagnostics.measure(
+            operation = "library_visible_and_folders",
+            details = { "raw=${videos.size}" }
+        ) {
+            val visibleNotTrashed = if (trashedUris.isEmpty()) {
+                videos
+            } else {
+                videos.filterNot { it.contentUri.toString() in trashedUris }
+            }
+            val visibleVideos = VaultHiddenMatcher.filterVisibleVideos(visibleNotTrashed, vaultHidden)
+            val folders = videoRepository.groupIntoFolders(visibleVideos)
+            VisibleLibrarySnapshot(
+                visibleVideos = visibleVideos,
+                folders = folders
+            )
+        }
     }
+        .flowOn(computeDispatcher)
+        .distinctUntilChanged()
+
+    private val filterInputsFlow = combine(
+        searchQuery,
+        sortOrder,
+        selectedFolder.map { it?.bucketId }.distinctUntilChanged()
+    ) { query, sort, folderId ->
+        FilterInputs(query = query, sort = sort, folderId = folderId)
+    }
+
+    private val filteredVideosFlow = combine(
+        visibleSnapshotFlow.map { it.visibleVideos }.distinctUntilChanged(),
+        filterInputsFlow
+    ) { visibleVideos, inputs ->
+        PerformanceDiagnostics.measure(
+            operation = "library_filter_and_sort",
+            details = { "visible=${visibleVideos.size},q=${inputs.query.length}" }
+        ) {
+            videoRepository.filterAndSort(
+                videos = visibleVideos,
+                query = inputs.query,
+                sortOrder = inputs.sort.asVideoSortOrder,
+                folderId = inputs.folderId
+            )
+        }
+    }
+        .flowOn(computeDispatcher)
+        .distinctUntilChanged()
 
     val uiState: StateFlow<LibraryUiState> = combine(
         _permissionStatus,
         _isLoading,
-        _rawVideos,
-        filterCriteria
-    ) { status, loading, videos, criteria ->
-        val visibleNotTrashed = if (criteria.trashedUris.isEmpty()) {
-            videos
-        } else {
-            videos.filterNot { it.contentUri.toString() in criteria.trashedUris }
-        }
-        val visibleVideos = VaultHiddenMatcher.filterVisibleVideos(visibleNotTrashed, criteria.vaultHidden)
-        val filtered = videoRepository.filterAndSort(
-            videos = visibleVideos,
-            query = criteria.query,
-            sortOrder = criteria.sort.asVideoSortOrder,
-            folderId = criteria.folder?.bucketId
-        )
-        val folders = videoRepository.groupIntoFolders(visibleVideos)
-
+        _errorMessage,
+        visibleSnapshotFlow,
+        filteredVideosFlow
+    ) { status, loading, errorMsg, visibleSnapshot, filtered ->
         LibraryUiState(
             permissionStatus = status,
             isLoading = loading,
-            allVideos = visibleVideos,
+            allVideos = visibleSnapshot.visibleVideos,
             filteredVideos = filtered,
-            folders = folders,
-            errorMessage = _errorMessage.value
+            folders = visibleSnapshot.folders,
+            errorMessage = errorMsg
         )
     }.stateIn(
         scope = viewModelScope,
@@ -158,17 +207,38 @@ class LibraryViewModel(
         initialValue = LibraryUiState(isLoading = true)
     )
 
-    fun onPermissionStatusChanged(status: VideoPermissionStatus) {
+    fun onPermissionStatusChanged(status: VideoPermissionStatus) =
+        onPermissionStatusChanged(status = status, forceRefresh = false)
+
+    fun onPermissionStatusChanged(status: VideoPermissionStatus, forceRefresh: Boolean) {
+        val statusChanged = status != lastHandledPermissionStatus
+        lastHandledPermissionStatus = status
         _permissionStatus.value = status
-        if (PermissionHelper.hasAnyAccess(status)) {
-            loadVideos()
-        } else {
+
+        if (!PermissionHelper.hasAnyAccess(status)) {
+            loadVideosJob?.cancel()
+            loadVideosJob = null
             _isLoading.value = false
+            if (trashRepository != null && !hasCompletedInitialLoad) {
+                viewModelScope.launch {
+                    trashRepository.refresh()
+                }
+            }
+            return
+        }
+
+        val loadAlreadyActive = loadVideosJob?.isActive == true
+        if (forceRefresh || statusChanged || (!hasCompletedInitialLoad && !loadAlreadyActive)) {
+            loadVideos(
+                force = forceRefresh || statusChanged,
+                includeTrashRefresh = forceRefresh || !hasCompletedInitialLoad
+            )
         }
     }
 
     // Backward-compatible alias
-    fun updatePermissionState(status: VideoPermissionStatus) = onPermissionStatusChanged(status)
+    fun updatePermissionState(status: VideoPermissionStatus) =
+        onPermissionStatusChanged(status = status, forceRefresh = false)
 
     fun onSearchQueryChanged(query: String) {
         searchQuery.value = query
@@ -818,33 +888,68 @@ class LibraryViewModel(
     }
 
     fun refresh() {
-        viewModelScope.launch {
-            trashRepository?.refresh()
-        }
         if (PermissionHelper.hasAnyAccess(_permissionStatus.value)) {
-            loadVideos()
+            loadVideos(force = true, includeTrashRefresh = true)
+        } else if (trashRepository != null) {
+            viewModelScope.launch {
+                trashRepository.refresh()
+            }
         }
     }
 
-    private fun loadVideos() {
-        viewModelScope.launch {
+    private fun loadVideos(
+        force: Boolean = true,
+        includeTrashRefresh: Boolean = true
+    ) {
+        if (!force && loadVideosJob?.isActive == true) {
+            return
+        }
+        loadVideosJob?.cancel()
+        val requestGeneration = loadGeneration.incrementAndGet()
+
+        loadVideosJob = viewModelScope.launch {
             _isLoading.value = true
             try {
-                trashRepository?.refresh()
+                if (includeTrashRefresh) {
+                    trashRepository?.refresh()
+                }
                 val videos = videoRepository.getVideos()
+                if (requestGeneration != loadGeneration.get()) return@launch
+
                 _rawVideos.value = videos
-                val visibleNotTrashed = videos.filterNot { it.contentUri.toString() in trashedUrisFlow.value }
-                val visible = VaultHiddenMatcher.filterVisibleVideos(visibleNotTrashed, vaultHiddenEntries.value)
+                hasCompletedInitialLoad = true
+
                 val activeFolder = selectedFolder.value
                 if (activeFolder != null) {
-                    selectedFolder.value = videoRepository.groupIntoFolders(visible)
-                        .firstOrNull { it.bucketId == activeFolder.bucketId }
+                    val refreshedFolder = kotlinx.coroutines.withContext(computeDispatcher) {
+                        val visibleNotTrashed = videos.filterNot {
+                            it.contentUri.toString() in trashedUrisFlow.value
+                        }
+                        val visible = VaultHiddenMatcher.filterVisibleVideos(
+                            visibleNotTrashed,
+                            vaultHiddenEntries.value
+                        )
+                        val folderVideos = visible.filter { it.bucketId == activeFolder.bucketId }
+                        videoRepository.groupIntoFolders(folderVideos)
+                            .firstOrNull { it.bucketId == activeFolder.bucketId }
+                    }
+                    if (requestGeneration == loadGeneration.get()) {
+                        selectedFolder.value = refreshedFolder
+                    }
                 }
-                _errorMessage.value = null
+                if (requestGeneration == loadGeneration.get()) {
+                    _errorMessage.value = null
+                }
+            } catch (ce: CancellationException) {
+                throw ce
             } catch (e: Exception) {
-                _errorMessage.value = e.localizedMessage ?: "فشل في قراءة الفيديوهات"
+                if (requestGeneration == loadGeneration.get()) {
+                    _errorMessage.value = e.localizedMessage ?: "فشل في قراءة الفيديوهات"
+                }
             } finally {
-                _isLoading.value = false
+                if (requestGeneration == loadGeneration.get()) {
+                    _isLoading.value = false
+                }
             }
         }
     }
@@ -854,7 +959,8 @@ class LibraryViewModel(
             videoRepository: VideoRepository,
             trashRepository: TrashRepository? = null,
             scrollStore: LibraryScrollStore? = null,
-            vaultHiddenEntries: StateFlow<List<VaultHiddenOriginal>> = MutableStateFlow(emptyList())
+            vaultHiddenEntries: StateFlow<List<VaultHiddenOriginal>> = MutableStateFlow(emptyList()),
+            computeDispatcher: CoroutineDispatcher = Dispatchers.Default
         ): ViewModelProvider.Factory =
             object : ViewModelProvider.Factory {
                 @Suppress("UNCHECKED_CAST")
@@ -863,7 +969,8 @@ class LibraryViewModel(
                         videoRepository = videoRepository,
                         trashRepository = trashRepository,
                         scrollStore = scrollStore,
-                        vaultHiddenEntries = vaultHiddenEntries
+                        vaultHiddenEntries = vaultHiddenEntries,
+                        computeDispatcher = computeDispatcher
                     ) as T
                 }
             }

@@ -94,13 +94,18 @@ data class VaultHiddenOriginal(
 object VaultHiddenMatcher {
     private fun normalizeUri(raw: String?): String = raw?.trim().orEmpty()
 
-    private fun extractFilePath(rawUri: String, explicitPath: String?): String {
+    private fun extractRawFilePath(rawUri: String, explicitPath: String?): String {
         val cleanExplicit = explicitPath?.trim().orEmpty()
-        if (cleanExplicit.isNotEmpty()) return normalizePath(cleanExplicit)
+        if (cleanExplicit.isNotEmpty()) return cleanExplicit
         if (rawUri.startsWith("file://", ignoreCase = true)) {
-            return runCatching { Uri.parse(rawUri).path?.let(::normalizePath).orEmpty() }.getOrDefault("")
+            return runCatching { Uri.parse(rawUri).path.orEmpty() }.getOrDefault("")
         }
         return ""
+    }
+
+    private fun extractFilePath(rawUri: String, explicitPath: String?): String {
+        val rawPath = extractRawFilePath(rawUri, explicitPath)
+        return if (rawPath.isNotEmpty()) normalizePath(rawPath) else ""
     }
 
     private fun normalizePath(path: String): String {
@@ -110,6 +115,72 @@ object VaultHiddenMatcher {
     private fun isMediaStoreUri(rawUri: String): Boolean {
         if (rawUri.isBlank()) return false
         return rawUri.startsWith("content://media/", ignoreCase = true)
+    }
+
+    private class CompiledEntry(
+        val entryPath: String,
+        val storageType: VaultOriginalStorageType
+    )
+
+    private class CompiledHiddenIndex(entries: List<VaultHiddenOriginal>) {
+        val uris = HashSet<String>(entries.size * 2)
+        val paths = HashSet<String>(entries.size * 2)
+        val byMediaStoreId = HashMap<Long, MutableList<CompiledEntry>>(entries.size)
+        val isEmpty: Boolean
+
+        init {
+            var activeCount = 0
+            for (entry in entries) {
+                if (!entry.vaultState.shouldHideOriginalInLibrary) continue
+                activeCount++
+                val entryUri = normalizeUri(entry.originalUri)
+                if (entryUri.isNotEmpty()) {
+                    uris.add(entryUri)
+                }
+                val entryPath = extractFilePath(entryUri, entry.originalFilePath)
+                if (entryPath.isNotEmpty()) {
+                    paths.add(entryPath)
+                }
+                val entryMediaId = entry.originalMediaStoreId
+                if (entryMediaId != null && entryMediaId > 0L) {
+                    byMediaStoreId.getOrPut(entryMediaId) { ArrayList(1) }
+                        .add(CompiledEntry(entryPath = entryPath, storageType = entry.storageType))
+                }
+            }
+            isEmpty = activeCount == 0
+        }
+
+        fun matches(videoId: Long, contentUri: String?, filePath: String?): Boolean {
+            if (isEmpty) return false
+            val normUri = normalizeUri(contentUri)
+            if (normUri.startsWith("vault://", ignoreCase = true)) return false
+            if (normUri.isNotEmpty() && normUri in uris) return true
+
+            val rawPath = if (paths.isNotEmpty() || (videoId > 0L && byMediaStoreId.containsKey(videoId))) {
+                extractRawFilePath(normUri, filePath)
+            } else {
+                ""
+            }
+            val normPath = if (rawPath.isNotEmpty()) normalizePath(rawPath) else ""
+            if (normPath.isNotEmpty() && normPath in paths) return true
+
+            if (videoId > 0L) {
+                val idEntries = byMediaStoreId[videoId]
+                if (idEntries != null) {
+                    val isMsUri = isMediaStoreUri(normUri)
+                    val isGenericContent = !isMsUri && normUri.startsWith("content://", ignoreCase = true)
+                    for (entry in idEntries) {
+                        val compatibleScheme = isMsUri ||
+                            (entry.storageType == VaultOriginalStorageType.MEDIA_STORE && (normUri.isEmpty() || !isGenericContent || isMsUri))
+                        val compatiblePath = entry.entryPath.isEmpty() || normPath.isEmpty() || normPath == entry.entryPath
+                        if (compatibleScheme && compatiblePath) {
+                            return true
+                        }
+                    }
+                }
+            }
+            return false
+        }
     }
 
     fun isTargetHidden(
@@ -171,7 +242,15 @@ object VaultHiddenMatcher {
         hiddenEntries: List<VaultHiddenOriginal>
     ): List<VideoItem> {
         if (hiddenEntries.isEmpty() || videos.isEmpty()) return videos
-        return videos.filterNot { isVideoHidden(it, hiddenEntries) }
+        val index = CompiledHiddenIndex(hiddenEntries)
+        if (index.isEmpty) return videos
+        return videos.filterNot { video ->
+            index.matches(
+                videoId = video.id,
+                contentUri = video.contentUri.toString(),
+                filePath = video.path
+            )
+        }
     }
 }
 

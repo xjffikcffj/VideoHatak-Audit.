@@ -259,7 +259,8 @@ class VaultOptionAHiddenOriginalTest {
 
         val libVm = LibraryViewModel(
             videoRepository = fakeVideoRepo,
-            vaultHiddenEntries = vaultRepo.hiddenOriginalEntries
+            vaultHiddenEntries = vaultRepo.hiddenOriginalEntries,
+            computeDispatcher = testDispatcher
         )
         val plVm = PlaylistViewModel(
             repository = plRepo,

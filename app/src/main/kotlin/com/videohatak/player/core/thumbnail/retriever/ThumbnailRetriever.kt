@@ -6,7 +6,10 @@ import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import com.videohatak.player.core.playback.service.MediaNotificationPrivacy
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
@@ -51,8 +54,11 @@ class ThumbnailRetriever(private val context: Context) {
         if (MediaNotificationPrivacy.isVaultUri(videoUri)) {
             return null
         }
+        kotlinx.coroutines.currentCoroutineContext().ensureActive()
         return retrieverSemaphore.withPermit {
+            kotlinx.coroutines.currentCoroutineContext().ensureActive()
             withContext(Dispatchers.IO) {
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
                 val retriever = MediaMetadataRetriever()
                 try {
                     if (videoUri.scheme == "content" || videoUri.scheme == "file") {
@@ -61,6 +67,7 @@ class ThumbnailRetriever(private val context: Context) {
                         retriever.setDataSource(videoUri.toString(), HashMap())
                     }
 
+                    kotlinx.coroutines.currentCoroutineContext().ensureActive()
                     val timeUs = positionMs * 1000L
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
                         retriever.getScaledFrameAtTime(
@@ -73,6 +80,8 @@ class ThumbnailRetriever(private val context: Context) {
                         retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                             ?.let { raw -> downscaleIfNeeded(raw, targetWidth, targetHeight) }
                     }
+                } catch (ce: kotlinx.coroutines.CancellationException) {
+                    throw ce
                 } catch (_: Throwable) {
                     null
                 } finally {

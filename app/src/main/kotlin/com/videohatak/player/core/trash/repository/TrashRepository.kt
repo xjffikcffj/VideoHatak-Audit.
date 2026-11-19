@@ -5,6 +5,7 @@ import com.videohatak.player.core.model.VideoItem
 import com.videohatak.player.core.playlist.db.TrashDatabaseStore
 import com.videohatak.player.core.playlist.db.VideoHatakDatabaseHelper
 import com.videohatak.player.core.trash.model.TrashItem
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -27,12 +28,24 @@ interface TrashRepository {
 }
 
 class TrashRepositoryImpl(
-    private val dbStore: TrashDatabaseStore
+    private val dbStore: TrashDatabaseStore,
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    preloadSync: Boolean = true
 ) : TrashRepository {
 
-    constructor(context: Context) : this(VideoHatakDatabaseHelper(context))
+    constructor(
+        context: Context,
+        preloadSync: Boolean = false
+    ) : this(
+        dbStore = VideoHatakDatabaseHelper(context),
+        ioDispatcher = Dispatchers.IO,
+        preloadSync = preloadSync
+    )
 
     private val mutex = Mutex()
+
+    @Volatile
+    private var hasLoadedInitial: Boolean = preloadSync
 
     private val _trashItems = MutableStateFlow<List<TrashItem>>(emptyList())
     override val trashItems: StateFlow<List<TrashItem>> = _trashItems.asStateFlow()
@@ -44,15 +57,29 @@ class TrashRepositoryImpl(
     override val trashError: StateFlow<String?> = _trashError.asStateFlow()
 
     init {
-        loadFromDbSync()
+        if (preloadSync) {
+            loadFromDbSync()
+        }
+    }
+
+    private fun ensureLoadedLocked() {
+        if (!hasLoadedInitial) {
+            loadFromDbSync()
+        }
     }
 
     private fun loadFromDbSync() {
         try {
-            val list = dbStore.getAllTrashItems()
+            val list = com.videohatak.player.core.diagnostics.PerformanceDiagnostics.measure(
+                operation = "trash_db_read",
+                details = { "syncInit=${!hasLoadedInitial}" }
+            ) {
+                dbStore.getAllTrashItems()
+            }
             _trashItems.value = list
-            _trashedUris.value = list.map { it.contentUri }.toSet()
+            _trashedUris.value = list.mapTo(HashSet(list.size.coerceAtLeast(1))) { it.contentUri }
             _trashError.value = null
+            hasLoadedInitial = true
         } catch (e: Exception) {
             // Preserve existing in-memory state instead of silently presenting an empty Trash Bin
             _trashError.value = e.localizedMessage?.takeIf { it.isNotBlank() }
@@ -60,7 +87,7 @@ class TrashRepositoryImpl(
         }
     }
 
-    override suspend fun refresh() = withContext(Dispatchers.IO) {
+    override suspend fun refresh() = withContext(ioDispatcher) {
         mutex.withLock {
             loadFromDbSync()
         }
@@ -70,8 +97,9 @@ class TrashRepositoryImpl(
         _trashError.value = null
     }
 
-    override suspend fun moveToTrash(video: VideoItem): TrashItem? = withContext(Dispatchers.IO) {
+    override suspend fun moveToTrash(video: VideoItem): TrashItem? = withContext(ioDispatcher) {
         mutex.withLock {
+            ensureLoadedLocked()
             val uriString = video.contentUri.toString()
             if (uriString.isBlank()) {
                 _trashError.value = "مسار الفيديو غير صالح للنقل إلى سلة المحذوفات"
@@ -118,8 +146,9 @@ class TrashRepositoryImpl(
         }
     }
 
-    override suspend fun restoreFromTrash(trashId: Long): TrashItem? = withContext(Dispatchers.IO) {
+    override suspend fun restoreFromTrash(trashId: Long): TrashItem? = withContext(ioDispatcher) {
         mutex.withLock {
+            ensureLoadedLocked()
             try {
                 val existing = _trashItems.value.firstOrNull { it.id == trashId }
                     ?: dbStore.getAllTrashItems().firstOrNull { it.id == trashId }
@@ -141,8 +170,9 @@ class TrashRepositoryImpl(
         }
     }
 
-    override suspend fun removeRecord(trashId: Long): Boolean = withContext(Dispatchers.IO) {
+    override suspend fun removeRecord(trashId: Long): Boolean = withContext(ioDispatcher) {
         mutex.withLock {
+            ensureLoadedLocked()
             try {
                 val rows = dbStore.deleteTrashItemById(trashId)
                 _trashError.value = null
@@ -156,7 +186,7 @@ class TrashRepositoryImpl(
         }
     }
 
-    override suspend fun clearAllRecords() = withContext(Dispatchers.IO) {
+    override suspend fun clearAllRecords() = withContext(ioDispatcher) {
         mutex.withLock {
             try {
                 dbStore.clearAllTrashItems()

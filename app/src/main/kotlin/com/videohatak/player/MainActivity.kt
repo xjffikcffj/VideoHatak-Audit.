@@ -32,6 +32,8 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -130,7 +132,18 @@ class MainActivity : FragmentActivity() {
 
     private val isInPipModeState = mutableStateOf(false)
     private val canUseBiometricsState = mutableStateOf(true)
+    private val configurationRevisionState = mutableIntStateOf(0)
     private var activeVideoState: VideoItem? = null
+
+    private fun syncMainScreenOrientation() {
+        val target = resolveOrientationSyncTarget(
+            isInPlayerScreen = activeVideoState != null,
+            currentRequestedOrientation = requestedOrientation
+        )
+        if (target != null) {
+            requestedOrientation = target
+        }
+    }
 
     private val volumeComboDetector = VolumeComboShortcutDetector {
         val exo = playerViewModel.playerManager.exoPlayer
@@ -156,7 +169,10 @@ class MainActivity : FragmentActivity() {
         enableEdgeToEdge()
 
         setContent {
-            val windowSizeClass = calculateWindowSizeClass(this)
+            val configurationRevision = configurationRevisionState.intValue
+            val windowSizeClass = key(configurationRevision) {
+                calculateWindowSizeClass(this)
+            }
             val themeState by themeViewModel.themeState.collectAsStateWithLifecycle()
             val persistedAppTheme by themeViewModel.appTheme.collectAsStateWithLifecycle()
             val selectedAppTheme by themeViewModel.effectiveAppTheme.collectAsStateWithLifecycle()
@@ -184,7 +200,7 @@ class MainActivity : FragmentActivity() {
                 contract = ActivityResultContracts.RequestMultiplePermissions()
             ) { _ ->
                 val status = PermissionHelper.checkPermissionStatus(this@MainActivity, this@MainActivity)
-                libraryViewModel.onPermissionStatusChanged(status)
+                libraryViewModel.onPermissionStatusChanged(status, forceRefresh = true)
             }
 
             // Optional Notification Permission Launcher for background media controls (Android 13+)
@@ -722,8 +738,12 @@ class MainActivity : FragmentActivity() {
                     val isInPlayerScreen = activeVideo != null
 
                     LaunchedEffect(isInPlayerScreen) {
-                        if (!isInPlayerScreen) {
-                            requestedOrientation = MAIN_APP_ORIENTATION
+                        val target = resolveOrientationSyncTarget(
+                            isInPlayerScreen = isInPlayerScreen,
+                            currentRequestedOrientation = requestedOrientation
+                        )
+                        if (target != null) {
+                            requestedOrientation = target
                         }
                     }
 
@@ -1145,8 +1165,15 @@ class MainActivity : FragmentActivity() {
         }
     }
 
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        configurationRevisionState.intValue = configurationRevisionState.intValue + 1
+        syncMainScreenOrientation()
+    }
+
     override fun onResume() {
         super.onResume()
+        syncMainScreenOrientation()
         canUseBiometricsState.value = vaultViewModel.canUseBiometrics()
         vaultViewModel.checkTimeoutOnForeground()
         val currentStatus = PermissionHelper.checkPermissionStatus(this, this)
@@ -1175,5 +1202,16 @@ class MainActivity : FragmentActivity() {
 
     companion object {
         internal const val MAIN_APP_ORIENTATION: Int = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
+
+        internal fun resolveOrientationSyncTarget(
+            isInPlayerScreen: Boolean,
+            currentRequestedOrientation: Int
+        ): Int? {
+            return if (!isInPlayerScreen && currentRequestedOrientation != MAIN_APP_ORIENTATION) {
+                MAIN_APP_ORIENTATION
+            } else {
+                null
+            }
+        }
     }
 }

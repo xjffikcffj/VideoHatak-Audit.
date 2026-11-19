@@ -950,9 +950,9 @@ class LibraryViewModel(
         }
         loadVideosJob?.cancel()
         val requestGeneration = loadGeneration.incrementAndGet()
+        _isLoading.value = true
 
         loadVideosJob = viewModelScope.launch {
-            _isLoading.value = true
             try {
                 if (includeTrashRefresh) {
                     trashRepository?.refresh()

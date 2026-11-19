@@ -3,6 +3,8 @@ package com.videohatak.player
 import android.content.pm.ActivityInfo
 import android.graphics.Bitmap
 import android.net.Uri
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.ViewModelStore
 import com.videohatak.player.core.data.repository.VideoRepository
 import com.videohatak.player.core.diagnostics.PerformanceDiagnostics
 import com.videohatak.player.core.model.SortOrder
@@ -29,7 +31,10 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -45,6 +50,7 @@ import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -199,14 +205,19 @@ class LibraryPerformanceAndRotationVerificationTest {
             }
             val workerDispatcher = workerExecutor.asCoroutineDispatcher()
             Dispatchers.setMain(mainDispatcher)
+            val vmStore = ViewModelStore()
+            var collectJob: Job? = null
             try {
                 val repo = CountingVideoRepository(sampleVideos(6))
-                val vm = LibraryViewModel(
-                    videoRepository = repo,
-                    computeDispatcher = workerDispatcher
-                )
+                val vm = ViewModelProvider(
+                    vmStore,
+                    LibraryViewModel.provideFactory(
+                        videoRepository = repo,
+                        computeDispatcher = workerDispatcher
+                    )
+                )[LibraryViewModel::class.java]
 
-                val collectJob = launch(mainDispatcher) {
+                collectJob = launch(mainDispatcher) {
                     vm.uiState.collect {}
                 }
 
@@ -252,9 +263,11 @@ class LibraryPerformanceAndRotationVerificationTest {
                     expectedWorkerThread = workerThreadRef.get(),
                     forbiddenMainThread = mainThreadRef.get()
                 )
-
-                collectJob.cancel()
             } finally {
+                withContext(NonCancellable) {
+                    runCatching { collectJob?.cancelAndJoin() }
+                }
+                runCatching { vmStore.clear() }
                 Dispatchers.setMain(testDispatcher)
                 workerDispatcher.close()
                 workerExecutor.shutdownNow()
@@ -277,6 +290,8 @@ class LibraryPerformanceAndRotationVerificationTest {
             }
             val workerDispatcher = workerExecutor.asCoroutineDispatcher()
             Dispatchers.setMain(mainDispatcher)
+            val vmStore = ViewModelStore()
+            var collectJob: Job? = null
             try {
                 val videosRef = AtomicReference<List<VideoItem>>(emptyList())
                 val repo = object : CountingVideoRepository(emptyList()) {
@@ -286,20 +301,23 @@ class LibraryPerformanceAndRotationVerificationTest {
                     }
                 }
                 val vaultHiddenFlow = MutableStateFlow<List<VaultHiddenOriginal>>(emptyList())
-                val vm = LibraryViewModel(
-                    videoRepository = repo,
-                    vaultHiddenEntries = vaultHiddenFlow,
-                    computeDispatcher = workerDispatcher
-                )
+                val vm = ViewModelProvider(
+                    vmStore,
+                    LibraryViewModel.provideFactory(
+                        videoRepository = repo,
+                        vaultHiddenEntries = vaultHiddenFlow,
+                        computeDispatcher = workerDispatcher
+                    )
+                )[LibraryViewModel::class.java]
 
-                val collectJob = launch(mainDispatcher) {
+                collectJob = launch(mainDispatcher) {
                     vm.uiState.collect {}
                 }
 
                 // 1. Initial empty state & empty MediaStore result must NEVER call groupIntoFolders()
                 vm.onPermissionStatusChanged(VideoPermissionStatus.FullAccess)
                 val emptyLoadedState = withTimeout(5_000L) {
-                    vm.uiState.first { !it.isLoading }
+                    vm.uiState.first { !it.isLoading && it.permissionStatus == VideoPermissionStatus.FullAccess }
                 }
                 assertTrue(emptyLoadedState.allVideos.isEmpty())
                 assertTrue(emptyLoadedState.folders.isEmpty())
@@ -363,9 +381,11 @@ class LibraryPerformanceAndRotationVerificationTest {
                 }
                 assertTrue(allHiddenState.folders.isEmpty())
                 assertEquals(1, repo.groupIntoFoldersCalls.get())
-
-                collectJob.cancel()
             } finally {
+                withContext(NonCancellable) {
+                    runCatching { collectJob?.cancelAndJoin() }
+                }
+                runCatching { vmStore.clear() }
                 Dispatchers.setMain(testDispatcher)
                 workerDispatcher.close()
                 workerExecutor.shutdownNow()
@@ -388,6 +408,8 @@ class LibraryPerformanceAndRotationVerificationTest {
             }
             val workerDispatcher = workerExecutor.asCoroutineDispatcher()
             Dispatchers.setMain(mainDispatcher)
+            val vmStore = ViewModelStore()
+            var collectJob: Job? = null
             try {
                 val videosRef = AtomicReference(sampleVideos(6))
                 val repo = object : CountingVideoRepository(emptyList()) {
@@ -396,11 +418,14 @@ class LibraryPerformanceAndRotationVerificationTest {
                         return videosRef.get()
                     }
                 }
-                val vm = LibraryViewModel(
-                    videoRepository = repo,
-                    computeDispatcher = workerDispatcher
-                )
-                val collectJob = launch(mainDispatcher) {
+                val vm = ViewModelProvider(
+                    vmStore,
+                    LibraryViewModel.provideFactory(
+                        videoRepository = repo,
+                        computeDispatcher = workerDispatcher
+                    )
+                )[LibraryViewModel::class.java]
+                collectJob = launch(mainDispatcher) {
                     vm.uiState.collect {}
                 }
 
@@ -458,9 +483,11 @@ class LibraryPerformanceAndRotationVerificationTest {
                     expectedWorkerThread = workerThreadRef.get(),
                     forbiddenMainThread = mainThreadRef.get()
                 )
-
-                collectJob.cancel()
             } finally {
+                withContext(NonCancellable) {
+                    runCatching { collectJob?.cancelAndJoin() }
+                }
+                runCatching { vmStore.clear() }
                 Dispatchers.setMain(testDispatcher)
                 workerDispatcher.close()
                 workerExecutor.shutdownNow()

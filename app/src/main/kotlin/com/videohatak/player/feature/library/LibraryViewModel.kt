@@ -35,7 +35,9 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.shareIn
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -134,7 +136,7 @@ class LibraryViewModel(
         val folderId: String?
     )
 
-    private val visibleSnapshotFlow = combine(
+    private val visibleSnapshotFlow: SharedFlow<VisibleLibrarySnapshot> = combine(
         _rawVideos,
         trashedUrisFlow,
         vaultHiddenEntries
@@ -144,6 +146,9 @@ class LibraryViewModel(
             details = { "raw=${videos.size}" }
         ) {
             if (videos.isEmpty()) {
+                if (selectedFolder.value != null) {
+                    selectedFolder.value = null
+                }
                 VisibleLibrarySnapshot()
             } else {
                 val visibleNotTrashed = if (trashedUris.isEmpty()) {
@@ -157,6 +162,11 @@ class LibraryViewModel(
                 } else {
                     videoRepository.groupIntoFolders(visibleVideos)
                 }
+                if (selectedFolder.value != null) {
+                    selectedFolder.update { active ->
+                        active?.let { current -> folders.firstOrNull { it.bucketId == current.bucketId } }
+                    }
+                }
                 VisibleLibrarySnapshot(
                     visibleVideos = visibleVideos,
                     folders = folders
@@ -166,6 +176,11 @@ class LibraryViewModel(
     }
         .flowOn(computeDispatcher)
         .distinctUntilChanged()
+        .shareIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            replay = 1
+        )
 
     private val filterInputsFlow = combine(
         searchQuery,
@@ -927,32 +942,6 @@ class LibraryViewModel(
                 _rawVideos.value = videos
                 hasCompletedInitialLoad = true
 
-                val activeFolder = selectedFolder.value
-                if (activeFolder != null) {
-                    val refreshedFolder = kotlinx.coroutines.withContext(computeDispatcher) {
-                        if (videos.isEmpty()) {
-                            null
-                        } else {
-                            val visibleNotTrashed = videos.filterNot {
-                                it.contentUri.toString() in trashedUrisFlow.value
-                            }
-                            val visible = VaultHiddenMatcher.filterVisibleVideos(
-                                visibleNotTrashed,
-                                vaultHiddenEntries.value
-                            )
-                            val folderVideos = visible.filter { it.bucketId == activeFolder.bucketId }
-                            if (folderVideos.isEmpty()) {
-                                null
-                            } else {
-                                videoRepository.groupIntoFolders(folderVideos)
-                                    .firstOrNull { it.bucketId == activeFolder.bucketId }
-                            }
-                        }
-                    }
-                    if (requestGeneration == loadGeneration.get()) {
-                        selectedFolder.value = refreshedFolder
-                    }
-                }
                 if (requestGeneration == loadGeneration.get()) {
                     _errorMessage.value = null
                 }
